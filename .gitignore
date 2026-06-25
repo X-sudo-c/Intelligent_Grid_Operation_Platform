@@ -1,0 +1,47 @@
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+!**/.env.example
+!**/.env.local.example
+
+# --- Python ---
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# --- Node ---
+node_modules/
+dist/
+dist-ssr/
+.vite/
+
+# --- GIOP runtime ---
+.giop/
+
+# --- Logs ---
+*.log
+
+# --- Supabase local ---
+supabase/.branches/
+supabase/.temp/
+
+# --- GIS datasets (import locally; see scripts/import_power_system_gpkg.sh) ---
+supabase/Power System.gpkg
+*.gpkg
+
+# --- IDE / OS ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*~
+
+# --- Cursor debug ---
+.cursor/debug-*.log
