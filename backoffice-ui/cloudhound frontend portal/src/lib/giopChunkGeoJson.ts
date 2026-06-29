@@ -1,28 +1,32 @@
 import type { GiopGraphChunkResponse } from '../api/giop-api';
 import { voltageEdgeColor } from './giopSldTheme';
 
+function edgeLineCoordinates(edge: GiopGraphChunkResponse['edges'][number]): [number, number][] | null {
+  if (edge.coordinates && edge.coordinates.length >= 2) {
+    return edge.coordinates;
+  }
+
+  const source =
+    edge.source_lon != null && edge.source_lat != null
+      ? ([edge.source_lon, edge.source_lat] as [number, number])
+      : undefined;
+  const target =
+    edge.target_lon != null && edge.target_lat != null
+      ? ([edge.target_lon, edge.target_lat] as [number, number])
+      : undefined;
+  if (!source || !target) return null;
+  return [source, target];
+}
+
 export function chunkToEdgeGeoJson(chunk: GiopGraphChunkResponse | null) {
   if (!chunk) {
     return { type: 'FeatureCollection' as const, features: [] };
   }
 
-  const coordsByMrid = new Map(
-    chunk.nodes.map((node) => [node.mrid, [node.lon, node.lat] as [number, number]]),
-  );
-
   const features = chunk.edges
     .map((edge) => {
-      const source =
-        coordsByMrid.get(edge.source) ??
-        (edge.source_lon != null && edge.source_lat != null
-          ? ([edge.source_lon, edge.source_lat] as [number, number])
-          : undefined);
-      const target =
-        coordsByMrid.get(edge.target) ??
-        (edge.target_lon != null && edge.target_lat != null
-          ? ([edge.target_lon, edge.target_lat] as [number, number])
-          : undefined);
-      if (!source || !target) return null;
+      const coordinates = edgeLineCoordinates(edge);
+      if (!coordinates) return null;
       return {
         type: 'Feature' as const,
         properties: {
@@ -34,7 +38,7 @@ export function chunkToEdgeGeoJson(chunk: GiopGraphChunkResponse | null) {
         },
         geometry: {
           type: 'LineString' as const,
-          coordinates: [source, target],
+          coordinates,
         },
       };
     })
@@ -78,6 +82,7 @@ export function chunkToNodeGeoJson(chunk: GiopGraphChunkResponse | null) {
         name: node.name,
         connected: node.connected,
         traced: node.traced,
+        validation: node.validation ?? '',
       },
       geometry: {
         type: 'Point' as const,

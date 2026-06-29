@@ -1,15 +1,38 @@
 import { useCallback, useEffect, useState } from 'react';
 import { listTickets, patchTicket, type GiopTroubleTicket } from '../api/giop-api';
+import { useGiopMapOverlay } from '../context/GiopMapOverlayContext';
 
 interface GiopTicketsTabProps {
   isLightMode: boolean;
 }
 
 export function GiopTicketsTab({ isLightMode }: GiopTicketsTabProps) {
+  const { focusOnMap } = useGiopMapOverlay();
   const [tickets, setTickets] = useState<GiopTroubleTicket[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('');
   const [status, setStatus] = useState('');
+  const [mapBusyId, setMapBusyId] = useState<string | null>(null);
+
+  const showOnMap = useCallback(
+    async (t: GiopTroubleTicket) => {
+      const mrid = t.asset_mrid ?? t.meter_mrid;
+      if (!mrid) {
+        setStatus(`Ticket ${t.reference} has no linked asset to locate`);
+        return;
+      }
+      setMapBusyId(t.id);
+      try {
+        await focusOnMap(mrid, { name: t.summary, coordinates: null });
+        setStatus(`Opened ${t.reference} on map`);
+      } catch (err) {
+        setStatus(err instanceof Error ? err.message : 'Could not focus map');
+      } finally {
+        setMapBusyId(null);
+      }
+    },
+    [focusOnMap],
+  );
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -63,23 +86,35 @@ export function GiopTicketsTab({ isLightMode }: GiopTicketsTabProps) {
             <p className="text-xs text-slate-500 mt-1">
               {t.source} · {t.ticket_type} · {t.severity} · P{t.priority}
             </p>
-            {t.status !== 'IN_PROGRESS' && t.status !== 'CLOSED' && (
-              <button
-                type="button"
-                className="text-xs px-2 py-1 mt-2 bg-cyan-800 rounded text-white"
-                onClick={async () => {
-                  try {
-                    await patchTicket(t.id, { status: 'IN_PROGRESS', assigned_to: 'ops.demo' });
-                    setStatus(`Ticket ${t.reference} in progress`);
-                    await load();
-                  } catch (err) {
-                    setStatus(err instanceof Error ? err.message : 'Update failed');
-                  }
-                }}
-              >
-                Start work
-              </button>
-            )}
+            <div className="flex flex-wrap gap-2 mt-2">
+              {t.status !== 'IN_PROGRESS' && t.status !== 'CLOSED' && (
+                <button
+                  type="button"
+                  className="text-xs px-2 py-1 bg-cyan-800 rounded text-white"
+                  onClick={async () => {
+                    try {
+                      await patchTicket(t.id, { status: 'IN_PROGRESS', assigned_to: 'ops.demo' });
+                      setStatus(`Ticket ${t.reference} in progress`);
+                      await load();
+                    } catch (err) {
+                      setStatus(err instanceof Error ? err.message : 'Update failed');
+                    }
+                  }}
+                >
+                  Start work
+                </button>
+              )}
+              {(t.asset_mrid || t.meter_mrid) && (
+                <button
+                  type="button"
+                  disabled={mapBusyId === t.id}
+                  className="text-xs px-2 py-1 bg-slate-700 rounded text-white disabled:opacity-40"
+                  onClick={() => void showOnMap(t)}
+                >
+                  {mapBusyId === t.id ? 'Opening…' : 'Show on map'}
+                </button>
+              )}
+            </div>
           </div>
         ))}
       </div>

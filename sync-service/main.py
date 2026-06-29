@@ -1,6 +1,7 @@
 """GIOP unified sync gateway — graph webhooks, telemetry, and network trace."""
 
 import asyncio
+import json
 import os
 import secrets
 import time
@@ -11,24 +12,126 @@ from typing import Any, Literal, Optional
 
 import psycopg2
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from neo4j import GraphDatabase
 from pydantic import BaseModel, Field
 
 from dlq import list_dlq, mark_retrying, patch_dlq
+from field_ops import (
+    fetch_staging_validation,
+    list_active_technicians,
+    list_technician_submissions,
+    upsert_technician_position,
+)
+from field_notifications import (
+    dispatch_rejection_push,
+    list_technician_notifications,
+    mark_notification_delivered,
+    mark_notification_read,
+    notify_asset_rejected,
+    register_device_token,
+)
 from energy_accounting import compute_balance
-from graph_sync import apply_webhook_event, reconcile_memgraph
+from integrations.sap.sync_customers import (
+    sap_integration_status,
+    sync_customers_from_sap,
+    upsert_customer_from_payload,
+)
+from graph_sync import apply_webhook_event, graph_parity_report, reconcile_memgraph
+from redis_cache import (
+    OPS_CACHE_TTL_SEC,
+    RULES_CACHE_TTL_SEC,
+    SCHEMATIC_CACHE_TTL_SEC,
+    CIM_PREVIEW_TTL_SEC,
+    asset_detail_key,
+    assets_master_key,
+    assets_staging_key,
+    bulk_connections_key,
+    cached_json,
+    cim_preview_key,
+    claim_idempotency,
+    conflicts_key,
+    dq_exceptions_key,
+    dq_rules_key,
+    dq_summary_key,
+    exports_list_key,
+    get_idempotent_response,
+    get_json,
+    graph_chunk_key,
+    graph_parity_key,
+    h3_assignments_geojson_key,
+    h3_cells_key,
+    h3_coverage_key,
+    h3_grid_key,
+    idempotency_key,
+    invalidate_after_promote,
+    invalidate_after_staging_write,
+    invalidate_h3_cache,
+    invalidate_ops_cache,
+    invalidate_topology_cache,
+    lock,
+    map_nodes_key,
+    nav_badges_key,
+    node_connections_key,
+    repair_lock_key,
+    schematic_key,
+    topology_dq_summary_key,
+    set_json,
+    status as redis_status,
+    store_idempotent_response,
+    topology_gaps_key,
+    topology_health_key,
+    topology_impact_key,
+    trace_key,
+    webhook_dedup_key,
+)
+from topology_analysis import (
+    downstream_impact_payload,
+    topology_gaps_payload,
+    topology_health_report,
+)
 from lineage import (
     fetch_asset_updated_at,
     fetch_lineage,
     insert_conflict_proposal,
     list_open_conflicts,
+    log_dlq_event,
     log_lineage,
     resolve_conflict,
+    search_lineage,
+    set_lineage_context,
 )
-from metrics import record_request, snapshot as metrics_snapshot
+from data_quality import (
+    count_blocking_open,
+    list_exceptions as dq_list_exceptions,
+    list_rules as dq_list_rules,
+    resolve_exception as dq_resolve_exception,
+    run_asset_checks,
+    summary as dq_summary,
+)
+from topology_dq import (
+    create_topology_batch_run,
+    execute_topology_batch_scan,
+    latest_topology_snapshot,
+    list_batch_runs as topology_dq_list_runs,
+    topology_dq_summary,
+)
+from map_nodes import fetch_nodes_near_location
+import h3_index as h3x
+from h3_service import (
+    assignments_geojson,
+    batch_upsert_assignments,
+    bbox_grid_geojson,
+    cell_at_point,
+    delete_assignments,
+    fetch_coverage,
+    fetch_nodes_in_cells,
+    list_assignments,
+    upsert_assignment,
+)
+from node_connections import fetch_bulk_node_connections, fetch_node_connections
 from schematic import generate_svg
 from contact_cases import (
     convert_case_to_ticket,
@@ -41,14 +144,61 @@ from contact_cases import (
 from outages import create_outage, get_outage, list_outages, patch_outage, restore_outage
 from regulatory import compute_metrics, generate_report, list_reports
 from trouble_tickets import create_ticket, get_ticket, link_ticket, list_tickets, patch_ticket
+from cim_export import (
+    DEFAULT_LAYERS,
+    build_cim_payload,
+    create_export_job,
+    get_job as get_export_job,
+    list_jobs as list_export_jobs,
+    validate_export_scope,
+)
+from dxf_export import (
+    build_dxf_payload,
+    create_dxf_export_job,
+)
+from export_dispatch import (
+    LINEAGE_ACTIONS,
+    SUPPORTED_FORMATS,
+    download_filename,
+    process_job as process_export_by_format,
+    read_job_bytes as read_export_bytes_by_format,
+)
+from gpkg_export import create_gpkg_export_job
+from kml_export import create_kml_export_job
+from shapefile_export import create_shapefile_export_job
+from csv_export import create_csv_export_job
+from cim_xml_export import create_cim_rdf_export_job, create_cim_xml_export_job
+from integration_export import create_mdms_export_job, create_sap_export_job
 from work_orders import create_work_order, get_work_order, list_work_orders, patch_work_order
+from migration_engine import (
+    list_failed as list_migration_failed,
+    list_runs as list_migration_runs,
+    parse_dxf,
+    parse_geopackage,
+    run_migration,
+)
+from metrics import record_request, snapshot as metrics_snapshot
+from ops_badges import collect_badge_counts
+from agents.models import RunMode, RunType, ValidationRunRequest
+from agents.orchestrator import run_agent_validation_cycle, run_validation_cycle
+from agents import approval_agent, cleanup_agent, kpi, proposal_agent, repository
+
+from pathlib import Path
 
 load_dotenv()
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 GRAPH_URI = os.getenv("GRAPH_DB_URI") or os.getenv("MEMGRAPH_URI", "bolt://localhost:7687")
 SUPABASE_DB_URI = os.getenv("SUPABASE_DB_URI")
 TIMESCALE_URI = os.getenv("TIMESCALE_URI")
 OCR_SERVICE_URL = os.getenv("OCR_SERVICE_URL", "http://127.0.0.1:5002")
+
+# Interactive trace bounds — national graph must never be walked on a click.
+TRACE_MAX_HOPS = int(os.getenv("TRACE_MAX_HOPS", "10"))
+TRACE_MAX_NODES = int(os.getenv("TRACE_MAX_NODES", "5000"))
+TRACE_MAX_EDGES = int(os.getenv("TRACE_MAX_EDGES", "15000"))
+TRACE_FULL_NODE_CAP = int(os.getenv("TRACE_FULL_NODE_CAP", "8000"))
+TRACE_VIEWPORT_PAD = float(os.getenv("TRACE_VIEWPORT_PAD", "0.08"))
 
 app = FastAPI(title="GIOP Dev Sync Gateway")
 
@@ -65,6 +215,30 @@ try:
     FastAPIInstrumentor.instrument_app(app)
 except ImportError:
     pass
+
+
+def _push_rejection_notification(
+    technician_id: str | None,
+    title: str,
+    body: str,
+    payload: dict[str, Any],
+) -> None:
+    if not technician_id or not SUPABASE_DB_URI:
+        return
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            dispatch_rejection_push(
+                conn,
+                technician_id=technician_id,
+                title=title,
+                body=body,
+                payload=payload,
+            )
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
 
 @app.middleware("http")
@@ -88,123 +262,354 @@ graph_driver = GraphDatabase.driver(
     connection_acquisition_timeout=float(os.getenv("MEMGRAPH_CONNECT_TIMEOUT", "10")),
 )
 
-TRACE_QUERY = """
-MATCH (s {mrid: $mrid})
-MATCH p = (s)-[:AC_LINE_SEGMENT*1..10]->(c)
-RETURN p
-"""
-
-EDGE_FETCH_QUERY = """
-MATCH (s:ConnectivityNode)-[r:AC_LINE_SEGMENT]->(t:ConnectivityNode)
-RETURN r.mrid AS mrid,
-       s.mrid AS source,
-       t.mrid AS target,
-       coalesce(r.phases, 'ABC') AS phases,
-       coalesce(r.voltage, 'MV_11KV') AS voltage
-"""
-
 TraceScope = Literal["traced", "full"]
 
 
-def _graph_totals(session) -> tuple[int, int]:
-    node_count = session.run("MATCH (c:ConnectivityNode) RETURN count(c) AS n").single()["n"]
-    edge_count = session.run("MATCH ()-[r:AC_LINE_SEGMENT]->() RETURN count(r) AS n").single()["n"]
-    return int(node_count), int(edge_count)
+def _pg_graph_totals(conn) -> tuple[int, int]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM public.connectivity_nodes")
+        node_count = int(cur.fetchone()[0])
+        cur.execute("SELECT COUNT(*) FROM public.ac_line_segments")
+        edge_count = int(cur.fetchone()[0])
+    return node_count, edge_count
 
 
-def _collect_traced_mrids(session, start_mrid: str) -> set[str]:
-    traced: set[str] = {start_mrid}
-    for record in session.run(TRACE_QUERY, mrid=start_mrid):
-        path = record["p"]
-        for node in path.nodes:
-            mrid = node.get("mrid")
-            if mrid:
-                traced.add(mrid)
-    return traced
+def _collect_traced_mrids_pg(
+    conn,
+    start_mrid: str,
+    *,
+    max_hops: int,
+    max_nodes: int,
+) -> tuple[set[str], bool]:
+    """Downstream walk in PostGIS — bounded by hops and node cap."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH RECURSIVE walk AS (
+              SELECT %s::uuid AS mrid, 0 AS depth
+              UNION ALL
+              SELECT als.target_node_id, w.depth + 1
+              FROM walk w
+              JOIN public.ac_line_segments als ON als.source_node_id = w.mrid
+              WHERE w.depth < %s
+            ),
+            reached AS (
+              SELECT DISTINCT mrid FROM walk
+            )
+            SELECT mrid::text FROM reached
+            LIMIT %s
+            """,
+            (start_mrid, max_hops, max_nodes),
+        )
+        mrids = {row[0] for row in cur.fetchall()}
+    return mrids, len(mrids) >= max_nodes
 
 
-def _trace_payload_blocking(start_mrid: str, scope: TraceScope) -> dict[str, Any]:
-    with graph_driver.session() as session:
-        return _build_trace_payload(session, start_mrid, scope)
+def _build_trace_payload_postgres(
+    conn,
+    start_mrid: str,
+    scope: TraceScope,
+    *,
+    max_hops: int | None = None,
+    max_nodes: int | None = None,
+) -> dict[str, Any]:
+    """Interactive trace from PostGIS — never scans the full national graph."""
+    hop_cap = max(1, min(max_hops or TRACE_MAX_HOPS, 20))
+    node_cap = max(100, min(max_nodes or TRACE_MAX_NODES, 20000))
+    edge_cap = max(100, min(TRACE_MAX_EDGES, 50000))
 
+    traced_mrids, trace_truncated = _collect_traced_mrids_pg(
+        conn, start_mrid, max_hops=hop_cap, max_nodes=node_cap
+    )
+    total_nodes, total_edges = _pg_graph_totals(conn)
+    graph_totals = {"nodes": total_nodes, "edges": total_edges}
 
-def _graph_chunk_traced_mrids_blocking(start_mrid: str) -> set[str]:
-    with graph_driver.session() as session:
-        return _collect_traced_mrids(session, start_mrid)
-
-
-def _edge_dict(row) -> dict[str, Any]:
-    return {
-        "mrid": row["mrid"],
-        "source": row["source"],
-        "target": row["target"],
-        "phases": row["phases"],
-        "voltage": row["voltage"],
-    }
-
-
-def _build_trace_payload(session, start_mrid: str, scope: TraceScope) -> dict[str, Any]:
-    traced_mrids = _collect_traced_mrids(session, start_mrid)
-    total_nodes, total_edges = _graph_totals(session)
-    all_edge_rows = list(session.run(EDGE_FETCH_QUERY))
-
-    connected_mrids: set[str] = set()
-    for row in all_edge_rows:
-        connected_mrids.add(row["source"])
-        connected_mrids.add(row["target"])
+    if scope == "full" and total_nodes > TRACE_FULL_NODE_CAP:
+        return _trace_viewport_fallback(
+            start_mrid,
+            scope,
+            traced_mrids,
+            graph_totals,
+            max_nodes=node_cap,
+            truncated=trace_truncated,
+        )
 
     if scope == "full":
-        included_mrids = {row["mrid"] for row in session.run(
-            "MATCH (c:ConnectivityNode) RETURN c.mrid AS mrid"
-        )}
-        edge_rows = all_edge_rows
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT cn.mrid::text
+                FROM public.connectivity_nodes cn
+                ORDER BY cn.mrid
+                LIMIT %s
+                """,
+                (node_cap,),
+            )
+            included_mrids = {row[0] for row in cur.fetchall()}
+        if len(included_mrids) >= node_cap:
+            trace_truncated = True
     else:
         included_mrids = set(traced_mrids)
-        for row in all_edge_rows:
-            if row["source"] in traced_mrids or row["target"] in traced_mrids:
-                included_mrids.add(row["source"])
-                included_mrids.add(row["target"])
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  als.mrid::text,
+                  als.source_node_id::text,
+                  als.target_node_id::text,
+                  coalesce(ce.phases, 'ABC'),
+                  coalesce(ce.nominal_voltage::text, 'MV_11KV')
+                FROM public.ac_line_segments als
+                JOIN public.conducting_equipment ce ON ce.mrid = als.mrid
+                WHERE als.source_node_id = ANY(%s::uuid[])
+                   OR als.target_node_id = ANY(%s::uuid[])
+                LIMIT %s
+                """,
+                (list(included_mrids), list(included_mrids), edge_cap),
+            )
+            expand_rows = cur.fetchall()
+        if len(expand_rows) >= edge_cap:
+            trace_truncated = True
+        for row in expand_rows:
+            included_mrids.add(row[1])
+            included_mrids.add(row[2])
 
-        edge_rows = [
-            row
-            for row in all_edge_rows
-            if row["source"] in included_mrids and row["target"] in included_mrids
-        ]
-
-    node_rows = list(
-        session.run(
+    edges_truncated = False
+    with conn.cursor() as cur:
+        cur.execute(
             """
-            MATCH (c:ConnectivityNode)
-            WHERE c.mrid IN $mrids
-            RETURN c.mrid AS mrid, c.name AS name
+            SELECT
+              als.mrid::text,
+              als.source_node_id::text,
+              als.target_node_id::text,
+              coalesce(ce.phases, 'ABC'),
+              coalesce(ce.nominal_voltage::text, 'MV_11KV')
+            FROM public.ac_line_segments als
+            JOIN public.conducting_equipment ce ON ce.mrid = als.mrid
+            WHERE als.source_node_id = ANY(%s::uuid[])
+              AND als.target_node_id = ANY(%s::uuid[])
+            LIMIT %s
             """,
-            mrids=list(included_mrids),
+            (list(included_mrids), list(included_mrids), edge_cap),
         )
-    )
+        edge_rows = cur.fetchall()
+    if len(edge_rows) >= edge_cap:
+        edges_truncated = True
+        trace_truncated = True
 
-    nodes: dict[str, dict[str, Any]] = {}
-    for row in node_rows:
-        mrid = row["mrid"]
-        nodes[mrid] = {
+    connected_mrids: set[str] = set()
+    for row in edge_rows:
+        connected_mrids.add(row[1])
+        connected_mrids.add(row[2])
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT cn.mrid::text, io.name, io.validation::text
+            FROM public.connectivity_nodes cn
+            JOIN public.identified_objects io ON io.mrid = cn.mrid
+            WHERE cn.mrid = ANY(%s::uuid[])
+            """,
+            (list(included_mrids),),
+        )
+        node_rows = cur.fetchall()
+
+    nodes = [
+        {
             "mrid": mrid,
-            "name": row["name"] or mrid,
+            "name": name or mrid,
             "type": ["ConnectivityNode"],
             "connected": mrid in connected_mrids,
             "traced": mrid in traced_mrids,
+            "validation": validation,
         }
+        for mrid, name, validation in node_rows
+    ]
+    edges = [
+        {
+            "mrid": row[0],
+            "source": row[1],
+            "target": row[2],
+            "phases": row[3],
+            "voltage": row[4],
+        }
+        for row in edge_rows
+    ]
 
-    edges: dict[str, dict[str, Any]] = {}
-    for row in edge_rows:
-        key = row["mrid"] or f"{row['source']}->{row['target']}"
-        edges[key] = _edge_dict(row)
+    bounds = {
+        "max_hops": hop_cap,
+        "max_nodes": node_cap,
+        "max_edges": edge_cap,
+        "truncated": trace_truncated,
+        "mode": "traced" if scope == "traced" else "full_bounded",
+    }
+    if edges_truncated:
+        bounds["edges_truncated"] = True
 
     return {
-        "nodes": list(nodes.values()),
-        "edges": list(edges.values()),
+        "nodes": nodes,
+        "edges": edges,
         "start_mrid": start_mrid,
         "scope": scope,
-        "graph_totals": {"nodes": total_nodes, "edges": total_edges},
+        "graph_totals": graph_totals,
+        "bounds": bounds,
     }
+
+
+def _fetch_start_lonlat(conn, start_mrid: str) -> tuple[float, float] | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT ST_X(cn.geom), ST_Y(cn.geom)
+            FROM connectivity_nodes cn
+            WHERE cn.mrid = %s::uuid
+            """,
+            (start_mrid,),
+        )
+        row = cur.fetchone()
+    if not row or row[0] is None or row[1] is None:
+        return None
+    return float(row[0]), float(row[1])
+
+
+def _chunk_to_trace_payload(
+    chunk: dict[str, Any],
+    *,
+    start_mrid: str,
+    scope: TraceScope,
+    traced_mrids: set[str],
+    graph_totals: dict[str, int],
+    bounds: dict[str, Any],
+) -> dict[str, Any]:
+    nodes = [
+        {
+            "mrid": n["mrid"],
+            "name": n.get("name") or n["mrid"],
+            "type": ["ConnectivityNode"],
+            "connected": n.get("connected", True),
+            "traced": n["mrid"] in traced_mrids,
+            "validation": n.get("validation"),
+        }
+        for n in chunk.get("nodes") or []
+    ]
+    edges = [
+        {
+            "mrid": e["mrid"],
+            "source": e["source"],
+            "target": e["target"],
+            "phases": e.get("phases"),
+            "voltage": e.get("voltage"),
+            **(
+                {"coordinates": e["coordinates"]}
+                if e.get("coordinates")
+                else {}
+            ),
+        }
+        for e in chunk.get("edges") or []
+    ]
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "start_mrid": start_mrid,
+        "scope": scope,
+        "graph_totals": graph_totals,
+        "bounds": bounds,
+        "bbox": chunk.get("bbox"),
+    }
+
+
+def _trace_viewport_fallback(
+    start_mrid: str,
+    scope: TraceScope,
+    traced_mrids: set[str],
+    graph_totals: dict[str, int],
+    *,
+    max_nodes: int,
+    truncated: bool,
+) -> dict[str, Any]:
+    conn = _pg_connect()
+    if not conn:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        lonlat = _fetch_start_lonlat(conn, start_mrid)
+        if lonlat is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Start node has no geometry (start_mrid={start_mrid})",
+            )
+        lon, lat = lonlat
+        pad = TRACE_VIEWPORT_PAD
+        chunk = _fetch_graph_chunk_from_postgres(
+            lon - pad,
+            lat - pad,
+            lon + pad,
+            lat + pad,
+            max_nodes,
+            traced_mrids,
+            min(max_nodes * 2, TRACE_MAX_EDGES),
+        )
+    finally:
+        conn.close()
+
+    bounds = {
+        "max_hops": TRACE_MAX_HOPS,
+        "max_nodes": max_nodes,
+        "max_edges": TRACE_MAX_EDGES,
+        "truncated": truncated or chunk.get("truncated", False),
+        "mode": "viewport_fallback",
+    }
+    if chunk.get("edges_truncated"):
+        bounds["edges_truncated"] = True
+    return _chunk_to_trace_payload(
+        chunk,
+        start_mrid=start_mrid,
+        scope=scope,
+        traced_mrids=traced_mrids,
+        graph_totals=graph_totals,
+        bounds=bounds,
+    )
+
+
+def _trace_payload_blocking(
+    start_mrid: str,
+    scope: TraceScope,
+    *,
+    max_hops: int | None = None,
+    max_nodes: int | None = None,
+) -> dict[str, Any]:
+    conn = _pg_connect()
+    if not conn:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        return _build_trace_payload_postgres(
+            conn,
+            start_mrid,
+            scope,
+            max_hops=max_hops,
+            max_nodes=max_nodes,
+        )
+    finally:
+        conn.close()
+
+
+def _graph_chunk_traced_mrids_blocking(
+    start_mrid: str,
+    *,
+    max_hops: int | None = None,
+    max_nodes: int | None = None,
+) -> set[str]:
+    conn = _pg_connect()
+    if not conn:
+        return {start_mrid}
+    try:
+        hop_cap = max(1, min(max_hops or TRACE_MAX_HOPS, 20))
+        node_cap = max(100, min(max_nodes or TRACE_MAX_NODES, 20000))
+        traced, _ = _collect_traced_mrids_pg(
+            conn, start_mrid, max_hops=hop_cap, max_nodes=node_cap
+        )
+        return traced
+    finally:
+        conn.close()
 
 
 def _fetch_graph_chunk_from_postgres(
@@ -242,6 +647,9 @@ def _fetch_graph_chunk_from_postgres(
             )
             node_rows = cur.fetchall()
 
+            span = max(east - west, north - south)
+            simplify_tol = max(0.00003, span / 600.0)
+
             cur.execute(
                 """
                 SELECT
@@ -253,7 +661,8 @@ def _fetch_graph_chunk_from_postgres(
                   ST_X(src.geom) AS src_lon,
                   ST_Y(src.geom) AS src_lat,
                   ST_X(tgt.geom) AS tgt_lon,
-                  ST_Y(tgt.geom) AS tgt_lat
+                  ST_Y(tgt.geom) AS tgt_lat,
+                  ST_AsGeoJSON(ST_SimplifyPreserveTopology(als.geom, %s))::json AS geom_json
                 FROM ac_line_segments als
                 JOIN conducting_equipment ce ON als.mrid = ce.mrid
                 JOIN connectivity_nodes src ON src.mrid = als.source_node_id
@@ -262,7 +671,7 @@ def _fetch_graph_chunk_from_postgres(
                 ORDER BY als.mrid
                 LIMIT %s
                 """,
-                (*envelope, edge_limit + 1),
+                (simplify_tol, *envelope, edge_limit + 1),
             )
             edge_rows = cur.fetchall()
             edges_truncated = len(edge_rows) > edge_limit
@@ -281,9 +690,21 @@ def _fetch_graph_chunk_from_postgres(
                 }
 
             connected_mrids: set[str] = set()
-            for _, source, target, _, _, _, _, _, _ in edge_rows:
-                connected_mrids.add(source)
-                connected_mrids.add(target)
+            for row in edge_rows:
+                connected_mrids.add(row[1])
+                connected_mrids.add(row[2])
+
+            def _edge_coordinates(geom_json: Any) -> list[list[float]] | None:
+                if not geom_json:
+                    return None
+                if isinstance(geom_json, str):
+                    geom_json = json.loads(geom_json)
+                if geom_json.get("type") != "LineString":
+                    return None
+                coords = geom_json.get("coordinates")
+                if not isinstance(coords, list) or len(coords) < 2:
+                    return None
+                return coords
 
             nodes = [
                 {
@@ -297,8 +718,22 @@ def _fetch_graph_chunk_from_postgres(
                 }
                 for mrid, name, lon, lat, validation in node_rows
             ]
-            edges = [
-                {
+            edges = []
+            for row in edge_rows:
+                (
+                    mrid,
+                    source,
+                    target,
+                    phases,
+                    voltage,
+                    src_lon,
+                    src_lat,
+                    tgt_lon,
+                    tgt_lat,
+                    geom_json,
+                ) = row
+                coords = _edge_coordinates(geom_json)
+                edge: dict[str, Any] = {
                     "mrid": mrid,
                     "source": source,
                     "target": target,
@@ -309,8 +744,9 @@ def _fetch_graph_chunk_from_postgres(
                     "target_lon": float(tgt_lon),
                     "target_lat": float(tgt_lat),
                 }
-                for mrid, source, target, phases, voltage, src_lon, src_lat, tgt_lon, tgt_lat in edge_rows
-            ]
+                if coords:
+                    edge["coordinates"] = coords
+                edges.append(edge)
 
             truncated = len(node_rows) >= limit
             return {
@@ -353,6 +789,25 @@ class FieldNodePayload(BaseModel):
     boundary_feeder_id: str | None = Field(default=None, max_length=50)
     mrid: str | None = None
     offline_session_started_at: str | None = None
+    operator_id: str | None = Field(default=None, max_length=100)
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+
+class FieldLocationPayload(BaseModel):
+    technician_id: str = Field(min_length=1, max_length=100)
+    longitude: float = Field(ge=-180, le=180)
+    latitude: float = Field(ge=-90, le=90)
+    display_name: str | None = Field(default=None, max_length=200)
+    accuracy_m: float | None = Field(default=None, ge=0)
+    heading_deg: float | None = None
+    speed_mps: float | None = Field(default=None, ge=0)
+    work_order_id: str | None = Field(default=None, max_length=100)
+    session_started_at: str | None = None
+
+
+class BulkNodeConnectionsPayload(BaseModel):
+    mrids: list[str] = Field(min_length=1, max_length=1500)
+    limit_per_node: int = Field(default=25, ge=1, le=100)
 
 
 class AssetUpdatePayload(BaseModel):
@@ -379,16 +834,131 @@ class DlqPatchPayload(BaseModel):
 class TopologyRepairPayload(BaseModel):
     target_mrid: str
     radius_meters: float = Field(default=50, gt=0, le=5000)
+    dry_run: bool = False
+    operator_id: str | None = Field(default=None, max_length=100)
 
 
 class ValidationActionPayload(BaseModel):
-    validation: Literal["APPROVED", "IN_CONFLICT", "STAGED", "PENDING_FIELD"]
+    validation: Literal["APPROVED", "IN_CONFLICT", "STAGED", "PENDING_FIELD", "REJECTED"]
+    reason: str | None = Field(default=None, max_length=500)
+    operator_id: str | None = Field(default=None, max_length=100)
+    override_data_quality: bool = False
+
+
+class DqResolvePayload(BaseModel):
+    status: Literal["RESOLVED", "DEFERRED", "QUARANTINED", "REJECTED"]
+    note: str | None = Field(default=None, max_length=1000)
+    operator_id: str | None = Field(default=None, max_length=100)
+
+
+class CimExportClip(BaseModel):
+    west: float = Field(ge=-180, le=180)
+    south: float = Field(ge=-90, le=90)
+    east: float = Field(ge=-180, le=180)
+    north: float = Field(ge=-90, le=90)
+
+
+class TopologyDqScanPayload(BaseModel):
+    clip: CimExportClip | None = None
+    operator_id: str | None = Field(default=None, max_length=100)
+
+
+class ValidationRunPayload(BaseModel):
+    run_type: Literal["full_cycle", "asset_checks", "topology_master", "revalidation"] = "full_cycle"
+    mode: Literal["deterministic", "agent"] = "deterministic"
+    mrid: str | None = None
+    tier: Literal["staging", "master"] = "master"
+    operator_id: str | None = Field(default=None, max_length=100)
+    clip: CimExportClip | None = None
+
+
+class PortalAiChatPayload(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+    exception_id: str | None = None
+    mrid: str | None = None
+    operator_id: str | None = Field(default=None, max_length=100)
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class ApprovalDecisionPayload(BaseModel):
+    operator_id: str | None = Field(default=None, max_length=100)
+    note: str | None = Field(default=None, max_length=1000)
+    execute: bool = False
+
+
+class CleanupExecutePayload(BaseModel):
+    operator_id: str | None = Field(default=None, max_length=100)
+    force: bool = False
+
+
+class CimExportPayload(BaseModel):
+    layers: list[str] = Field(default_factory=lambda: list(DEFAULT_LAYERS))
+    clip: CimExportClip | None = None
+    exclude_dq_blocked: bool = True
+    requested_by: str | None = Field(default=None, max_length=100)
+    operator_id: str | None = Field(default=None, max_length=100)
+
+
+class DxfExportPayload(BaseModel):
+    clip: CimExportClip | None = None
+    exclude_dq_blocked: bool = True
+    include_nodes: bool = True
+    include_lines: bool = True
+    requested_by: str | None = Field(default=None, max_length=100)
+    operator_id: str | None = Field(default=None, max_length=100)
+
+
+class GisExportPayload(BaseModel):
+    clip: CimExportClip | None = None
+    exclude_dq_blocked: bool = True
+    include_meters: bool = True
+    layers: list[str] = Field(default_factory=lambda: list(DEFAULT_LAYERS))
+    requested_by: str | None = Field(default=None, max_length=100)
+    operator_id: str | None = Field(default=None, max_length=100)
+
+
+class AffineParams(BaseModel):
+    anchor_lon: float = Field(ge=-180, le=180)
+    anchor_lat: float = Field(ge=-90, le=90)
+    scale: float = Field(default=1.0)
+    rotation_deg: float = Field(default=0.0)
+    origin_x: float = Field(default=0.0)
+    origin_y: float = Field(default=0.0)
+
+
+class DxfMigrationPayload(BaseModel):
+    dxf_text: str | None = None
+    file_path: str | None = None
+    source_name: str = Field(default="dxf-import", max_length=200)
+    apply_affine: bool = True
+    affine: AffineParams | None = None
+    default_feeder: str | None = Field(default=None, max_length=100)
+    default_utility: str = Field(default="ECG_SOUTHERN", max_length=40)
+    requested_by: str | None = Field(default=None, max_length=100)
+
+
+class GpkgMigrationPayload(BaseModel):
+    file_path: str = Field(..., max_length=1024)
+    table: str | None = Field(default=None, max_length=200)
+    source_name: str = Field(default="geopackage-import", max_length=200)
+    apply_affine: bool = False
+    affine: AffineParams | None = None
+    default_feeder: str | None = Field(default=None, max_length=100)
+    default_utility: str = Field(default="ECG_SOUTHERN", max_length=40)
+    requested_by: str | None = Field(default=None, max_length=100)
+
+
+class DeviceTokenPayload(BaseModel):
+    technician_id: str = Field(..., min_length=1, max_length=100)
+    token: str = Field(..., min_length=8, max_length=512)
+    platform: str = Field(default="android", max_length=32)
 
 
 class EquipmentUpdatePayload(BaseModel):
     nominal_voltage: Literal[
         "LV_230V", "LV_400V", "MV_11KV", "MV_33KV", "HV_161KV", "HV_330KV"
     ]
+    operator_id: str | None = Field(default=None, max_length=100)
 
 
 class InspectionCreatePayload(BaseModel):
@@ -406,6 +976,26 @@ class SpotBillPayload(BaseModel):
     tariff_rate_ghs: float = Field(default=1.25, gt=0)
     field_technician: str | None = None
     evidence_photo_url: str | None = None
+
+
+class H3AssignmentPayload(BaseModel):
+    h3_index: str = Field(min_length=1, max_length=32)
+    resolution: int = Field(default=9, ge=0, le=15)
+    assigned_to: str | None = None
+    status: Literal["ASSIGNED", "IN_PROGRESS", "DONE", "BLOCKED"] = "ASSIGNED"
+    note: str | None = None
+
+
+class H3BatchAssignmentPayload(BaseModel):
+    h3_indexes: list[str] = Field(min_length=1, max_length=500)
+    resolution: int = Field(default=9, ge=0, le=15)
+    assigned_to: str = Field(min_length=1, max_length=128)
+    status: Literal["ASSIGNED", "IN_PROGRESS", "DONE", "BLOCKED"] = "ASSIGNED"
+    note: str | None = None
+
+
+class H3DeleteAssignmentsPayload(BaseModel):
+    h3_indexes: list[str] = Field(min_length=1, max_length=500)
 
 
 def _pg_connect():
@@ -514,6 +1104,9 @@ def sync_to_graph_store(payload: WebhookPayload) -> None:
     # Master (public) changes only — staging rows must not reach Memgraph until promoted.
     if payload.schema and payload.schema != "public":
         return
+    topology_tables = {"connectivity_nodes", "ac_line_segments", "identified_objects", "conducting_equipment"}
+    if payload.table in topology_tables and payload.type:
+        invalidate_topology_cache()
     if payload.table in ("connectivity_nodes", "ac_line_segments") and payload.type:
         apply_webhook_event(
             graph_driver,
@@ -533,8 +1126,30 @@ async def handle_supabase_sync(
     payload: WebhookPayload,
     background_tasks: BackgroundTasks,
 ):
+    dedup_material = {
+        "type": payload.type,
+        "table": payload.table,
+        "schema": payload.schema,
+        "record": payload.record,
+        "old_record": payload.old_record,
+    }
+    if not claim_idempotency(webhook_dedup_key(dedup_material)):
+        return {"status": "duplicate"}
     background_tasks.add_task(sync_to_graph_store, payload)
     return {"status": "queued"}
+
+
+@app.get("/api/v1/graph/parity")
+async def graph_parity():
+    """Read-only Postgres vs Memgraph node/edge counts."""
+    try:
+        return cached_json(
+            graph_parity_key(),
+            lambda: graph_parity_report(graph_driver),
+            OPS_CACHE_TTL_SEC,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/graph/reconcile")
@@ -583,16 +1198,29 @@ def _asset_tier(cur, mrid: str) -> str | None:
 
 
 @app.get("/api/v1/assets/staging")
-async def list_staging_assets():
+async def list_staging_assets(
+    include_rejected: bool = Query(default=False),
+    submitted_by: str | None = Query(default=None),
+):
     """Pending field assets awaiting backoffice approval."""
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    try:
+    cache_key = assets_staging_key(include_rejected, submitted_by)
+
+    def _fetch():
         conn = psycopg2.connect(SUPABASE_DB_URI)
         try:
+            filters = []
+            params: list[Any] = []
+            if not include_rejected:
+                filters.append("io.validation <> 'REJECTED'")
+            if submitted_by:
+                filters.append("io.submitted_by = %s")
+                params.append(submitted_by)
+            where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     SELECT
                       cn.mrid::text,
                       io.name,
@@ -601,12 +1229,15 @@ async def list_staging_assets():
                       cn.boundary_feeder_id,
                       ga.operating_utility::text,
                       ga.substation_name,
-                      NULL::text AS nominal_voltage
+                      NULL::text AS nominal_voltage,
+                      io.submitted_by
                     FROM staging.connectivity_nodes cn
                     JOIN staging.identified_objects io ON cn.mrid = io.mrid
                     LEFT JOIN staging.ghana_grid_assets ga ON cn.mrid = ga.mrid
+                    {where_clause}
                     ORDER BY io.updated_at DESC
-                    """
+                    """,
+                    params,
                 )
                 rows = cur.fetchall()
         finally:
@@ -622,11 +1253,15 @@ async def list_staging_assets():
                     "operating_utility": r[5],
                     "substation_name": r[6],
                     "nominal_voltage": r[7],
+                    "submitted_by": r[8],
                     "tier": "staging",
                 }
                 for r in rows
             ]
         }
+
+    try:
+        return cached_json(cache_key, _fetch, OPS_CACHE_TTL_SEC)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -635,6 +1270,17 @@ async def list_staging_assets():
 async def submit_field_node(payload: FieldNodePayload):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+
+    if payload.idempotency_key:
+        ikey = idempotency_key("field-nodes", payload.idempotency_key)
+        cached = get_idempotent_response(ikey)
+        if cached is not None:
+            return cached
+        if not claim_idempotency(ikey):
+            cached = get_idempotent_response(ikey)
+            if cached is not None:
+                return cached
+            raise HTTPException(status_code=409, detail="Duplicate request in progress")
 
     proposed = payload.model_dump()
     conn = psycopg2.connect(SUPABASE_DB_URI)
@@ -656,6 +1302,7 @@ async def submit_field_node(payload: FieldNodePayload):
                             proposed_payload=proposed,
                         )
                         conn.commit()
+                        invalidate_ops_cache()
                         return JSONResponse(
                             status_code=409,
                             content={
@@ -674,18 +1321,95 @@ async def submit_field_node(payload: FieldNodePayload):
         with conn.cursor() as cur:
             if payload.mrid:
                 tier = _asset_tier(cur, mrid)
-                if tier:
+                if tier == "staging":
+                    validation = fetch_staging_validation(conn, mrid)
+                    if validation == "REJECTED":
+                        set_lineage_context(conn, skip=True)
+                        cur.execute(
+                            """
+                            UPDATE staging.identified_objects
+                            SET name = %s,
+                                validation = 'PENDING_FIELD',
+                                error_log = NULL,
+                                submitted_by = COALESCE(%s, submitted_by),
+                                updated_at = NOW()
+                            WHERE mrid = %s
+                            """,
+                            (payload.name, payload.operator_id, mrid),
+                        )
+                        cur.execute(
+                            """
+                            UPDATE staging.connectivity_nodes
+                            SET geom = ST_SetSRID(ST_MakePoint(%s, %s), 4326),
+                                boundary_feeder_id = COALESCE(%s, boundary_feeder_id)
+                            WHERE mrid = %s
+                            """,
+                            (
+                                payload.longitude,
+                                payload.latitude,
+                                payload.boundary_feeder_id,
+                                mrid,
+                            ),
+                        )
+                        cur.execute(
+                            """
+                            UPDATE staging.ghana_grid_assets
+                            SET operating_utility = %s::ghana_utility_enum,
+                                substation_name = COALESCE(%s, substation_name)
+                            WHERE mrid = %s
+                            """,
+                            (
+                                payload.operating_utility,
+                                payload.substation_name or payload.name,
+                                mrid,
+                            ),
+                        )
+                        log_lineage(
+                            conn,
+                            target_mrid=mrid,
+                            source_type="FIELD_SYNC",
+                            action_type="FIELD_RECAPTURE",
+                            operator_id=payload.operator_id,
+                            provenance_ref="POST /api/v1/field/nodes",
+                            after_state=proposed,
+                        )
+                        conn.commit()
+                        result = {
+                            "mrid": mrid,
+                            "validation": "PENDING_FIELD",
+                            "tier": "staging",
+                            "name": payload.name,
+                            "longitude": payload.longitude,
+                            "latitude": payload.latitude,
+                            "boundary_feeder_id": payload.boundary_feeder_id,
+                            "recaptured": True,
+                        }
+                        if payload.idempotency_key:
+                            store_idempotent_response(
+                                idempotency_key("field-nodes", payload.idempotency_key),
+                                result,
+                            )
+                        invalidate_after_staging_write()
+                        return result
                     raise HTTPException(
                         status_code=400,
                         detail=f"Asset {mrid} already exists; use conflict flow if updating",
                     )
+                if tier == "master":
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Asset {mrid} already exists in master",
+                    )
 
+            set_lineage_context(conn, skip=True)
             cur.execute(
                 """
-                INSERT INTO staging.identified_objects (mrid, name, lifecycle_state, validation)
-                VALUES (%s, %s, 'IN_SERVICE', 'PENDING_FIELD')
+                INSERT INTO staging.identified_objects (
+                  mrid, name, lifecycle_state, validation, submitted_by
+                )
+                VALUES (%s, %s, 'IN_SERVICE', 'PENDING_FIELD', %s)
                 """,
-                (mrid, payload.name),
+                (mrid, payload.name, payload.operator_id),
             )
             cur.execute(
                 """
@@ -709,9 +1433,11 @@ async def submit_field_node(payload: FieldNodePayload):
                 target_mrid=mrid,
                 source_type="FIELD_SYNC",
                 action_type="FIELD_CAPTURE",
+                operator_id=payload.operator_id,
                 provenance_ref="POST /api/v1/field/nodes",
                 after_state=proposed,
             )
+            run_asset_checks(conn, mrid, "staging")
             conn.commit()
     except HTTPException:
         raise
@@ -720,7 +1446,7 @@ async def submit_field_node(payload: FieldNodePayload):
     finally:
         conn.close()
 
-    return {
+    result = {
         "mrid": mrid,
         "validation": "PENDING_FIELD",
         "tier": "staging",
@@ -729,6 +1455,545 @@ async def submit_field_node(payload: FieldNodePayload):
         "latitude": payload.latitude,
         "boundary_feeder_id": feeder_id,
     }
+    if payload.idempotency_key:
+        store_idempotent_response(
+            idempotency_key("field-nodes", payload.idempotency_key),
+            result,
+        )
+    invalidate_after_staging_write()
+    return result
+
+
+@app.post("/api/v1/field/location")
+async def report_field_location(payload: FieldLocationPayload):
+    """Upsert latest GPS position for a field technician."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            result = upsert_technician_position(
+                conn,
+                technician_id=payload.technician_id,
+                longitude=payload.longitude,
+                latitude=payload.latitude,
+                display_name=payload.display_name,
+                accuracy_m=payload.accuracy_m,
+                heading_deg=payload.heading_deg,
+                speed_mps=payload.speed_mps,
+                work_order_id=payload.work_order_id,
+                session_started_at=payload.session_started_at,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/field/technicians")
+async def get_field_technicians(
+    stale_minutes: int = Query(default=30, ge=1, le=240),
+):
+    """Active field technicians with latest positions and submission counts."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            technicians = list_active_technicians(conn, stale_minutes=stale_minutes)
+        finally:
+            conn.close()
+        return {"technicians": technicians, "stale_minutes": stale_minutes}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/field/technicians/{technician_id}/submissions")
+async def get_technician_submissions(
+    technician_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """Staging assets submitted by a field technician."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            submissions = list_technician_submissions(conn, technician_id, limit=limit)
+        finally:
+            conn.close()
+        return {"technician_id": technician_id, "submissions": submissions}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/field/device-tokens")
+async def post_field_device_token(payload: DeviceTokenPayload):
+    """Register FCM/APNs token for push (optional; polling fallback when unset)."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            result = register_device_token(
+                conn,
+                technician_id=payload.technician_id,
+                token=payload.token,
+                platform=payload.platform,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/field/notifications")
+async def get_field_notifications(
+    technician_id: str = Query(..., min_length=1),
+    undelivered_only: bool = Query(default=True),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """Pending notifications for a field technician (poll from mobile)."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            notifications = list_technician_notifications(
+                conn,
+                technician_id,
+                undelivered_only=undelivered_only,
+                limit=limit,
+            )
+        finally:
+            conn.close()
+        return {"technician_id": technician_id, "notifications": notifications}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/field/notifications/{notification_id}/delivered")
+async def post_notification_delivered(notification_id: str):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            result = mark_notification_delivered(conn, notification_id)
+            if not result:
+                raise HTTPException(status_code=404, detail="Notification not found")
+            conn.commit()
+        finally:
+            conn.close()
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/field/notifications/{notification_id}/read")
+async def post_notification_read(
+    notification_id: str,
+    technician_id: str = Query(..., min_length=1),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            result = mark_notification_read(conn, notification_id, technician_id)
+            if not result:
+                raise HTTPException(status_code=404, detail="Notification not found")
+            conn.commit()
+        finally:
+            conn.close()
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/map/nodes")
+async def get_map_nodes_near(
+    lat: float = Query(..., ge=-90, le=90),
+    lon: float = Query(..., ge=-180, le=180),
+    limit: int = Query(default=500, ge=1, le=1000),
+    prefer_wired: bool = Query(default=False),
+):
+    """Mobile map nodes — same data as Supabase nodes_near_location, via sync-service."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    cache_key = map_nodes_key(lat, lon, limit, prefer_wired)
+    cached = get_json(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            rows = await asyncio.to_thread(
+                lambda: fetch_nodes_near_location(
+                    conn,
+                    lat=lat,
+                    lon=lon,
+                    limit=limit,
+                    prefer_wired=prefer_wired,
+                )
+            )
+            result = {"nodes": rows, "count": len(rows)}
+            set_json(cache_key, result)
+            return result
+        finally:
+            conn.close()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _require_h3() -> None:
+    if not h3x.H3_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "H3 spatial index unavailable: "
+                f"{h3x.H3_IMPORT_ERROR or 'h3 not installed'}. "
+                "Install with: pip install -r sync-service/requirements.txt"
+            ),
+        )
+
+
+@app.get("/api/v1/nodes/by-cells")
+async def get_nodes_by_cells(
+    cells: str | None = Query(default=None, description="Comma-separated H3 cells"),
+    lat: float | None = Query(default=None, ge=-90, le=90),
+    lng: float | None = Query(default=None, ge=-180, le=180),
+    k: int = Query(default=1, ge=0, le=12),
+    res: int = Query(default=h3x.DEFAULT_RES, ge=0, le=15),
+    have: str | None = Query(default=None, description="Already-cached cells to skip"),
+    limit: int = Query(default=4000, ge=1, le=20000),
+    include_staging: bool = Query(default=True),
+):
+    """Stream master (+ optional staging) nodes for H3 cells.
+
+    Either pass an explicit `cells` list, or `lat`/`lng` (+ `k`) to derive the
+    ring server-side. `have` lists cells the client already cached so only the
+    newly entered cells are queried and returned.
+    """
+    _require_h3()
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+
+    res = h3x.clamp_resolution(res)
+    center_cell: str | None = None
+
+    if cells:
+        target_cells = [c.strip() for c in cells.split(",") if c.strip()]
+    elif lat is not None and lng is not None:
+        center_cell, target_cells = h3x.ring_cells(lat, lng, res, k)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either `cells` or both `lat` and `lng`.",
+        )
+
+    target_cells = [c for c in target_cells if h3x.is_valid_cell(c)]
+    if not target_cells:
+        raise HTTPException(status_code=400, detail="No valid H3 cells in request.")
+
+    have_set = {c.strip() for c in have.split(",")} if have else set()
+    fetch_cells = [c for c in target_cells if c not in have_set]
+
+    nodes: list[dict[str, Any]] = []
+    if fetch_cells:
+        cache_key = h3_cells_key(fetch_cells, res, limit, include_staging)
+        cached = get_json(cache_key)
+        if cached is not None:
+            nodes = cached.get("nodes", [])
+        else:
+            conn = psycopg2.connect(SUPABASE_DB_URI)
+            try:
+                from h3_service import fetch_map_nodes_in_cells
+
+                nodes = await asyncio.to_thread(
+                    lambda: fetch_map_nodes_in_cells(
+                        conn,
+                        cells=fetch_cells,
+                        res=res,
+                        limit=limit,
+                        include_staging=include_staging,
+                    )
+                )
+                set_json(cache_key, {"nodes": nodes})
+            finally:
+                conn.close()
+
+    return {
+        "resolution": res,
+        "center_cell": center_cell,
+        "cells": target_cells,
+        "fetched_cells": fetch_cells,
+        "nodes": nodes,
+        "count": len(nodes),
+        "include_staging": include_staging,
+    }
+
+
+@app.get("/api/v1/h3/coverage")
+async def get_h3_coverage(
+    west: float = Query(..., ge=-180, le=180),
+    south: float = Query(..., ge=-90, le=90),
+    east: float = Query(..., ge=-180, le=180),
+    north: float = Query(..., ge=-90, le=90),
+    res: int = Query(default=8, ge=0, le=15),
+    include_reference: bool = Query(default=True),
+):
+    """Per-hex rebuild coverage (verified / staged / reference) as GeoJSON."""
+    _require_h3()
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    if west >= east or south >= north:
+        raise HTTPException(status_code=400, detail="Invalid bbox")
+
+    res = h3x.clamp_resolution(res)
+    cache_key = h3_coverage_key(west, south, east, north, res, include_reference)
+
+    def _fetch():
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            return fetch_coverage(
+                conn,
+                west=west,
+                south=south,
+                east=east,
+                north=north,
+                res=res,
+                include_reference=include_reference,
+            )
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(lambda: cached_json(cache_key, _fetch))
+
+
+@app.get("/api/v1/h3/assignments")
+async def get_h3_assignments(
+    assigned_to: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        items = await asyncio.to_thread(
+            lambda: list_assignments(conn, assigned_to=assigned_to, status=status)
+        )
+        return {"assignments": items, "count": len(items)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/h3/status")
+async def get_h3_status():
+    """Lightweight probe — present only on builds with territory/H3 routes."""
+    return {
+        "endpoints_ready": True,
+        "h3_available": h3x.H3_AVAILABLE,
+        "import_error": h3x.H3_IMPORT_ERROR,
+        "default_res": h3x.DEFAULT_RES,
+    }
+
+
+@app.get("/api/v1/h3/cell-at")
+async def get_h3_cell_at(
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+    res: int = Query(default=h3x.DEFAULT_RES, ge=0, le=15),
+):
+    """H3 cell for a map click (portal territory picker)."""
+    _require_h3()
+    res = h3x.clamp_resolution(res)
+    return cell_at_point(lat, lng, res)
+
+
+@app.get("/api/v1/h3/grid/geojson")
+async def get_h3_grid_geojson(
+    west: float = Query(..., ge=-180, le=180),
+    south: float = Query(..., ge=-90, le=90),
+    east: float = Query(..., ge=-180, le=180),
+    north: float = Query(..., ge=-90, le=90),
+    res: int = Query(default=h3x.DEFAULT_RES, ge=0, le=15),
+    max_cells: int = Query(default=800, ge=1, le=2000),
+):
+    """Hex grid covering the viewport bbox (portal territory picker)."""
+    _require_h3()
+    if west >= east or south >= north:
+        raise HTTPException(status_code=400, detail="Invalid bbox")
+    res = h3x.clamp_resolution(res)
+    cache_key = h3_grid_key(west, south, east, north, res, max_cells)
+    return cached_json(
+        cache_key,
+        lambda: bbox_grid_geojson(west, south, east, north, res, max_cells=max_cells),
+    )
+
+
+@app.get("/api/v1/h3/assignments/geojson")
+async def get_h3_assignments_geojson(
+    assigned_to: str | None = Query(default=None),
+    status: str | None = Query(
+        default=None,
+        description="Comma-separated statuses (e.g. ASSIGNED,IN_PROGRESS)",
+    ),
+):
+    """Assignment hexagons as GeoJSON so the field app can draw a worker's territory."""
+    _require_h3()
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    statuses = [s for s in (status.split(",") if status else []) if s.strip()]
+    cache_key = h3_assignments_geojson_key(assigned_to, status)
+
+    def _fetch():
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            return assignments_geojson(
+                conn, assigned_to=assigned_to, statuses=statuses
+            )
+        finally:
+            conn.close()
+
+    try:
+        return await asyncio.to_thread(lambda: cached_json(cache_key, _fetch))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/h3/assignments/batch")
+async def post_h3_assignments_batch(payload: H3BatchAssignmentPayload):
+    """Assign multiple hex cells to one technician in one request."""
+    _require_h3()
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        items = await asyncio.to_thread(
+            lambda: batch_upsert_assignments(
+                conn,
+                h3_indexes=payload.h3_indexes,
+                resolution=h3x.clamp_resolution(payload.resolution),
+                assigned_to=payload.assigned_to,
+                status=payload.status,
+                note=payload.note,
+            )
+        )
+        invalidate_h3_cache()
+        return {"assignments": items, "count": len(items)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.delete("/api/v1/h3/assignments")
+async def delete_h3_assignments(payload: H3DeleteAssignmentsPayload):
+    """Unassign hex cells (remove territory rows)."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        deleted = await asyncio.to_thread(
+            lambda: delete_assignments(conn, payload.h3_indexes)
+        )
+        invalidate_h3_cache()
+        return {"deleted": deleted}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/h3/assignments")
+async def post_h3_assignment(payload: H3AssignmentPayload):
+    _require_h3()
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    if not h3x.is_valid_cell(payload.h3_index):
+        raise HTTPException(status_code=400, detail="Invalid h3_index")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        result = await asyncio.to_thread(
+            lambda: upsert_assignment(
+                conn,
+                h3_index=payload.h3_index,
+                resolution=payload.resolution,
+                assigned_to=payload.assigned_to,
+                status=payload.status,
+                note=payload.note,
+            )
+        )
+        invalidate_h3_cache()
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/nodes/{mrid}/connections")
+async def get_node_connections(
+    mrid: str,
+    limit: int = Query(default=25, ge=1, le=100),
+):
+    """Indexed adjacency lookup for mobile map (fast alternative to Supabase RPC)."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    cache_key = node_connections_key(mrid, limit)
+    cached = get_json(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            result = await asyncio.to_thread(
+                lambda: fetch_node_connections(conn, mrid, limit=limit)
+            )
+            set_json(cache_key, result)
+            return result
+        finally:
+            conn.close()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/nodes/connections/bulk")
+async def get_bulk_node_connections(payload: BulkNodeConnectionsPayload):
+    """Prefetch adjacency for many nodes (mobile offline topology cache)."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    cache_key = bulk_connections_key(payload.mrids, payload.limit_per_node)
+    cached = get_json(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            result = await asyncio.to_thread(
+                lambda: fetch_bulk_node_connections(
+                    conn,
+                    payload.mrids,
+                    limit_per_node=payload.limit_per_node,
+                )
+            )
+            set_json(cache_key, result)
+            return result
+        finally:
+            conn.close()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/topology/repair")
@@ -736,49 +2001,170 @@ async def repair_topology(payload: TopologyRepairPayload, background_tasks: Back
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
 
-    try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
-        try:
-            with conn.cursor() as cur:
-                tier = _asset_tier(cur, payload.target_mrid)
-                if tier == "staging":
-                    cur.execute(
-                        "SELECT repair_staging_asset_topology_and_attributes(%s::uuid, %s)",
-                        (payload.target_mrid, payload.radius_meters),
-                    )
-                elif tier == "master":
-                    cur.execute(
-                        "SELECT repair_asset_topology_and_attributes(%s::uuid, %s)",
-                        (payload.target_mrid, payload.radius_meters),
-                    )
-                else:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Asset {payload.target_mrid} not found in staging or master",
-                    )
-                result = cur.fetchone()[0]
-                log_lineage(
-                    conn,
-                    target_mrid=payload.target_mrid,
-                    source_type="REPAIR",
-                    action_type="TOPOLOGY_REPAIR",
-                    provenance_ref="POST /api/v1/topology/repair",
-                    after_state={"result": result},
-                )
-                conn.commit()
-        finally:
-            conn.close()
-    except Exception as exc:
-        msg = str(exc)
-        if "repair_asset_topology_and_attributes" in msg and "does not exist" in msg:
+    lock_name = repair_lock_key(payload.target_mrid)
+    with lock(lock_name) as token:
+        if token is None:
             raise HTTPException(
-                status_code=503,
-                detail="Migration 00007 not applied. Run: npx supabase db reset",
-            ) from exc
-        raise HTTPException(status_code=500, detail=msg) from exc
+                status_code=409,
+                detail=f"Repair already in progress for {payload.target_mrid}",
+            )
+        try:
+            conn = psycopg2.connect(SUPABASE_DB_URI)
+            try:
+                with conn.cursor() as cur:
+                    tier = _asset_tier(cur, payload.target_mrid)
+                    if tier == "staging":
+                        if payload.dry_run:
+                            cur.execute(
+                                """
+                                SELECT jsonb_build_object(
+                                  'target_mrid', %s::text,
+                                  'tier', 'staging',
+                                  'dry_run', true,
+                                  'proposed', jsonb_build_array(
+                                    jsonb_build_object('action', 'staging_asset_verified')
+                                  ),
+                                  'applied', '[]'::jsonb,
+                                  'skipped', '[]'::jsonb
+                                )
+                                """,
+                                (payload.target_mrid,),
+                            )
+                        else:
+                            cur.execute(
+                                "SELECT repair_staging_asset_topology_and_attributes(%s::uuid, %s)",
+                                (payload.target_mrid, payload.radius_meters),
+                            )
+                    elif tier == "master":
+                        cur.execute(
+                            """
+                            SELECT repair_asset_topology_and_attributes(
+                              %s::uuid, %s, %s
+                            )
+                            """,
+                            (payload.target_mrid, payload.radius_meters, payload.dry_run),
+                        )
+                    else:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Asset {payload.target_mrid} not found in staging or master",
+                        )
+                    result = cur.fetchone()[0]
+                    applied = result.get("applied") or []
+                    if not payload.dry_run and tier == "master" and applied:
+                        run_asset_checks(conn, payload.target_mrid, "master")
+                        log_lineage(
+                            conn,
+                            target_mrid=payload.target_mrid,
+                            source_type="REPAIR",
+                            action_type="TOPOLOGY_REPAIR",
+                            operator_id=payload.operator_id,
+                            provenance_ref="POST /api/v1/topology/repair",
+                            after_state={"result": result},
+                        )
+                    elif not payload.dry_run and tier == "staging":
+                        log_lineage(
+                            conn,
+                            target_mrid=payload.target_mrid,
+                            source_type="REPAIR",
+                            action_type="TOPOLOGY_REPAIR",
+                            operator_id=payload.operator_id,
+                            provenance_ref="POST /api/v1/topology/repair",
+                            after_state={"result": result},
+                        )
+                    conn.commit()
+            finally:
+                conn.close()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            msg = str(exc)
+            if "repair_asset_topology_and_attributes" in msg and "does not exist" in msg:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Migration 00035 not applied. Run: npx supabase migration up --local",
+                ) from exc
+            raise HTTPException(status_code=500, detail=msg) from exc
 
-    background_tasks.add_task(reconcile_memgraph, graph_driver)
-    return {"status": "repaired", "result": result}
+    if not payload.dry_run:
+        invalidate_topology_cache()
+        background_tasks.add_task(reconcile_memgraph, graph_driver)
+    return {
+        "status": "preview" if payload.dry_run else "repaired",
+        "dry_run": payload.dry_run,
+        "result": result,
+    }
+
+
+@app.get("/api/v1/topology/health")
+async def topology_health():
+    """Master topology quality summary (orphans, components, counts)."""
+    cache_key = topology_health_key()
+    cached = get_json(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        payload = await asyncio.to_thread(topology_health_report)
+        set_json(cache_key, payload)
+        return payload
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/topology/gaps")
+async def topology_gaps(
+    limit: int = Query(default=2000, ge=1, le=10000),
+    west: float | None = Query(default=None, ge=-180, le=180),
+    south: float | None = Query(default=None, ge=-90, le=90),
+    east: float | None = Query(default=None, ge=-180, le=180),
+    north: float | None = Query(default=None, ge=-90, le=90),
+):
+    """Disconnected connectivity nodes (portal topology_gaps, data stewardship)."""
+    if None not in (west, south, east, north) and (west >= east or south >= north):
+        raise HTTPException(status_code=400, detail="Invalid bbox")
+    cache_key = topology_gaps_key(limit, west, south, east, north)
+    cached = get_json(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        payload = await asyncio.to_thread(
+            topology_gaps_payload,
+            limit=limit,
+            west=west,
+            south=south,
+            east=east,
+            north=north,
+        )
+        set_json(cache_key, payload)
+        return payload
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/topology/impact")
+async def topology_impact(
+    start_mrid: str = Query(..., min_length=36, max_length=36),
+    max_nodes: int = Query(default=5000, ge=1, le=20000),
+):
+    """Downstream nodes and lines from a fault / outage seed (directed feeder walk)."""
+    cache_key = topology_impact_key(start_mrid, max_nodes)
+    cached = get_json(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        payload = await asyncio.to_thread(
+            downstream_impact_payload,
+            start_mrid,
+            max_nodes=max_nodes,
+        )
+        if not payload["nodes"]:
+            raise HTTPException(status_code=404, detail=f"No nodes found for mrid {start_mrid}")
+        set_json(cache_key, payload)
+        return payload
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.patch("/api/v1/assets/{mrid}/validation")
@@ -799,9 +2185,24 @@ async def update_asset_validation(
                     raise HTTPException(status_code=404, detail=f"Asset {mrid} not found")
 
                 if tier == "staging" and payload.validation == "APPROVED":
+                    run_asset_checks(conn, mrid, "staging")
+                    blocking = count_blocking_open(conn, mrid)
+                    if blocking and not payload.override_data_quality:
+                        conn.commit()
+                        return JSONResponse(
+                            status_code=422,
+                            content={
+                                "detail": "Blocked by open data-quality exceptions",
+                                "mrid": mrid,
+                                "blocking_exceptions": blocking,
+                            },
+                        )
+                    if payload.operator_id:
+                        set_lineage_context(conn, operator_id=payload.operator_id)
                     cur.execute("SELECT promote_staged_asset(%s::uuid)", (mrid,))
                     result = cur.fetchone()[0]
                     conn.commit()
+                    invalidate_after_promote()
                     reconcile_memgraph(graph_driver)
                     return {
                         "mrid": result["mrid"],
@@ -809,6 +2210,91 @@ async def update_asset_validation(
                         "promoted": result.get("promoted", True),
                         "tier": "master",
                     }
+
+                if tier == "staging" and payload.validation == "REJECTED":
+                    cur.execute(
+                        """
+                        SELECT io.name, io.validation::text, io.error_log, io.submitted_by,
+                               ST_X(cn.geom) AS lon, ST_Y(cn.geom) AS lat
+                        FROM staging.identified_objects io
+                        JOIN staging.connectivity_nodes cn ON cn.mrid = io.mrid
+                        WHERE io.mrid = %s
+                        """,
+                        (mrid,),
+                    )
+                    before = cur.fetchone()
+                    if not before:
+                        raise HTTPException(status_code=404, detail=f"Asset {mrid} not found")
+                    if before[1] not in ("PENDING_FIELD", "STAGED", "IN_CONFLICT"):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Asset {mrid} cannot be rejected (validation={before[1]})",
+                        )
+                    reason = (payload.reason or "").strip()
+                    error_log = before[2] or ""
+                    if reason:
+                        error_log = f"{error_log}\n[{datetime.utcnow().isoformat()}Z] REJECTED: {reason}".strip()
+                    set_lineage_context(conn, skip=True)
+                    cur.execute(
+                        """
+                        UPDATE staging.identified_objects
+                        SET validation = 'REJECTED',
+                            error_log = %s,
+                            updated_at = NOW()
+                        WHERE mrid = %s
+                        RETURNING mrid, name, validation::text
+                        """,
+                        (error_log or None, mrid),
+                    )
+                    row = cur.fetchone()
+                    log_lineage(
+                        conn,
+                        target_mrid=mrid,
+                        source_type="FIELD_SYNC",
+                        action_type="FIELD_REJECTED",
+                        operator_id=payload.operator_id,
+                        provenance_ref="PATCH /api/v1/assets/{mrid}/validation",
+                        before_state={
+                            "name": before[0],
+                            "validation": before[1],
+                            "longitude": before[4],
+                            "latitude": before[5],
+                        },
+                        after_state={"validation": "REJECTED", "reason": reason or None},
+                    )
+                    submitted_by = before[3]
+                    asset_name = before[0] or row[1]
+                    push_payload = {
+                        "mrid": mrid,
+                        "name": asset_name,
+                        "reason": reason or None,
+                        "message_type": "ASSET_REJECTED",
+                        "latitude": before[5],
+                        "longitude": before[4],
+                    }
+                    push_title = "Asset rejected"
+                    push_body = f'"{asset_name or mrid}" was rejected by backoffice.'
+                    if reason:
+                        push_body = f"{push_body} Reason: {reason}"
+                    notify_asset_rejected(
+                        conn,
+                        mrid=mrid,
+                        name=asset_name,
+                        submitted_by=submitted_by,
+                        reason=reason or None,
+                        latitude=before[5],
+                        longitude=before[4],
+                    )
+                    conn.commit()
+                    invalidate_after_staging_write()
+                    background_tasks.add_task(
+                        _push_rejection_notification,
+                        submitted_by,
+                        push_title,
+                        push_body,
+                        push_payload,
+                    )
+                    return {"mrid": row[0], "name": row[1], "validation": row[2], "tier": tier}
 
                 table = "staging.identified_objects" if tier == "staging" else "public.identified_objects"
                 cur.execute(
@@ -859,6 +2345,7 @@ async def update_asset(mrid: str, payload: AssetUpdatePayload):
                             proposed_payload=payload.model_dump(),
                         )
                         conn.commit()
+                        invalidate_ops_cache()
                         return JSONResponse(
                             status_code=409,
                             content={
@@ -869,6 +2356,7 @@ async def update_asset(mrid: str, payload: AssetUpdatePayload):
                         )
 
                 table = "staging.identified_objects" if tier == "staging" else "public.identified_objects"
+                set_lineage_context(conn, skip=True)
                 cur.execute(f"SELECT row_to_json(t)::jsonb FROM {table} t WHERE mrid = %s", (mrid,))
                 before_row = cur.fetchone()
                 cur.execute(
@@ -909,6 +2397,14 @@ async def update_asset_equipment(mrid: str, payload: EquipmentUpdatePayload):
                 if tier is None:
                     raise HTTPException(status_code=404, detail=f"Asset {mrid} not found")
                 schema = "staging" if tier == "staging" else "public"
+                cur.execute(f"SELECT row_to_json(t)::jsonb FROM {schema}.conducting_equipment t WHERE mrid = %s", (mrid,))
+                before_row = cur.fetchone()
+                set_lineage_context(
+                    conn,
+                    source_type="MANUAL_EDIT",
+                    operator_id=payload.operator_id,
+                    provenance_ref="PATCH /api/v1/assets/{mrid}/equipment",
+                )
                 cur.execute(
                     f"""
                     UPDATE {schema}.conducting_equipment
@@ -1140,7 +2636,9 @@ async def list_master_assets_bbox(
         raise HTTPException(status_code=400, detail="Invalid bbox")
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    try:
+    cache_key = assets_master_key(west, south, east, north, limit)
+
+    def _fetch():
         conn = psycopg2.connect(SUPABASE_DB_URI)
         try:
             with conn.cursor() as cur:
@@ -1165,6 +2663,75 @@ async def list_master_assets_bbox(
                 for r in rows
             ]
         }
+
+    try:
+        return cached_json(cache_key, _fetch)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/assets/{mrid}")
+async def get_asset_detail(mrid: str):
+    """Single connectivity node — master or staging — for map identify and focus."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    cache_key = asset_detail_key(mrid)
+    cached = get_json(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            with conn.cursor() as cur:
+                tier = _asset_tier(cur, mrid)
+                if tier is None:
+                    raise HTTPException(status_code=404, detail=f"Asset {mrid} not found")
+                if tier == "staging":
+                    cur.execute(
+                        """
+                        SELECT cn.mrid::text, io.name, io.validation::text,
+                               ST_X(cn.geom) AS longitude, ST_Y(cn.geom) AS latitude,
+                               cn.boundary_feeder_id,
+                               NULL::text AS nominal_voltage
+                        FROM staging.connectivity_nodes cn
+                        JOIN staging.identified_objects io ON io.mrid = cn.mrid
+                        WHERE cn.mrid = %s::uuid
+                        """,
+                        (mrid,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT cn.mrid::text, io.name, io.validation::text,
+                               ST_X(cn.geom) AS longitude, ST_Y(cn.geom) AS latitude,
+                               cn.boundary_feeder_id,
+                               ce.nominal_voltage::text
+                        FROM public.connectivity_nodes cn
+                        JOIN public.identified_objects io ON io.mrid = cn.mrid
+                        LEFT JOIN public.conducting_equipment ce ON ce.mrid = cn.mrid
+                        WHERE cn.mrid = %s::uuid
+                        """,
+                        (mrid,),
+                    )
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail=f"Asset {mrid} not found")
+        finally:
+            conn.close()
+        result = {
+            "mrid": row[0],
+            "name": row[1],
+            "validation": row[2],
+            "longitude": float(row[3]) if row[3] is not None else None,
+            "latitude": float(row[4]) if row[4] is not None else None,
+            "boundary_feeder_id": row[5],
+            "nominal_voltage": row[6],
+            "tier": tier,
+        }
+        set_json(cache_key, result)
+        return result
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -1173,12 +2740,31 @@ async def list_master_assets_bbox(
 async def execute_trace(
     start_mrid: str | None = Query(default=None),
     scope: TraceScope = Query(default="traced"),
+    max_hops: int = Query(default=TRACE_MAX_HOPS, ge=1, le=20),
+    max_nodes: int = Query(default=TRACE_MAX_NODES, ge=100, le=20000),
 ):
+    """Bounded network trace from a seed node.
+
+    Never walks the full national graph: results are capped by hop/node/edge
+    limits. ``scope=full`` on large networks automatically falls back to a
+    viewport-bounded PostGIS chunk around the seed.
+    """
     if not start_mrid:
         raise HTTPException(status_code=400, detail="start_mrid query parameter is required")
 
+    cache_key = trace_key(start_mrid, scope, max_hops, max_nodes)
+    cached = get_json(cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        payload = await asyncio.to_thread(_trace_payload_blocking, start_mrid, scope)
+        payload = await asyncio.to_thread(
+            _trace_payload_blocking,
+            start_mrid,
+            scope,
+            max_hops=max_hops,
+            max_nodes=max_nodes,
+        )
 
         if not payload["nodes"]:
             raise HTTPException(
@@ -1186,6 +2772,7 @@ async def execute_trace(
                 detail=f"No connectivity nodes in graph (start_mrid={start_mrid})",
             )
 
+        set_json(cache_key, payload)
         return payload
     except HTTPException:
         raise
@@ -1206,6 +2793,11 @@ async def graph_chunk(
     if west >= east or south >= north:
         raise HTTPException(status_code=400, detail="Invalid bbox: west < east and south < north required")
 
+    cache_key = graph_chunk_key(west, south, east, north, limit, edge_limit, start_mrid)
+    cached = get_json(cache_key)
+    if cached is not None:
+        return cached
+
     traced_mrids: set[str] = set()
     if start_mrid:
         try:
@@ -1214,7 +2806,7 @@ async def graph_chunk(
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     try:
-        return await asyncio.to_thread(
+        payload = await asyncio.to_thread(
             _fetch_graph_chunk_from_postgres,
             west,
             south,
@@ -1224,6 +2816,8 @@ async def graph_chunk(
             traced_mrids,
             edge_limit,
         )
+        set_json(cache_key, payload)
+        return payload
     except HTTPException:
         raise
     except Exception as exc:
@@ -1248,17 +2842,1312 @@ async def get_lineage(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.get("/api/v1/conflicts")
-async def get_conflicts(limit: int = Query(default=100, ge=1, le=500)):
+@app.get("/api/v1/lineage/search")
+async def search_lineage_endpoint(
+    asset_mrid: str | None = Query(default=None),
+    source_type: str | None = Query(default=None),
+    action_type: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0, le=5000),
+):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
         conn = psycopg2.connect(SUPABASE_DB_URI)
         try:
-            conflicts = list_open_conflicts(conn, limit)
+            events = search_lineage(
+                conn,
+                asset_mrid=asset_mrid,
+                source_type=source_type,
+                action_type=action_type,
+                limit=limit,
+                offset=offset,
+            )
         finally:
             conn.close()
-        return {"conflicts": conflicts}
+        return {"events": events, "count": len(events)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/dq/rules")
+async def get_dq_rules():
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+
+    def _fetch():
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            return {"rules": dq_list_rules(conn)}
+        finally:
+            conn.close()
+
+    try:
+        return cached_json(dq_rules_key(), _fetch, RULES_CACHE_TTL_SEC)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/dq/summary")
+async def get_dq_summary():
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+
+    def _fetch():
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            return dq_summary(conn)
+        finally:
+            conn.close()
+
+    try:
+        return cached_json(dq_summary_key(), _fetch, OPS_CACHE_TTL_SEC)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/dq/exceptions")
+async def get_dq_exceptions(
+    status: str | None = Query(default="OPEN"),
+    severity: str | None = Query(default=None),
+    domain: str | None = Query(default=None),
+    record_mrid: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    cache_key = dq_exceptions_key(status, severity, domain, record_mrid, limit)
+
+    def _fetch():
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            items = dq_list_exceptions(
+                conn,
+                status=None if status in (None, "ALL") else status,
+                severity=severity,
+                domain=domain,
+                record_mrid=record_mrid,
+                limit=limit,
+            )
+            return {"exceptions": items, "count": len(items)}
+        finally:
+            conn.close()
+
+    try:
+        return cached_json(cache_key, _fetch, OPS_CACHE_TTL_SEC)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/dq/run")
+async def run_dq_checks(mrid: str = Query(...), tier: str = Query(default="staging")):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    if tier not in ("staging", "master"):
+        raise HTTPException(status_code=400, detail="tier must be staging or master")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        result = run_asset_checks(conn, mrid, tier)
+        conn.commit()
+        invalidate_ops_cache()
+        return result
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/dq/topology/summary")
+async def get_topology_dq_summary(
+    west: float | None = Query(default=None),
+    south: float | None = Query(default=None),
+    east: float | None = Query(default=None),
+    north: float | None = Query(default=None),
+    mode: Literal["snapshot", "live"] = Query(default="snapshot"),
+):
+    """Master topology DQ summary.
+
+    By default (``mode=snapshot``) this serves the most recent completed scan's
+    persisted summary — a single indexed row read — so the portal never pays for
+    the national orphan/dangling scan on load. ``mode=live`` forces a fresh
+    (expensive) recompute, used by the explicit "Refresh live" action and as a
+    fallback when no scan has run yet.
+    """
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    clip = None
+    if None not in (west, south, east, north):
+        if west >= east or south >= north:
+            raise HTTPException(status_code=400, detail="Invalid bbox")
+        clip = {"west": west, "south": south, "east": east, "north": north}
+
+    def _live():
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            return topology_dq_summary(conn, clip=clip)
+        finally:
+            conn.close()
+
+    def _snapshot_or_live():
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            snap = latest_topology_snapshot(conn)
+            if snap is not None:
+                return snap
+            # No scan yet — compute once so the panel isn't empty.
+            return topology_dq_summary(conn, clip=clip)
+        finally:
+            conn.close()
+
+    try:
+        if mode == "live":
+            return await asyncio.to_thread(_live)
+        # Snapshot path is cheap and shared across stewards — cache briefly.
+        return await asyncio.to_thread(
+            lambda: cached_json(topology_dq_summary_key(), _snapshot_or_live, OPS_CACHE_TTL_SEC)
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/ops/badges")
+async def get_nav_badges():
+    """Aggregated left-nav badge counts in a single cached call."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+
+    def _fetch():
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            return {"badges": collect_badge_counts(conn)}
+        finally:
+            conn.close()
+
+    try:
+        return await asyncio.to_thread(
+            lambda: cached_json(nav_badges_key(), _fetch, OPS_CACHE_TTL_SEC)
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/dq/topology/scan")
+async def run_topology_dq_scan(payload: TopologyDqScanPayload, background_tasks: BackgroundTasks):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    clip = payload.clip.model_dump() if payload.clip else None
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        run_id = create_topology_batch_run(
+            conn,
+            clip=clip,
+            requested_by=payload.operator_id,
+        )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+    def _execute() -> None:
+        if not SUPABASE_DB_URI:
+            return
+        bg = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            execute_topology_batch_scan(
+                bg,
+                run_id,
+                clip=clip,
+                requested_by=payload.operator_id,
+            )
+            bg.commit()
+            invalidate_ops_cache()
+            invalidate_topology_cache()
+        except Exception:
+            bg.rollback()
+        finally:
+            bg.close()
+
+    background_tasks.add_task(_execute)
+    return {"run_id": run_id, "status": "running", "message": "Topology scan queued"}
+
+
+@app.get("/api/v1/dq/topology/runs")
+async def list_topology_dq_runs(limit: int = Query(default=20, ge=1, le=100)):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        return {"runs": topology_dq_list_runs(conn, limit=limit)}
+    finally:
+        conn.close()
+
+
+@app.patch("/api/v1/dq/exceptions/{exception_id}")
+async def patch_dq_exception(exception_id: str, payload: DqResolvePayload):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        result = dq_resolve_exception(
+            conn,
+            exception_id,
+            status=payload.status,
+            note=payload.note,
+            operator=payload.operator_id,
+        )
+        conn.commit()
+        invalidate_ops_cache()
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/validation/run")
+async def post_validation_run(
+    payload: ValidationRunPayload,
+    mode: Literal["deterministic", "agent"] | None = Query(default=None),
+    async_run: bool = Query(default=True, alias="async"),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    clip = payload.clip.model_dump() if payload.clip else None
+    req = ValidationRunRequest(
+        run_type=RunType(payload.run_type),
+        mode=RunMode(mode or payload.mode),
+        mrid=payload.mrid,
+        tier=payload.tier,
+        operator_id=payload.operator_id,
+        clip=clip,
+    )
+
+    if async_run:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            run_id = repository.create_validation_run(
+                conn,
+                run_type=req.run_type.value,
+                mode=req.mode.value,
+                requested_by=req.operator_id,
+                metadata={"current_phase": "queued", "completed_phases": []},
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        bg_payload = {
+            "run_id": run_id,
+            "run_type": req.run_type.value,
+            "mode": req.mode.value,
+            "mrid": req.mrid,
+            "tier": req.tier,
+            "operator_id": req.operator_id,
+            "clip": req.clip,
+        }
+
+        async def _background() -> None:
+            await asyncio.to_thread(
+                __import__("agents.runner", fromlist=["execute_validation_background"]).execute_validation_background,
+                bg_payload,
+            )
+
+        asyncio.create_task(_background())
+        return {"run_id": run_id, "status": "running", "async": True}
+
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        if req.mode == RunMode.AGENT:
+            result = await asyncio.to_thread(run_agent_validation_cycle, conn, req)
+        else:
+            result = await asyncio.to_thread(run_validation_cycle, conn, req)
+        conn.commit()
+        invalidate_ops_cache()
+        invalidate_topology_cache()
+        return result
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/validation/runs/{run_id}/progress")
+async def get_validation_run_progress(run_id: str):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        progress = repository.get_run_progress(conn, run_id)
+        if not progress:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return progress
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/agents/status")
+async def get_agents_status():
+    from agents.llm.provider import llm_configured
+    import os
+
+    model = os.getenv("GIOP_LLM_MODEL") or "gpt-4o-mini"
+    return {
+        "engine": "online" if SUPABASE_DB_URI else "offline",
+        "llm_configured": llm_configured(),
+        "llm_model": model if llm_configured() else None,
+        "agents": [
+            "OrchestratorAgent",
+            "ValidatorAgent",
+            "GraphAgent",
+            "QueueManagerAgent",
+            "CleanupAgent",
+            "ApprovalAgent",
+            "StewardAssistant",
+        ],
+    }
+
+
+@app.get("/api/v1/validation/runs")
+async def get_validation_runs(limit: int = Query(default=20, ge=1, le=100)):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        return {"runs": repository.list_validation_runs(conn, limit=limit)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/validation/runs/{run_id}")
+async def get_validation_run(run_id: str):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        run = repository.get_validation_run(conn, run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return run
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/kpis/latest")
+async def get_kpis_latest():
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        snap = repository.latest_kpi_snapshot(conn)
+        if snap:
+            return snap
+        metrics = kpi.compute_kpis(conn)
+        return metrics
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/kpis/run/{run_id}")
+async def get_kpis_for_run(run_id: str):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id::text, run_id::text, topology_validity_pct, completeness_pct,
+                       critical_exception_count, open_exception_count, auto_fix_success_rate,
+                       pending_approval_count, export_blocked, escalation, created_at
+                FROM public.kpi_snapshot WHERE run_id = %s::uuid
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="KPI snapshot not found for run")
+        return {
+            "id": row[0],
+            "run_id": row[1],
+            "topology_validity_pct": row[2],
+            "completeness_pct": row[3],
+            "critical_exception_count": row[4],
+            "open_exception_count": row[5],
+            "auto_fix_success_rate": row[6],
+            "pending_approval_count": row[7],
+            "export_blocked": row[8],
+            "escalation": row[9],
+            "created_at": row[10].isoformat() if row[10] else None,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/portal/ai/chat")
+async def portal_ai_chat(payload: PortalAiChatPayload):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    from agents.llm.chat import run_steward_chat
+
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        result = await asyncio.to_thread(
+            run_steward_chat,
+            conn,
+            message=payload.message,
+            exception_id=payload.exception_id,
+            mrid=payload.mrid,
+            operator_id=payload.operator_id,
+            context=payload.context,
+        )
+        conn.commit()
+        return result.model_dump()
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+class PortalVoiceTurnPayload(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+    session_id: str | None = Field(default=None, max_length=64)
+    exception_id: str | None = None
+    mrid: str | None = None
+    operator_id: str | None = Field(default=None, max_length=100)
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class PortalSpeakPayload(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+
+
+@app.get("/api/v1/portal/ai/voice/status")
+async def portal_voice_status():
+    from agents import voice_stt, voice_tts
+
+    return {
+        "stt": voice_stt.status(),
+        "tts": voice_tts.status(),
+    }
+
+
+@app.post("/api/v1/portal/ai/transcribe")
+async def portal_ai_transcribe(audio: UploadFile = File(...)):
+    from agents import voice_stt
+
+    if not voice_stt.is_available():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Local STT not installed. In the repo venv run: "
+                "pip install -r sync-service/requirements-voice.txt "
+                "(requires ffmpeg)"
+            ),
+        )
+    data = await audio.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty audio upload")
+    try:
+        text = await asyncio.to_thread(
+            voice_stt.transcribe_audio,
+            data,
+            content_type=audio.content_type,
+        )
+        return {"text": text}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/portal/ai/voice-turn")
+async def portal_voice_turn(payload: PortalVoiceTurnPayload):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    from agents.voice import run_voice_turn
+
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        result = await asyncio.to_thread(
+            run_voice_turn,
+            conn,
+            text=payload.text,
+            session_id=payload.session_id,
+            exception_id=payload.exception_id,
+            mrid=payload.mrid,
+            operator_id=payload.operator_id,
+            context=payload.context,
+        )
+        conn.commit()
+        return result.model_dump()
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/portal/ai/speak")
+async def portal_ai_speak(payload: PortalSpeakPayload):
+    from agents import voice_tts
+    from fastapi.responses import Response
+
+    wav = await asyncio.to_thread(voice_tts.synthesize_wav, payload.text)
+    if not wav:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Supertonic TTS unavailable. Start with: ./scripts/start-supertonic.sh "
+                "and set SUPERTONIC_URL in .env"
+            ),
+        )
+    return Response(content=wav, media_type="audio/wav")
+
+
+@app.get("/api/v1/staging/summary")
+async def get_staging_summary():
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    from agents import staging_review
+
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        return staging_review.staging_summary(conn)
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/staging/territory-counts")
+async def get_staging_territory_counts(
+    group_by: str = Query(default="district"),
+    region: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    from agents import staging_review
+
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        return {
+            "group_by": group_by,
+            "counts": staging_review.staging_territory_totals(
+                conn, group_by=group_by, region=region, limit=limit
+            ),
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/staging/review/{mrid}")
+async def get_staging_review(mrid: str):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    from agents import staging_review
+
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        return staging_review.review_staging_asset(conn, mrid)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/spatial/territory")
+async def get_spatial_territory(
+    district: str | None = Query(default=None),
+    region: str | None = Query(default=None),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    from agents import spatial
+
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        return spatial.resolve_territory(conn, district=district, region=region)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/spatial/territory/geojson")
+async def get_spatial_territory_geojson(
+    district: str | None = Query(default=None),
+    region: str | None = Query(default=None),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    from agents import spatial
+
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        return spatial.territory_geojson(conn, district=district, region=region)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/spatial/inventory")
+async def get_spatial_inventory(
+    tier: str = Query(default="master"),
+    asset_kind: str | None = Query(default=None),
+    district: str | None = Query(default=None),
+    region: str | None = Query(default=None),
+    west: float | None = Query(default=None),
+    south: float | None = Query(default=None),
+    east: float | None = Query(default=None),
+    north: float | None = Query(default=None),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    from agents import spatial
+
+    bbox = None
+    if None not in (west, south, east, north):
+        bbox = {"west": west, "south": south, "east": east, "north": north}
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        return spatial.asset_inventory_counts(
+            conn,
+            tier=tier,
+            asset_kind=asset_kind,
+            district=district,
+            region=region,
+            bbox=bbox,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/approvals/pending")
+async def get_pending_approvals(limit: int = Query(default=50, ge=1, le=200)):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        return {"approvals": approval_agent.list_pending(conn, limit=limit)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/approvals/{approval_id}/approve")
+async def post_approval_approve(approval_id: str, payload: ApprovalDecisionPayload):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        result = approval_agent.approve(
+            conn,
+            approval_id,
+            operator_id=payload.operator_id,
+            note=payload.note,
+            execute=payload.execute,
+        )
+        conn.commit()
+        invalidate_ops_cache()
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/approvals/{approval_id}/reject")
+async def post_approval_reject(approval_id: str, payload: ApprovalDecisionPayload):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        result = approval_agent.reject(
+            conn,
+            approval_id,
+            operator_id=payload.operator_id,
+            note=payload.note,
+        )
+        conn.commit()
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/cleanup/generate/{exception_id}")
+async def post_cleanup_generate(exception_id: str, operator_id: str | None = Query(default=None)):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        result = proposal_agent.generate_topology_proposal(
+            conn, exception_id, operator_id=operator_id, proposed_by="CleanupAgent"
+        )
+        conn.commit()
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/proposals/generate/{exception_id}")
+async def post_proposal_generate(
+    exception_id: str,
+    operator_id: str | None = Query(default=None),
+    proposed_by: str = Query(default="StewardPortal"),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        result = proposal_agent.generate_topology_proposal(
+            conn, exception_id, operator_id=operator_id, proposed_by=proposed_by
+        )
+        conn.commit()
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/proposals/approved")
+async def get_proposals_approved(limit: int = Query(default=50, ge=1, le=200)):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        return {"proposals": repository.list_approved_proposals(conn, limit=limit)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/proposals/{proposal_id}")
+async def get_proposal(proposal_id: str):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        proposal = repository.get_topology_proposal(conn, proposal_id)
+        if not proposal:
+            raise HTTPException(status_code=404, detail="Proposal not found")
+        return proposal
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/proposals/{proposal_id}/publish")
+async def post_proposal_publish(proposal_id: str, payload: CleanupExecutePayload):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        result = proposal_agent.publish_proposal_to_master(
+            conn, proposal_id, operator_id=payload.operator_id
+        )
+        conn.commit()
+        invalidate_topology_cache()
+        invalidate_ops_cache()
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/cleanup/execute/{cleanup_id}")
+async def post_cleanup_execute(cleanup_id: str, payload: CleanupExecutePayload):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        result = cleanup_agent.execute_cleanup(
+            conn,
+            cleanup_id,
+            operator_id=payload.operator_id,
+            force=payload.force,
+        )
+        conn.commit()
+        invalidate_topology_cache()
+        invalidate_ops_cache()
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/cleanup/{cleanup_id}")
+async def get_cleanup(cleanup_id: str):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        action = repository.get_cleanup_action(conn, cleanup_id)
+        if not action:
+            raise HTTPException(status_code=404, detail="Cleanup action not found")
+        return action
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/exceptions/queue/{queue_name}")
+async def get_exceptions_by_queue(queue_name: str, limit: int = Query(default=100, ge=1, le=500)):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT e.id::text, e.record_type, e.record_mrid::text, e.rule_code,
+                       r.domain, e.severity::text, e.status::text, e.error_message,
+                       e.queue_name, e.created_at
+                FROM public.data_quality_exceptions e
+                JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
+                WHERE e.queue_name = %s AND e.status = 'OPEN'
+                ORDER BY e.created_at DESC
+                LIMIT %s
+                """,
+                (queue_name, limit),
+            )
+            rows = cur.fetchall()
+        return {
+            "queue": queue_name,
+            "exceptions": [
+                {
+                    "id": r[0],
+                    "record_type": r[1],
+                    "record_mrid": r[2],
+                    "rule_code": r[3],
+                    "domain": r[4],
+                    "severity": r[5],
+                    "status": r[6],
+                    "error_message": r[7],
+                    "queue_name": r[8],
+                    "created_at": r[9].isoformat() if r[9] else None,
+                }
+                for r in rows
+            ],
+        }
+    finally:
+        conn.close()
+
+
+def _run_export_job(job_id: str, operator_id: str | None = None) -> None:
+    if not SUPABASE_DB_URI:
+        return
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        meta = get_export_job(conn, job_id)
+        fmt = (meta or {}).get("format", "cim-json")
+        job = process_export_by_format(conn, job_id, fmt)
+        action = LINEAGE_ACTIONS.get(fmt, "GIS_EXPORT")
+        log_lineage(
+            conn,
+            target_mrid=job_id,
+            source_type="SYSTEM",
+            action_type=action,
+            operator_id=operator_id,
+            provenance_ref=f"gis_transfer_jobs:{job_id}",
+            after_state={
+                "format": fmt,
+                "feature_count": job.get("feature_count"),
+                "storage_bucket": job.get("storage_bucket"),
+                "storage_path": job.get("storage_path"),
+            },
+        )
+        conn.commit()
+        invalidate_ops_cache()
+    except Exception:
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/exports/cim/preview")
+async def preview_cim_export(
+    limit: int = Query(default=50, ge=1, le=500),
+    west: float | None = Query(default=None),
+    south: float | None = Query(default=None),
+    east: float | None = Query(default=None),
+    north: float | None = Query(default=None),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    clip = None
+    if None not in (west, south, east, north):
+        if west >= east or south >= north:
+            raise HTTPException(status_code=400, detail="Invalid bbox")
+        clip = {"west": west, "south": south, "east": east, "north": north}
+    cache_key = cim_preview_key(limit, west, south, east, north)
+
+    def _fetch():
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            return build_cim_payload(conn, clip=clip, limit=limit)
+        finally:
+            conn.close()
+
+    return cached_json(cache_key, _fetch, CIM_PREVIEW_TTL_SEC)
+
+
+@app.post("/api/v1/exports/cim")
+async def start_cim_export(payload: CimExportPayload, background_tasks: BackgroundTasks):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    clip = payload.clip.model_dump() if payload.clip else None
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        validate_export_scope(conn, clip)
+        job = create_export_job(
+            conn,
+            layers=payload.layers,
+            clip=clip,
+            exclude_dq_blocked=payload.exclude_dq_blocked,
+            requested_by=payload.requested_by or payload.operator_id,
+        )
+        conn.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+    invalidate_ops_cache()
+    background_tasks.add_task(_run_export_job, job["id"], payload.operator_id)
+    return {"job": job}
+
+
+@app.get("/api/v1/exports/dxf/preview")
+async def preview_dxf_export(
+    limit: int = Query(default=50, ge=1, le=500),
+    west: float | None = Query(default=None),
+    south: float | None = Query(default=None),
+    east: float | None = Query(default=None),
+    north: float | None = Query(default=None),
+    include_nodes: bool = Query(default=True),
+    include_lines: bool = Query(default=True),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    clip = None
+    if None not in (west, south, east, north):
+        if west >= east or south >= north:
+            raise HTTPException(status_code=400, detail="Invalid bbox")
+        clip = {"west": west, "south": south, "east": east, "north": north}
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        _, meta = build_dxf_payload(
+            conn,
+            clip=clip,
+            include_nodes=include_nodes,
+            include_lines=include_lines,
+            limit=limit,
+        )
+        return meta
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/exports/dxf")
+async def start_dxf_export(payload: DxfExportPayload, background_tasks: BackgroundTasks):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    clip = payload.clip.model_dump() if payload.clip else None
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        validate_export_scope(conn, clip)
+        job = create_dxf_export_job(
+            conn,
+            clip=clip,
+            exclude_dq_blocked=payload.exclude_dq_blocked,
+            include_nodes=payload.include_nodes,
+            include_lines=payload.include_lines,
+            requested_by=payload.requested_by or payload.operator_id,
+        )
+        conn.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+    invalidate_ops_cache()
+    background_tasks.add_task(_run_export_job, job["id"], payload.operator_id)
+    return {"job": job}
+
+
+def _start_gis_export(fmt: str, payload: GisExportPayload, background_tasks: BackgroundTasks):
+    if fmt not in SUPPORTED_FORMATS:
+        raise HTTPException(status_code=404, detail=f"Unknown export format: {fmt}")
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    clip = payload.clip.model_dump() if payload.clip else None
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        if fmt not in ("mdms-csv",):
+            validate_export_scope(conn, clip)
+        requested = payload.requested_by or payload.operator_id
+        if fmt == "geopackage":
+            job = create_gpkg_export_job(conn, clip=clip, exclude_dq_blocked=payload.exclude_dq_blocked, requested_by=requested)
+        elif fmt == "kml":
+            job = create_kml_export_job(conn, clip=clip, requested_by=requested)
+        elif fmt == "shapefile":
+            job = create_shapefile_export_job(conn, clip=clip, requested_by=requested)
+        elif fmt == "csv":
+            job = create_csv_export_job(
+                conn, clip=clip, include_meters=payload.include_meters, requested_by=requested
+            )
+        elif fmt == "cim-xml":
+            job = create_cim_xml_export_job(
+                conn, layers=payload.layers, clip=clip, requested_by=requested
+            )
+        elif fmt == "cim-rdf":
+            job = create_cim_rdf_export_job(
+                conn, layers=payload.layers, clip=clip, requested_by=requested
+            )
+        elif fmt == "mdms-csv":
+            job = create_mdms_export_job(conn, requested_by=requested)
+        elif fmt == "sap-csv":
+            job = create_sap_export_job(conn, clip=clip, requested_by=requested)
+        else:
+            raise HTTPException(status_code=404, detail=f"Format {fmt} uses a dedicated endpoint")
+        conn.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+    invalidate_ops_cache()
+    background_tasks.add_task(_run_export_job, job["id"], payload.operator_id)
+    return {"job": job}
+
+
+@app.get("/api/v1/exports/formats")
+async def list_export_formats():
+    return {"formats": SUPPORTED_FORMATS}
+
+
+@app.post("/api/v1/exports/{export_format}")
+async def start_format_export(
+    export_format: str,
+    payload: GisExportPayload,
+    background_tasks: BackgroundTasks,
+):
+    return _start_gis_export(export_format, payload, background_tasks)
+
+
+@app.get("/api/v1/exports")
+async def list_exports(limit: int = Query(default=50, ge=1, le=200)):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+
+    def _fetch():
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            return {"jobs": list_export_jobs(conn, limit=limit)}
+        finally:
+            conn.close()
+
+    return cached_json(exports_list_key(limit), _fetch, OPS_CACHE_TTL_SEC)
+
+
+@app.get("/api/v1/exports/{job_id}")
+async def get_export(job_id: str):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        job = get_export_job(conn, job_id)
+    finally:
+        conn.close()
+    if not job:
+        raise HTTPException(status_code=404, detail="Export job not found")
+    return job
+
+
+@app.get("/api/v1/exports/{job_id}/download")
+async def download_export(job_id: str):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        job = get_export_job(conn, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Export job not found")
+        fmt = job.get("format", "cim-json")
+        body, media_type = read_export_bytes_by_format(conn, job_id, fmt)
+        filename = download_filename(job_id, fmt)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    finally:
+        conn.close()
+    return Response(
+        content=body,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _resolve_affine(payload) -> dict[str, float]:
+    if payload.apply_affine and payload.affine is None:
+        raise HTTPException(status_code=422, detail="affine params required when apply_affine is true")
+    if payload.affine is None:
+        return {}
+    return payload.affine.model_dump()
+
+
+@app.post("/api/v1/migration/dxf")
+async def migrate_dxf(payload: DxfMigrationPayload):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    if not payload.dxf_text and not payload.file_path:
+        raise HTTPException(status_code=422, detail="Provide dxf_text or file_path")
+    text = payload.dxf_text
+    if text is None:
+        try:
+            text = Path(payload.file_path).read_text(errors="replace")
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=f"Cannot read DXF: {exc}") from exc
+    affine = _resolve_affine(payload)
+    features = parse_dxf(text)
+    if not features:
+        raise HTTPException(status_code=422, detail="No POINT or LINE primitives found in DXF")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        result = run_migration(
+            conn,
+            source_format="dxf",
+            source_name=payload.source_name,
+            features=features,
+            affine=affine,
+            apply_affine=payload.apply_affine,
+            default_feeder=payload.default_feeder,
+            default_utility=payload.default_utility,
+            requested_by=payload.requested_by,
+        )
+        conn.commit()
+        invalidate_after_staging_write()
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+    return result
+
+
+@app.post("/api/v1/migration/geopackage")
+async def migrate_geopackage(payload: GpkgMigrationPayload):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    if not Path(payload.file_path).is_file():
+        raise HTTPException(status_code=400, detail="GeoPackage file_path not found")
+    affine = _resolve_affine(payload)
+    try:
+        features = parse_geopackage(payload.file_path, payload.table)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Cannot read GeoPackage: {exc}") from exc
+    if not features:
+        raise HTTPException(status_code=422, detail="No features found in GeoPackage")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        result = run_migration(
+            conn,
+            source_format="geopackage",
+            source_name=payload.source_name,
+            features=features,
+            affine=affine,
+            apply_affine=payload.apply_affine,
+            default_feeder=payload.default_feeder,
+            default_utility=payload.default_utility,
+            requested_by=payload.requested_by,
+        )
+        conn.commit()
+        invalidate_after_staging_write()
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+    return result
+
+
+@app.get("/api/v1/migration/runs")
+async def list_migration_runs_endpoint(limit: int = Query(default=50, ge=1, le=200)):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        return {"runs": list_migration_runs(conn, limit=limit)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/migration/runs/{run_id}/failed")
+async def list_migration_failed_endpoint(run_id: str, limit: int = Query(default=200, ge=1, le=1000)):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        return {"failed": list_migration_failed(conn, run_id, limit=limit)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/conflicts")
+async def get_conflicts(limit: int = Query(default=100, ge=1, le=500)):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+
+    def _fetch():
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            return {"conflicts": list_open_conflicts(conn, limit)}
+        finally:
+            conn.close()
+
+    try:
+        return cached_json(conflicts_key(limit), _fetch, OPS_CACHE_TTL_SEC)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -1274,6 +4163,7 @@ async def resolve_conflict_endpoint(conflict_id: str, payload: ConflictResolvePa
             conn.commit()
         finally:
             conn.close()
+        invalidate_after_staging_write()
         return result
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1286,10 +4176,18 @@ async def schematic_generate(
     mrid: str = Query(...),
     depth: int = Query(default=10, ge=1, le=20),
 ):
+    cache_key = schematic_key(mrid, depth)
+    cached = get_json(cache_key)
+    if cached is not None:
+        return Response(content=cached["body"], media_type=cached["media_type"])
     try:
-        with graph_driver.session() as session:
-            payload = _build_trace_payload(session, mrid, "traced")
+        payload = await asyncio.to_thread(_trace_payload_blocking, mrid, "traced")
         svg = generate_svg(payload, mrid)
+        set_json(
+            cache_key,
+            {"body": svg, "media_type": "image/svg+xml"},
+            SCHEMATIC_CACHE_TTL_SEC,
+        )
         return Response(content=svg, media_type="image/svg+xml")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -1304,6 +4202,37 @@ async def energy_accounting_balance(payload: EnergyBalancePayload):
             period_end=payload.period_end,
             nominal_injection_kwh=payload.nominal_injection_kwh,
         )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/integrations/sap/status")
+async def api_sap_status():
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            return sap_integration_status(conn)
+        finally:
+            conn.close()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/integrations/sap/sync/customers")
+async def api_sap_sync_customers():
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            result = sync_customers_from_sap(conn)
+        finally:
+            conn.close()
+        return result
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
@@ -1333,6 +4262,14 @@ async def patch_dlq_endpoint(dlq_id: str, payload: DlqPatchPayload):
         conn = psycopg2.connect(SUPABASE_DB_URI)
         try:
             result = patch_dlq(conn, dlq_id, payload.status, payload.payload)
+            if payload.status in ("RESOLVED", "DISCARDED"):
+                log_dlq_event(
+                    conn,
+                    dlq_id=dlq_id,
+                    source=result["source"],
+                    action_type=f"DLQ_{payload.status}",
+                    payload=result.get("payload") if isinstance(result.get("payload"), dict) else payload.payload,
+                )
             conn.commit()
         finally:
             conn.close()
@@ -1375,7 +4312,30 @@ async def retry_dlq(dlq_id: str):
                     finally:
                         ts_conn.close()
                     patch_dlq(conn, dlq_id, "RESOLVED")
+                    log_dlq_event(
+                        conn,
+                        dlq_id=dlq_id,
+                        source=item["source"],
+                        action_type="DLQ_RETRY_RESOLVED",
+                        payload=item["payload"] if isinstance(item.get("payload"), dict) else None,
+                    )
                 else:
+                    patch_dlq(conn, dlq_id, "OPEN")
+            elif item["source"] == "SAP":
+                payload = item["payload"] or {}
+                try:
+                    upsert_customer_from_payload(conn, payload)
+                    conn.commit()
+                    patch_dlq(conn, dlq_id, "RESOLVED")
+                    log_dlq_event(
+                        conn,
+                        dlq_id=dlq_id,
+                        source=item["source"],
+                        action_type="DLQ_RETRY_RESOLVED",
+                        payload=payload,
+                    )
+                except Exception:
+                    conn.rollback()
                     patch_dlq(conn, dlq_id, "OPEN")
             else:
                 patch_dlq(conn, dlq_id, "RESOLVED")
@@ -1391,7 +4351,9 @@ async def retry_dlq(dlq_id: str):
 
 @app.get("/api/v1/health/metrics")
 async def health_metrics():
-    return metrics_snapshot()
+    snapshot = metrics_snapshot()
+    snapshot["redis"] = redis_status()
+    return snapshot
 
 
 # --- Operational modules (Phase 2 MVP) ---

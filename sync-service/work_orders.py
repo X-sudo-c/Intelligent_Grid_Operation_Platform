@@ -24,6 +24,8 @@ def _row_to_dict(cur, row) -> dict[str, Any]:
             out[k] = v.isoformat()
         elif k == "geom" and v is not None:
             out[k] = None
+        elif k in ("longitude", "latitude") and v is not None:
+            out[k] = float(v)
     return out
 
 
@@ -51,10 +53,13 @@ def list_work_orders(
         SELECT id::text, reference, work_type::text, priority, status::text,
                assigned_crew, assigned_user, due_at, account_mrid::text, asset_mrid::text,
                feeder_mrid::text, source_ticket_id::text, source_case_id::text,
-               summary, notes, created_by, created_at, updated_at
-        FROM work_orders
+               summary, notes, created_by, created_at, updated_at,
+               COALESCE(ST_X(wo.geom), ST_X(cn.geom)) AS longitude,
+               COALESCE(ST_Y(wo.geom), ST_Y(cn.geom)) AS latitude
+        FROM work_orders wo
+        LEFT JOIN public.connectivity_nodes cn ON cn.mrid = wo.asset_mrid
         WHERE {' AND '.join(clauses)}
-        ORDER BY created_at DESC
+        ORDER BY wo.created_at DESC
         LIMIT %s
     """
     with conn.cursor() as cur:

@@ -16,6 +16,7 @@ interface GraphAiMessage {
 interface GiopTopologyTabProps {
   graph: PortalGraphResponse | null;
   loading: boolean;
+  revalidating?: boolean;
   error: string | null;
   graphQuery: GiopGraphQueryKey;
   onQueryChange: (key: GiopGraphQueryKey) => void;
@@ -30,6 +31,7 @@ interface GiopTopologyTabProps {
 export function GiopTopologyTab({
   graph,
   loading,
+  revalidating = false,
   error,
   graphQuery,
   onQueryChange,
@@ -56,22 +58,23 @@ export function GiopTopologyTab({
       setGraphAiDraft(request.prompt);
       const node = graph?.nodes.find((n) => n.id === request.nodeId);
       const props = (node?.properties || {}) as Record<string, unknown>;
-      const response = mockNodeAssist({
+      void mockNodeAssist({
         mrid: request.nodeId,
         name: request.nodeTitle,
         validation: String(props.validation || 'APPROVED'),
         connected: props.connected !== false,
         traced: props.traced === true,
+      }).then((response) => {
+        setGraphAiMessages([
+          { role: 'user', content: request.prompt },
+          {
+            role: 'assistant',
+            content: response.content,
+            findings: response.findings,
+            actions: response.actions,
+          },
+        ]);
       });
-      setGraphAiMessages([
-        { role: 'user', content: request.prompt },
-        {
-          role: 'assistant',
-          content: response.content,
-          findings: response.findings,
-          actions: response.actions,
-        },
-      ]);
     },
     [graph],
   );
@@ -82,16 +85,15 @@ export function GiopTopologyTab({
     const userMsg = graphAiDraft.trim();
     setGraphAiDraft('');
     setGraphAiMessages((prev) => [...prev, { role: 'user', content: userMsg }]);
-    await new Promise((r) => setTimeout(r, 400));
     const response = graphAiNodeId
-      ? mockNodeAssist({
+      ? await mockNodeAssist({
           mrid: graphAiNodeId,
           name: graphAiNodeTitle,
           validation: 'APPROVED',
           connected: true,
           traced: true,
         })
-      : mockGraphAssist(userMsg, graph?.metrics?.total_nodes ?? 0);
+      : await mockGraphAssist(userMsg, graph?.metrics?.total_nodes ?? 0);
     setGraphAiMessages((prev) => [
       ...prev,
       {
@@ -145,6 +147,12 @@ export function GiopTopologyTab({
         >
           {graph.metrics.note}
         </div>
+      )}
+
+      {revalidating && graph && !loading && (
+        <p className={`mb-2 mx-4 text-center text-[10px] ${isLightMode ? 'text-slate-400' : 'text-slate-500'}`}>
+          Updating topology…
+        </p>
       )}
 
       {loading && (

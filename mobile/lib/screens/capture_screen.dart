@@ -48,6 +48,7 @@ class _CaptureScreenState extends State<CaptureScreen> {
           offlineSessionStartedAt:
               row['offline_session_started_at'] as String? ??
               DateTime.now().toUtc().toIso8601String(),
+          operatorId: widget.api.operatorId,
         );
         if (result.conflict) {
           await OfflineDb.markCaptureConflicted(row['id'] as int);
@@ -121,6 +122,7 @@ class _CaptureScreenState extends State<CaptureScreen> {
         longitude: _position!.longitude,
         latitude: _position!.latitude,
         offlineSessionStartedAt: DateTime.now().toUtc().toIso8601String(),
+        operatorId: widget.api.operatorId,
       );
       if (result.conflict) {
         setState(() {

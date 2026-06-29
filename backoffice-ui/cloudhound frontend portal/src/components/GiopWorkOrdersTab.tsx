@@ -5,16 +5,25 @@ import {
   patchWorkOrder,
   type GiopWorkOrder,
 } from '../api/giop-api';
+import { useGiopMapOverlay } from '../context/GiopMapOverlayContext';
 
 interface GiopWorkOrdersTabProps {
   isLightMode: boolean;
+  workOrders?: GiopWorkOrder[];
+  onRefresh?: () => void;
 }
 
-export function GiopWorkOrdersTab({ isLightMode }: GiopWorkOrdersTabProps) {
-  const [orders, setOrders] = useState<GiopWorkOrder[]>([]);
-  const [loading, setLoading] = useState(true);
+export function GiopWorkOrdersTab({
+  isLightMode,
+  workOrders: workOrdersProp,
+  onRefresh,
+}: GiopWorkOrdersTabProps) {
+  const { focusOnMap } = useGiopMapOverlay();
+  const [orders, setOrders] = useState<GiopWorkOrder[]>(workOrdersProp ?? []);
+  const [loading, setLoading] = useState(!workOrdersProp);
   const [summary, setSummary] = useState('');
   const [status, setStatus] = useState('');
+  const [mapBusyId, setMapBusyId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -28,10 +37,38 @@ export function GiopWorkOrdersTab({ isLightMode }: GiopWorkOrdersTabProps) {
   }, []);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    if (workOrdersProp) {
+      setOrders(workOrdersProp);
+      setLoading(false);
+    }
+  }, [workOrdersProp]);
+
+  useEffect(() => {
+    if (!workOrdersProp) void load();
+  }, [load, workOrdersProp]);
 
   const card = isLightMode ? 'border-slate-200 bg-white' : 'border-slate-700 bg-slate-900/40';
+
+  const showOnMap = async (wo: GiopWorkOrder) => {
+    const mrid = wo.asset_mrid;
+    if (!mrid) {
+      setStatus('Work order has no linked asset — set asset_mrid to show on map');
+      return;
+    }
+    setMapBusyId(wo.id);
+    try {
+      const coords =
+        wo.longitude != null && wo.latitude != null
+          ? ([wo.longitude, wo.latitude] as [number, number])
+          : undefined;
+      await focusOnMap(mrid, { name: wo.summary, coordinates: coords ?? null });
+      setStatus(`Opened ${wo.reference} on map`);
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : 'Could not focus map');
+    } finally {
+      setMapBusyId(null);
+    }
+  };
 
   return (
     <div className="h-full overflow-auto p-6">
@@ -60,6 +97,7 @@ export function GiopWorkOrdersTab({ isLightMode }: GiopWorkOrdersTabProps) {
               setSummary('');
               setStatus('Work order dispatched');
               await load();
+              onRefresh?.();
             } catch (err) {
               setStatus(err instanceof Error ? err.message : 'Dispatch failed');
             }
@@ -80,23 +118,37 @@ export function GiopWorkOrdersTab({ isLightMode }: GiopWorkOrdersTabProps) {
             <p className="mt-1">{wo.summary}</p>
             <p className="text-xs text-slate-500 mt-1">
               {wo.work_type} · crew {wo.assigned_crew ?? '—'} · {wo.assigned_user ?? 'unassigned'}
+              {wo.asset_mrid ? ` · asset ${wo.asset_mrid.slice(0, 8)}…` : ''}
             </p>
-            {wo.status === 'DISPATCHED' && (
-              <button
-                type="button"
-                className="text-xs px-2 py-1 mt-2 bg-slate-700 rounded text-white"
-                onClick={async () => {
-                  try {
-                    await patchWorkOrder(wo.id, { status: 'ACCEPTED' });
-                    await load();
-                  } catch (err) {
-                    setStatus(err instanceof Error ? err.message : 'Update failed');
-                  }
-                }}
-              >
-                Mark accepted
-              </button>
-            )}
+            <div className="flex flex-wrap gap-2 mt-2">
+              {wo.asset_mrid && (
+                <button
+                  type="button"
+                  className="text-xs px-2 py-1 bg-violet-800 rounded text-white disabled:opacity-50"
+                  disabled={mapBusyId === wo.id}
+                  onClick={() => void showOnMap(wo)}
+                >
+                  {mapBusyId === wo.id ? 'Opening…' : 'Show on map'}
+                </button>
+              )}
+              {wo.status === 'DISPATCHED' && (
+                <button
+                  type="button"
+                  className="text-xs px-2 py-1 bg-slate-700 rounded text-white"
+                  onClick={async () => {
+                    try {
+                      await patchWorkOrder(wo.id, { status: 'ACCEPTED' });
+                      await load();
+                      onRefresh?.();
+                    } catch (err) {
+                      setStatus(err instanceof Error ? err.message : 'Update failed');
+                    }
+                  }}
+                >
+                  Mark accepted
+                </button>
+              )}
+            </div>
           </div>
         ))}
       </div>

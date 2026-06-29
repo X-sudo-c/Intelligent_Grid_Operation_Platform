@@ -7,6 +7,10 @@ export type GiopPortalTab =
   | 'insights'
   | 'schematic'
   | 'dlq'
+  | 'audit'
+  | 'data-quality'
+  | 'exports'
+  | 'migration'
   | 'cases'
   | 'tickets'
   | 'work-orders'
@@ -29,6 +33,10 @@ const TAB_PATHS: Record<GiopPortalTab, string> = {
   insights: '/insights',
   schematic: '/schematic',
   dlq: '/dlq',
+  audit: '/audit',
+  'data-quality': '/data-quality',
+  exports: '/exports',
+  migration: '/migration',
   cases: '/cases',
   tickets: '/tickets',
   'work-orders': '/work-orders',
@@ -45,6 +53,10 @@ const PATH_TABS: Record<string, GiopPortalTab> = {
   '/insights': 'insights',
   '/schematic': 'schematic',
   '/dlq': 'dlq',
+  '/audit': 'audit',
+  '/data-quality': 'data-quality',
+  '/exports': 'exports',
+  '/migration': 'migration',
   '/cases': 'cases',
   '/tickets': 'tickets',
   '/work-orders': 'work-orders',

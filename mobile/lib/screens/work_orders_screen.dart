@@ -15,6 +15,7 @@ class WorkOrdersScreen extends StatefulWidget {
 class _WorkOrdersScreenState extends State<WorkOrdersScreen>
     with WidgetsBindingObserver {
   List<Map<String, dynamic>> _orders = [];
+  List<TechnicianSubmission> _rejected = [];
   bool _loading = true;
   String? _status;
 
@@ -43,17 +44,27 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
       _loading = true;
       _status = null;
     });
+    List<TechnicianSubmission> rejected = const [];
+    try {
+      rejected = (await widget.api.fetchMySubmissions())
+          .where((s) => s.validation == 'REJECTED')
+          .toList();
+    } catch (_) {
+      // submissions are optional when offline
+    }
     try {
       await widget.api.syncWorkOrders();
       final local = await OfflineDb.listWorkOrders();
       setState(() {
         _orders = local;
+        _rejected = rejected;
         _loading = false;
       });
     } catch (e) {
       final local = await OfflineDb.listWorkOrders();
       setState(() {
         _orders = local;
+        _rejected = rejected;
         _loading = false;
         _status = 'Offline — showing cached work orders';
       });
@@ -105,6 +116,36 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
                       padding: const EdgeInsets.only(bottom: 8),
                       child: Text(_status!, style: Theme.of(context).textTheme.bodySmall),
                     ),
+                  if (_rejected.isNotEmpty) ...[
+                    Text(
+                      'Rejected captures',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    ..._rejected.map((item) {
+                      final reason = _rejectionReason(item.errorLog);
+                      return Card(
+                        color: Theme.of(context).colorScheme.errorContainer.withValues(alpha: 0.35),
+                        child: ListTile(
+                          leading: Icon(
+                            Icons.warning_amber_rounded,
+                            color: Theme.of(context).colorScheme.error,
+                          ),
+                          title: Text(item.name.isNotEmpty ? item.name : item.mrid),
+                          subtitle: Text(
+                            reason ?? 'Rejected by backoffice — recapture from the map.',
+                          ),
+                          isThreeLine: reason != null,
+                        ),
+                      );
+                    }),
+                    const SizedBox(height: 16),
+                    Text(
+                      'Work orders',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 8),
+                  ],
                   if (_orders.isEmpty)
                     const Padding(
                       padding: EdgeInsets.all(24),
@@ -142,5 +183,12 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
               ),
             ),
     );
+  }
+
+  String? _rejectionReason(String? errorLog) {
+    if (errorLog == null || errorLog.isEmpty) return null;
+    final lines = errorLog.split('\n').where((l) => l.contains('REJECTED:')).toList();
+    if (lines.isEmpty) return errorLog.trim();
+    return lines.last.replaceFirst(RegExp(r'.*REJECTED:\s*'), '').trim();
   }
 }

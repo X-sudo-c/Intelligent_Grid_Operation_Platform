@@ -65,6 +65,39 @@ export interface TopologyCheck {
   edge_count?: number;
   edge_ratio?: number;
   hint?: string | null;
+  estimate?: boolean;
+}
+
+export interface GraphSyncCheck {
+  status: string;
+  reason?: string;
+  in_sync?: boolean;
+  postgres_nodes?: number;
+  postgres_edges?: number;
+  memgraph_nodes?: number;
+  memgraph_edges?: number;
+  node_delta?: number;
+  edge_delta?: number;
+  hint?: string | null;
+}
+
+export interface RedisCheck {
+  status: string;
+  enabled?: boolean;
+  port?: number;
+  hint?: string | null;
+  reason?: string;
+}
+
+export interface VoiceTtsCheck {
+  status: string;
+  port?: number;
+  url?: string;
+  hint?: string | null;
+  voice_api?: {
+    stt?: { browser?: boolean; note?: string };
+    tts?: { enabled?: boolean; available?: boolean; url?: string; voice?: string };
+  } | null;
 }
 
 export interface DataPlaneCheck {
@@ -77,6 +110,22 @@ export interface DataPlaneCheck {
     meter_readings_table?: boolean;
     error?: string;
   };
+}
+
+export interface MapTilesCheck {
+  status: string;
+  reason?: string;
+  hint?: string;
+  postgres_error?: string;
+  node_view_rows?: number;
+  line_view_rows?: number;
+  voltage_mix?: { nominal_voltage: string; lines: number }[];
+  has_asset_kind?: boolean;
+  asset_kind_mix?: { asset_kind: string; nodes: number }[];
+  transformer_nodes?: number;
+  martin_port?: number;
+  martin_layers?: Record<string, boolean>;
+  martin_error?: string | null;
 }
 
 export interface LogFileInfo {
@@ -102,7 +151,11 @@ export interface ObservabilitySnapshot {
   sync_metrics: SyncMetricsCheck;
   dlq: DlqCheck;
   topology: TopologyCheck;
+  graph_sync: GraphSyncCheck;
+  redis: RedisCheck;
+  voice_tts?: VoiceTtsCheck;
   data_plane: DataPlaneCheck;
+  map_tiles: MapTilesCheck;
   logs: LogFileInfo[];
   migrations: MigrationInfo;
 }
@@ -130,7 +183,11 @@ export function getObservability(): Promise<ObservabilitySnapshot> {
         },
         dlq: { status: 'unavailable', reason: 'restart API' },
         topology: { status: 'unavailable', reason: 'restart API' },
+        graph_sync: { status: 'unavailable', reason: 'restart API' },
+        redis: { status: 'unavailable', reason: 'restart API' },
+        voice_tts: { status: 'unavailable', hint: 'restart API' },
         data_plane: { status: 'unavailable' },
+        map_tiles: { status: 'unavailable', reason: 'restart API' },
         logs: [],
         migrations,
       };
@@ -145,6 +202,10 @@ export function getStatus(): Promise<StackStatus> {
 
 export function getMigrations(): Promise<MigrationInfo> {
   return fetchJson<MigrationInfo>('/migrations');
+}
+
+export function verifyMapTiles(): Promise<MapTilesCheck> {
+  return fetchJson<MapTilesCheck>('/verify/map-tiles');
 }
 
 export function getLogTail(name: string, tail = 200): Promise<LogTail> {
@@ -187,12 +248,68 @@ export function createMigration(name: string): Promise<{ filename: string }> {
   });
 }
 
-export function applyMigrations(mode: 'up' | 'reset', confirm = false): Promise<unknown> {
-  return fetchJson('/migrations/apply', {
+export interface MigrationApplyJob {
+  running: boolean;
+  mode?: 'up' | 'reset';
+  phase?: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  exit_code?: number | null;
+  error?: string | null;
+  result?: {
+    mode?: string;
+    exit_code?: number;
+    stdout?: string;
+    stderr?: string;
+    martin_paused?: boolean;
+    martin_restarted?: boolean;
+    migrations?: MigrationInfo;
+  } | null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+export function getMigrationApplyStatus(): Promise<MigrationApplyJob> {
+  return fetchJson<MigrationApplyJob>('/migrations/apply/status');
+}
+
+export async function applyMigrations(
+  mode: 'up' | 'reset',
+  confirm = false,
+  onProgress?: (status: MigrationApplyJob) => void,
+): Promise<unknown> {
+  const job = await fetchJson<MigrationApplyJob>('/migrations/apply', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ mode, confirm }),
   });
+
+  onProgress?.(job);
+
+  if (!job.running) {
+    if (job.exit_code != null && job.exit_code !== 0) {
+      throw new Error(job.error || job.result?.stderr || 'Migration apply failed');
+    }
+    return job.result ?? job;
+  }
+
+  const deadline = Date.now() + 620_000;
+  while (Date.now() < deadline) {
+    await sleep(2000);
+    const status = await getMigrationApplyStatus();
+    onProgress?.(status);
+    if (!status.running) {
+      if (status.exit_code != null && status.exit_code !== 0) {
+        throw new Error(
+          status.error || status.result?.stderr?.trim() || 'Migration apply failed',
+        );
+      }
+      return status.result ?? status;
+    }
+  }
+  throw new Error('Migration apply timed out — check Supabase logs; job may still be running');
 }
 
 export interface MemgraphBootstrapStatus {

@@ -49,6 +49,7 @@ npm run dev
 | `GET /api/migrations` | Local vs applied migrations |
 | `POST /api/migrations` | Create new `000NN_slug.sql` |
 | `POST /api/migrations/apply` | `migration up` or `db reset` |
+| `GET /api/verify/map-tiles` | Verify `map_*` PostGIS views + Martin catalog (migration 00017) |
 | `GET /api/memgraph/bootstrap/status` | Memgraph bootstrap job state |
 | `GET /api/memgraph/bootstrap/stream` | SSE stream — runs `.venv/bin/python memgraph/bootstrap.py` with live output |
 
@@ -58,15 +59,18 @@ The `/api/observability` payload includes:
 
 - **sync_metrics** — from sync-service `GET /api/v1/health/metrics` (p50/p95, error rate)
 - **dlq** — open integration DLQ count (sync-service or Postgres fallback)
-- **topology** — node/edge counts and pass/warn/fail vs `verify_topology.sh` rules
+- **graph_sync** — Postgres vs Memgraph parity (`/api/v1/graph/parity`)
+- **redis** — `giop-redis` reachability for sync-service cache (optional; gateway falls back without it)
+- **voice_tts** — Supertonic on :7788 for GIOP copilot spoken replies; sync-service `GET /api/v1/portal/ai/voice/status`
 - **data_plane** — staging asset count, open conflicts, Timescale `meter_readings` check
+- **map_tiles** — `map_connectivity_nodes` / `map_ac_line_segments` row counts, voltage mix, Martin `map_*` layer catalog
 - **logs** — metadata for all files in `.giop/logs/`
 
 ### Service IDs
 
-`supabase`, `memgraph`, `martin`, `timescale`, `sync-service`, `ocr-service`, `giop-portal`, `backoffice-ui`, `overseeyer-api`, `overseeyer-web`
+`supabase`, `memgraph`, `martin`, `timescale`, `redis`, `sync-service`, `supertonic`, `ocr-service`, `giop-portal`, `backoffice-ui`, `overseeyer-api`, `overseeyer-web`
 
-OVERSEEYER cannot start/stop itself via API (use `start.sh`).
+OVERSEEYER API and UI can be **Stop / Restart** from the Services panel (`service_ctl.sh`). Restart reconnects the UI in ~5s.
 
 ## Environment
 
@@ -76,5 +80,7 @@ OVERSEEYER cannot start/stop itself via API (use `start.sh`).
 | `OVERSEYER_WEB_PORT` | `5191` | Vite dev server port |
 | `GIOP_RUN_DIR` | `.giop` | Shared logs/PIDs directory |
 | `SUPABASE_DB_URI` | local Postgres | Migration status queries |
+| `SUPERTONIC_PORT` | `7788` | Supertonic TTS HTTP server |
+| `SUPERTONIC_URL` | `http://127.0.0.1:7788` | TTS health probe target |
 
 **Local development only** — runs `docker`, `npx supabase`, and process management on the host.

@@ -45,7 +45,7 @@ async def health():
         "status": "ok",
         "platform": "OVERSEEYER",
         "version": "1.1.0",
-        "features": ["observability", "logs", "sse", "memgraph-bootstrap"],
+        "features": ["observability", "logs", "sse", "memgraph-bootstrap", "map-tile-verify", "async-migrations"],
     }
 
 
@@ -64,14 +64,14 @@ async def status():
 
 @app.get("/api/observability")
 async def observability():
-    return checks.observability_snapshot()
+    return await asyncio.to_thread(checks.observability_snapshot)
 
 
 @app.get("/api/observability/stream")
 async def observability_stream():
     async def event_generator():
         while True:
-            payload = checks.observability_snapshot()
+            payload = await asyncio.to_thread(checks.observability_snapshot)
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(5)
 
@@ -144,6 +144,11 @@ async def list_migrations():
     return overseer.list_migrations()
 
 
+@app.get("/api/verify/map-tiles")
+async def verify_map_tiles():
+    return checks.check_map_tile_views(fast=False)
+
+
 @app.post("/api/migrations")
 async def create_migration(payload: MigrationCreatePayload):
     try:
@@ -162,9 +167,16 @@ async def apply_migrations(payload: MigrationApplyPayload):
             detail="db reset is destructive — set confirm=true",
         )
     try:
-        return overseer.apply_migrations(payload.mode)
+        return overseer.start_apply_migrations(payload.mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/migrations/apply/status")
+async def migration_apply_status():
+    return overseer.migration_apply_status()
 
 
 @app.get("/api/memgraph/bootstrap/status")

@@ -15,19 +15,15 @@ from graph_sync import reconcile_memgraph  # noqa: E402
 
 def _driver_hint(exc: BaseException) -> str | None:
     msg = str(exc).lower()
-    if "defunct connection" not in msg:
-        return None
-    venv_python = ROOT / ".venv" / "bin" / "python"
-    if venv_python.is_file():
+    if "database shutdown" in msg or "defunct connection" in msg:
+        venv_python = ROOT / ".venv" / "bin" / "python"
+        py = venv_python if venv_python.is_file() else "python3"
         return (
-            "Memgraph Bolt handshake failed — use the project venv "
-            f"({venv_python} memgraph/bootstrap.py). "
-            "System python often ships an incompatible neo4j driver."
+            "Memgraph closed the connection (often OOM or restart during bulk sync). "
+            f"Restart memgraph, then: MEMGRAPH_SYNC_BATCH=1000 {py} memgraph/bootstrap.py "
+            "(~900k nodes takes 30–60+ min). Use MEMGRAPH_URI=bolt://127.0.0.1:7687."
         )
-    return (
-        "Memgraph Bolt handshake failed — install deps in a venv "
-        "(pip install -r memgraph/requirements.txt) and rerun with that python."
-    )
+    return None
 
 
 def main():

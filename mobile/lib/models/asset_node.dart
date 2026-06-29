@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'asset_kind.dart';
 
 enum MapNodeLayer {
@@ -20,6 +22,8 @@ class AssetNode {
     this.tier = 'master',
     this.layer = MapNodeLayer.onGrid,
     this.assetKind = AssetKind.connectivityNode,
+    this.wireDegree = 0,
+    this.h3,
   });
 
   final String mrid;
@@ -33,6 +37,12 @@ class AssetNode {
   final String tier;
   final MapNodeLayer layer;
   final AssetKind assetKind;
+  final int wireDegree;
+
+  /// H3 cell index (set when streamed via /nodes/by-cells); null otherwise.
+  final String? h3;
+
+  bool get hasWireConnections => wireDegree > 0;
 
   /// Icon/color for map display (workflow layer for staging, asset kind for master).
   AssetKind get displayKind =>
@@ -44,7 +54,7 @@ class AssetNode {
       latitude!.isFinite &&
       longitude!.isFinite;
 
-  AssetNode copyWith({MapNodeLayer? layer, AssetKind? assetKind}) {
+  AssetNode copyWith({MapNodeLayer? layer, AssetKind? assetKind, int? wireDegree}) {
     return AssetNode(
       mrid: mrid,
       name: name,
@@ -57,12 +67,22 @@ class AssetNode {
       tier: tier,
       layer: layer ?? this.layer,
       assetKind: assetKind ?? this.assetKind,
+      wireDegree: wireDegree ?? this.wireDegree,
+      h3: h3,
     );
   }
 
   static (double?, double?) coordinatesFromGeom(dynamic geom) {
-    if (geom is Map<String, dynamic>) {
-      final coords = geom['coordinates'];
+    dynamic parsed = geom;
+    if (parsed is String) {
+      try {
+        parsed = jsonDecode(parsed);
+      } catch (_) {
+        return (null, null);
+      }
+    }
+    if (parsed is Map) {
+      final coords = parsed['coordinates'];
       if (coords is List && coords.length >= 2) {
         return (
           (coords[1] as num).toDouble(),
@@ -73,8 +93,19 @@ class AssetNode {
     return (null, null);
   }
 
+  static Map<String, dynamic>? _identifiedObjects(dynamic raw) {
+    if (raw is Map<String, dynamic>) return raw;
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    if (raw is List && raw.isNotEmpty) {
+      final first = raw.first;
+      if (first is Map<String, dynamic>) return first;
+      if (first is Map) return Map<String, dynamic>.from(first);
+    }
+    return null;
+  }
+
   factory AssetNode.fromJson(Map<String, dynamic> json) {
-    final identified = json['identified_objects'] as Map<String, dynamic>?;
+    final identified = _identifiedObjects(json['identified_objects']);
     final ghanaRaw = identified?['ghana_grid_assets'];
     final Map<String, dynamic>? ghana = ghanaRaw is Map<String, dynamic>
         ? ghanaRaw
@@ -94,12 +125,15 @@ class AssetNode {
       tier: 'master',
       layer: MapNodeLayer.onGrid,
       assetKind: assetKindFromString(json['asset_kind'] as String?),
+      wireDegree: (json['wire_degree'] as num?)?.toInt() ?? 0,
+      h3: json['h3'] as String?,
     );
   }
 
   factory AssetNode.fromStagingJson(
     Map<String, dynamic> json, {
     required bool isOwnCapture,
+    String? h3,
   }) {
     final (lat, lon) = coordinatesFromGeom(json['geom']);
     return AssetNode(
@@ -113,10 +147,20 @@ class AssetNode {
       substationName: json['substation_name'] as String?,
       tier: 'staging',
       layer: isOwnCapture ? MapNodeLayer.ownStaging : MapNodeLayer.otherStaging,
+      h3: h3 ?? json['h3'] as String?,
     );
   }
 
   factory AssetNode.fromCacheRow(Map<String, dynamic> row) {
+    final layerRaw = row['layer'] as String?;
+    MapNodeLayer layer = MapNodeLayer.onGrid;
+    if (layerRaw != null) {
+      try {
+        layer = MapNodeLayer.values.byName(layerRaw);
+      } catch (_) {
+        layer = MapNodeLayer.onGrid;
+      }
+    }
     return AssetNode(
       mrid: row['mrid'] as String,
       name: row['name'] as String,
@@ -127,8 +171,9 @@ class AssetNode {
       operatingUtility: row['operating_utility'] as String?,
       substationName: row['substation_name'] as String?,
       tier: row['tier'] as String? ?? 'master',
-      layer: MapNodeLayer.values.byName(row['layer'] as String),
+      layer: layer,
       assetKind: assetKindFromString(row['asset_kind'] as String?),
+      wireDegree: (row['wire_degree'] as num?)?.toInt() ?? 0,
     );
   }
 
@@ -145,6 +190,7 @@ class AssetNode {
       'tier': tier,
       'layer': layer.name,
       'asset_kind': assetKindToApiValue(assetKind),
+      'wire_degree': wireDegree,
     };
   }
 }

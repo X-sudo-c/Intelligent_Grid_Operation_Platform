@@ -11,10 +11,12 @@ import {
   startService,
   startStack,
   stopService,
+  verifyMapTiles,
   type LogTail,
   type ObservabilitySnapshot,
   type ServiceStatus,
 } from './api';
+import { ActionButton, LogFab, LogPanel, StatusToast, type LogPanelState } from './LogPanel';
 
 const STATUS_DOT: Record<string, string> = {
   up: 'bg-emerald-400',
@@ -47,17 +49,26 @@ const APM_COLORS: Record<string, string> = {
 
 const CHECK_COLORS: Record<string, string> = {
   ok: 'text-emerald-400',
+  pass: 'text-emerald-400',
   warn: 'text-amber-400',
   fail: 'text-red-400',
   unavailable: 'text-slate-500',
   partial: 'text-amber-400',
 };
 
+function stamp(line: string): string {
+  return `${new Date().toLocaleTimeString()}  ${line}`;
+}
+
+const DEFAULT_LOG_PANEL: LogPanelState = { open: false, minimized: false, x: 24, y: 72 };
+
 export function App() {
   const [snapshot, setSnapshot] = useState<ObservabilitySnapshot | null>(null);
   const [loading, setLoading] = useState(true);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
   const [message, setMessage] = useState('');
-  const [busyId, setBusyId] = useState<string | null>(null);
+  const [busyService, setBusyService] = useState<{ id: string; action: string } | null>(null);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [migrationName, setMigrationName] = useState('');
   const [stackOpts, setStackOpts] = useState({ portal: true, backoffice: false, bootstrap: false });
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -65,10 +76,27 @@ export function App() {
   const [selectedLog, setSelectedLog] = useState<string | null>(null);
   const [logTail, setLogTail] = useState<LogTail | null>(null);
   const [logLoading, setLogLoading] = useState(false);
+  const [logPanel, setLogPanel] = useState<LogPanelState>(DEFAULT_LOG_PANEL);
+  const [activityLines, setActivityLines] = useState<string[]>([]);
   const [bootstrapLines, setBootstrapLines] = useState<string[]>([]);
   const [bootstrapRunning, setBootstrapRunning] = useState(false);
   const prevOverall = useRef<string | null>(null);
   const bootstrapSource = useRef<EventSource | null>(null);
+  const refreshInFlight = useRef(false);
+
+  const hasActiveTask =
+    manualRefreshing || pendingAction !== null || busyService !== null || bootstrapRunning;
+
+  const openLogPanel = useCallback((logName?: string | null) => {
+    setLogPanel((p) => ({ ...p, open: true, minimized: false }));
+    if (logName) void loadLogRef.current?.(logName);
+  }, []);
+
+  const pushActivity = useCallback((line: string) => {
+    setActivityLines((prev) => [...prev.slice(-120), stamp(line)]);
+  }, []);
+
+  const loadLogRef = useRef<(name: string) => Promise<void>>(async () => {});
 
   const applySnapshot = useCallback(
     (data: ObservabilitySnapshot) => {
@@ -89,16 +117,28 @@ export function App() {
     [notifyOnDegrade],
   );
 
-  const refresh = useCallback(async () => {
-    try {
-      const data = await getObservability();
-      applySnapshot(data);
-    } catch (err) {
-      setMessage(err instanceof Error ? err.message : 'Failed to load observability');
-    } finally {
-      setLoading(false);
-    }
-  }, [applySnapshot]);
+  const refreshSnapshot = useCallback(
+    async (opts?: { showSpinner?: boolean }) => {
+      if (refreshInFlight.current) return;
+      refreshInFlight.current = true;
+      if (opts?.showSpinner) setManualRefreshing(true);
+      try {
+        const data = await getObservability();
+        applySnapshot(data);
+      } catch (err) {
+        setMessage(err instanceof Error ? err.message : 'Failed to load observability');
+      } finally {
+        setLoading(false);
+        refreshInFlight.current = false;
+        if (opts?.showSpinner) setManualRefreshing(false);
+      }
+    },
+    [applySnapshot],
+  );
+
+  useEffect(() => {
+    void refreshSnapshot();
+  }, [refreshSnapshot]);
 
   const loadLog = useCallback(async (name: string) => {
     setLogLoading(true);
@@ -106,16 +146,27 @@ export function App() {
     try {
       setLogTail(await getLogTail(name, 200));
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : 'Failed to load log');
+      const msg = err instanceof Error ? err.message : 'Failed to load log';
+      setMessage(msg);
+      pushActivity(`Log error: ${msg}`);
       setLogTail(null);
     } finally {
       setLogLoading(false);
     }
-  }, []);
+  }, [pushActivity]);
 
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
+  loadLogRef.current = loadLog;
+
+  const selectLog = useCallback(
+    (name: string | null) => {
+      if (name) void loadLog(name);
+      else {
+        setSelectedLog(null);
+        setLogTail(null);
+      }
+    },
+    [loadLog],
+  );
 
   useEffect(() => {
     if (!autoRefresh) return;
@@ -125,7 +176,7 @@ export function App() {
 
     const startPolling = () => {
       if (pollId !== null) return;
-      pollId = window.setInterval(() => void refresh(), 15000);
+      pollId = window.setInterval(() => void refreshSnapshot(), 15000);
     };
 
     try {
@@ -150,13 +201,24 @@ export function App() {
       es?.close();
       if (pollId !== null) window.clearInterval(pollId);
     };
-  }, [autoRefresh, refresh, applySnapshot]);
+  }, [autoRefresh, refreshSnapshot, applySnapshot]);
 
   useEffect(() => {
-    if (!selectedLog || !autoRefresh) return;
-    const id = window.setInterval(() => void loadLog(selectedLog), 5000);
+    if (!selectedLog || !autoRefresh || !logPanel.open) return;
+    const id = window.setInterval(() => void loadLog(selectedLog), 3000);
     return () => window.clearInterval(id);
-  }, [selectedLog, autoRefresh, loadLog]);
+  }, [selectedLog, autoRefresh, loadLog, logPanel.open]);
+
+  useEffect(() => {
+    if (!logPanel.open || bootstrapLines.length === 0) return;
+    setActivityLines((prev) => {
+      const stamped = bootstrapLines.map((l) =>
+        l.startsWith('--- bootstrap ') ? stamp(l) : l,
+      );
+      const merged = [...prev.filter((l) => !l.includes('bootstrap')), ...stamped].slice(-200);
+      return merged;
+    });
+  }, [bootstrapLines, logPanel.open]);
 
   useEffect(() => {
     void getMemgraphBootstrapStatus()
@@ -182,18 +244,20 @@ export function App() {
           );
         } else {
           setBootstrapRunning(false);
-          void refresh();
+          void refreshSnapshot();
         }
       });
     }, 3000);
     return () => window.clearInterval(id);
-  }, [bootstrapRunning, refresh]);
+  }, [bootstrapRunning, refreshSnapshot]);
 
   const runMemgraphBootstrap = useCallback(() => {
     if (bootstrapRunning) return;
     setBootstrapLines([]);
     setBootstrapRunning(true);
     setMessage('Memgraph bootstrap…');
+    pushActivity('Memgraph bootstrap started');
+    openLogPanel('memgraph-bootstrap.log');
     bootstrapSource.current?.close();
 
     const es = new EventSource(memgraphBootstrapStreamUrl());
@@ -214,16 +278,19 @@ export function App() {
         } else if (data.type === 'done') {
           setBootstrapRunning(false);
           es.close();
-          setMessage(
+          const doneMsg =
             data.exit_code === 0
               ? 'Memgraph bootstrap done'
-              : `Memgraph bootstrap failed (exit ${data.exit_code})`,
-          );
-          void refresh();
+              : `Memgraph bootstrap failed (exit ${data.exit_code})`;
+          setMessage(doneMsg);
+          pushActivity(doneMsg);
+          void refreshSnapshot();
         } else if (data.type === 'error') {
           setBootstrapRunning(false);
           es.close();
-          setMessage(data.text ?? 'Memgraph bootstrap failed');
+          const errMsg = data.text ?? 'Memgraph bootstrap failed';
+          setMessage(errMsg);
+          pushActivity(errMsg);
         }
       } catch {
         /* ignore malformed SSE */
@@ -242,11 +309,11 @@ export function App() {
         } else {
           setBootstrapRunning(false);
           setMessage('Memgraph bootstrap finished');
-          void refresh();
+          void refreshSnapshot();
         }
       });
     };
-  }, [bootstrapRunning, refresh]);
+  }, [bootstrapRunning, refreshSnapshot, openLogPanel, pushActivity]);
 
   const requestNotifications = async () => {
     if (typeof Notification === 'undefined') return;
@@ -254,30 +321,70 @@ export function App() {
     setNotifyOnDegrade(true);
   };
 
-  const run = async (label: string, fn: () => Promise<unknown>) => {
+  const run = async (actionKey: string, label: string, fn: () => Promise<unknown>, logName?: string | null) => {
+    if (pendingAction === actionKey) return;
+    setPendingAction(actionKey);
     setMessage(`${label}…`);
+    pushActivity(`${label} started`);
+    openLogPanel(logName ?? selectedLog);
     try {
       await fn();
-      setMessage(`${label} done`);
-      await refresh();
+      const done = `${label} done`;
+      setMessage(done);
+      pushActivity(done);
+      await refreshSnapshot();
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : `${label} failed`);
+      const fail = err instanceof Error ? err.message : `${label} failed`;
+      setMessage(fail);
+      pushActivity(fail);
+    } finally {
+      setPendingAction(null);
     }
   };
 
   const serviceAction = async (id: string, action: 'start' | 'stop' | 'restart') => {
-    setBusyId(id);
+    if (busyService?.id === id && busyService.action === action) return;
+    const logName = (snapshot?.logs ?? []).find((f) => f.service_id === id)?.name ?? null;
+    const label = `${action} ${id}`;
+    setBusyService({ id, action });
+    setMessage(`${label}…`);
+    pushActivity(`${label} started`);
+    openLogPanel(logName);
     const fns = { start: startService, stop: stopService, restart: restartService };
-    await run(`${action} ${id}`, () => fns[action](id));
-    setBusyId(null);
+    try {
+      const res = (await fns[action](id)) as {
+        scheduled?: boolean;
+        detail?: string;
+        stopped?: boolean;
+      };
+      const done =
+        res?.detail ??
+        (res?.scheduled ? `${label} scheduled` : `${label} done`);
+      setMessage(done);
+      pushActivity(done);
+      // API stop/restart kills this connection — skip refresh that would error.
+      if (res?.scheduled && id === 'overseeyer-api' && action !== 'start') {
+        return;
+      }
+      await refreshSnapshot();
+    } catch (err) {
+      const fail = err instanceof Error ? err.message : `${label} failed`;
+      setMessage(fail);
+      pushActivity(fail);
+    } finally {
+      setBusyService(null);
+    }
   };
-
   const status = snapshot?.stack ?? null;
   const migrations = snapshot?.migrations ?? null;
   const metrics = snapshot?.sync_metrics;
   const dlq = snapshot?.dlq;
   const topology = snapshot?.topology;
+  const graphSync = snapshot?.graph_sync;
+  const redisCheck = snapshot?.redis;
+  const voiceTtsCheck = snapshot?.voice_tts;
   const dataPlane = snapshot?.data_plane;
+  const mapTiles = snapshot?.map_tiles;
   const logFiles = snapshot?.logs ?? [];
   const applied = new Set(migrations?.applied.map((a) => a.version) ?? []);
 
@@ -316,13 +423,15 @@ export function App() {
               />
               Notify on degrade
             </label>
-            <button
-              type="button"
-              onClick={() => void refresh()}
-              className="px-3 py-1.5 rounded bg-cyan-900 hover:bg-cyan-800 text-white"
-            >
-              Refresh
-            </button>
+            <ActionButton
+              label="Refresh"
+              loading={manualRefreshing}
+              loadingLabel="Refreshing…"
+              disabled={manualRefreshing}
+              color="cyan"
+              onClick={() => void refreshSnapshot({ showSpinner: true })}
+              className="px-3 py-1.5 text-xs"
+            />
             <a href="http://127.0.0.1:5173" className="text-cyan-500 hover:underline" target="_blank" rel="noreferrer">
               GIOP Portal ↗
             </a>
@@ -331,7 +440,7 @@ export function App() {
       </header>
 
       <main className="max-w-7xl mx-auto px-6 py-8 space-y-8">
-        {message && <p className="text-sm text-slate-400">{message}</p>}
+        <StatusToast message={message} busy={hasActiveTask} />
         {loading && !status && <p className="text-slate-500">Connecting to OVERSEEYER API…</p>}
 
         {status && (
@@ -370,13 +479,14 @@ export function App() {
                   />
                   Memgraph bootstrap
                 </label>
-                <button
-                  type="button"
-                  className="text-xs px-4 py-2 rounded bg-emerald-800 hover:bg-emerald-700 text-white"
-                  onClick={() => void run('Start GIOP stack', () => startStack(stackOpts))}
-                >
-                  Start all offline
-                </button>
+                <ActionButton
+                  label="Start all offline"
+                  loading={pendingAction === 'start-stack'}
+                  disabled={pendingAction === 'start-stack'}
+                  color="emerald"
+                  onClick={() => void run('start-stack', 'Start GIOP stack', () => startStack(stackOpts))}
+                  className="text-xs px-4 py-2"
+                />
               </div>
             </div>
           </section>
@@ -385,7 +495,7 @@ export function App() {
         {snapshot && (
           <section>
             <h2 className="text-sm font-semibold text-slate-300 mb-3 uppercase tracking-wider">Observability</h2>
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
               <ObsCard title="Sync gateway APM">
                 {metrics?.status === 'ok' ? (
                   <>
@@ -404,27 +514,128 @@ export function App() {
                 )}
               </ObsCard>
 
-              <ObsCard title="Topology">
+              <ObsCard title="Topology (Postgres)">
                 {topology?.status !== 'unavailable' ? (
                   <>
                     <p className={`text-lg font-semibold capitalize ${CHECK_COLORS[topology?.status ?? ''] ?? ''}`}>
                       {topology?.status}
                     </p>
                     <p className="text-xs text-slate-500 mt-2">
-                      {topology?.node_count ?? 0} nodes · {topology?.edge_count ?? 0} edges
+                      {topology?.node_count?.toLocaleString() ?? 0} nodes ·{' '}
+                      {topology?.edge_count?.toLocaleString() ?? 0} edges
+                      {topology?.estimate ? ' (est.)' : ''}
                     </p>
                     {topology?.hint && <p className="text-xs text-amber-500 mt-1">{topology.hint}</p>}
-                    <button
-                      type="button"
-                      disabled={bootstrapRunning}
-                      className="mt-3 text-xs px-3 py-1.5 rounded bg-violet-900 hover:bg-violet-800 disabled:opacity-50 text-white"
-                      onClick={() => runMemgraphBootstrap()}
-                    >
-                      {bootstrapRunning ? 'Syncing Memgraph…' : 'Sync Memgraph'}
-                    </button>
                   </>
                 ) : (
                   <p className="text-xs text-slate-500">{topology?.reason}</p>
+                )}
+              </ObsCard>
+
+              <ObsCard title="Memgraph sync">
+                {graphSync?.status === 'unavailable' ? (
+                  <p className="text-xs text-slate-500">{graphSync.reason ?? 'unavailable'}</p>
+                ) : (
+                  <>
+                    <p
+                      className={`text-lg font-semibold capitalize ${
+                        graphSync?.in_sync
+                          ? 'text-emerald-400'
+                          : CHECK_COLORS[graphSync?.status ?? ''] ?? 'text-slate-300'
+                      }`}
+                    >
+                      {graphSync?.in_sync ? 'synced' : graphSync?.status}
+                    </p>
+                    <p className="text-xs text-slate-500 mt-2">
+                      PG {graphSync?.postgres_nodes?.toLocaleString() ?? '—'} /{' '}
+                      {graphSync?.postgres_edges?.toLocaleString() ?? '—'} edges
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      MG {graphSync?.memgraph_nodes?.toLocaleString() ?? '—'} /{' '}
+                      {graphSync?.memgraph_edges?.toLocaleString() ?? '—'} edges
+                    </p>
+                    {!graphSync?.in_sync &&
+                      (graphSync?.node_delta != null || graphSync?.edge_delta != null) && (
+                        <p className="text-xs text-amber-500/90 mt-1">
+                          Δ nodes {graphSync.node_delta ?? 0} · Δ edges {graphSync.edge_delta ?? 0}
+                        </p>
+                      )}
+                    {graphSync?.hint && <p className="text-xs text-amber-500 mt-1">{graphSync.hint}</p>}
+                    <ActionButton
+                      label="Sync Memgraph"
+                      loadingLabel="Syncing Memgraph…"
+                      loading={bootstrapRunning}
+                      disabled={bootstrapRunning}
+                      color="violet"
+                      onClick={() => runMemgraphBootstrap()}
+                      className="mt-3 text-xs px-3 py-1.5"
+                    />
+                  </>
+                )}
+              </ObsCard>
+
+              <ObsCard title="Redis cache">
+                {redisCheck?.status === 'disabled' ? (
+                  <p className="text-xs text-slate-500">REDIS_URL not configured</p>
+                ) : redisCheck?.status === 'ok' ? (
+                  <>
+                    <p className="text-lg font-semibold text-emerald-400">reachable</p>
+                    <p className="text-xs text-slate-500 mt-2">Port {redisCheck.port ?? 6379} · sync-service graph/map cache</p>
+                  </>
+                ) : (
+                  <>
+                    <p
+                      className={`text-lg font-semibold capitalize ${
+                        CHECK_COLORS[redisCheck?.status ?? ''] ?? 'text-slate-300'
+                      }`}
+                    >
+                      {redisCheck?.status ?? 'unknown'}
+                    </p>
+                    {redisCheck?.hint && <p className="text-xs text-amber-500 mt-1">{redisCheck.hint}</p>}
+                  </>
+                )}
+              </ObsCard>
+
+              <ObsCard title="Voice copilot (Supertonic)">
+                {voiceTtsCheck?.status === 'ok' ? (
+                  <>
+                    <p className="text-lg font-semibold text-emerald-400">TTS ready</p>
+                    <p className="text-xs text-slate-500 mt-2">
+                      Port {voiceTtsCheck.port ?? 7788} · GIOP copilot spoken replies
+                    </p>
+                    {voiceTtsCheck.voice_api?.stt?.available === false && (
+                      <p className="text-xs text-amber-500 mt-1">
+                        Local Whisper STT not installed — pip install -r sync-service/requirements-voice.txt
+                      </p>
+                    )}
+                    {voiceTtsCheck.voice_api?.tts?.available === false && (
+                      <p className="text-xs text-amber-500 mt-1">
+                        sync-service cannot reach Supertonic — check SUPERTONIC_URL in .env
+                      </p>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <p
+                      className={`text-lg font-semibold capitalize ${
+                        CHECK_COLORS[voiceTtsCheck?.status ?? ''] ?? 'text-slate-300'
+                      }`}
+                    >
+                      {voiceTtsCheck?.status ?? 'unknown'}
+                    </p>
+                    {voiceTtsCheck?.hint && (
+                      <p className="text-xs text-amber-500 mt-1">{voiceTtsCheck.hint}</p>
+                    )}
+                    <ActionButton
+                      label="Start Supertonic"
+                      loadingLabel="Starting…"
+                      loading={busyService?.id === 'supertonic' && busyService.action === 'start'}
+                      disabled={busyService?.id === 'supertonic'}
+                      color="cyan"
+                      onClick={() => void serviceAction('supertonic', 'start')}
+                      className="mt-3 text-xs px-3 py-1.5"
+                    />
+                  </>
                 )}
               </ObsCard>
 
@@ -453,59 +664,61 @@ export function App() {
                   <p className="text-xs text-slate-500">{dataPlane?.timescale?.error ?? 'unavailable'}</p>
                 )}
               </ObsCard>
+
+              <ObsCard title="Map tiles (00017 / 00018)">
+                {mapTiles?.status === 'unavailable' ? (
+                  <p className="text-xs text-slate-500">{mapTiles.reason}</p>
+                ) : (
+                  <>
+                    <p className={`text-lg font-semibold capitalize ${CHECK_COLORS[mapTiles?.status ?? ''] ?? ''}`}>
+                      {mapTiles?.status}
+                    </p>
+                    <p className="text-xs text-slate-500 mt-2">
+                      {mapTiles?.node_view_rows?.toLocaleString() ?? '—'} nodes ·{' '}
+                      {mapTiles?.line_view_rows?.toLocaleString() ?? '—'} lines
+                      {mapTiles?.has_asset_kind && mapTiles.transformer_nodes != null
+                        ? ` · ${mapTiles.transformer_nodes.toLocaleString()} transformers`
+                        : ''}
+                    </p>
+                    {mapTiles?.martin_layers && (
+                      <p className="text-xs text-slate-500 mt-1">
+                        Martin:{' '}
+                        {Object.entries(mapTiles.martin_layers)
+                          .map(([k, v]) => `${k.replace('map_', '')} ${v ? '✓' : '✗'}`)
+                          .join(' · ')}
+                      </p>
+                    )}
+                    {mapTiles?.hint && <p className="text-xs text-amber-500 mt-1">{mapTiles.hint}</p>}
+                    {mapTiles?.reason && mapTiles.status !== 'pass' && (
+                      <p className="text-xs text-slate-500 mt-1">{mapTiles.reason}</p>
+                    )}
+                    <ActionButton
+                      label="Re-verify"
+                      loading={pendingAction === 'verify-map-tiles'}
+                      disabled={pendingAction === 'verify-map-tiles'}
+                      color="cyan"
+                      onClick={() => void run('verify-map-tiles', 'Verify map tiles', () => verifyMapTiles())}
+                      className="mt-3 text-xs px-3 py-1.5"
+                    />
+                    {mapTiles?.status === 'warn' && (
+                      <ActionButton
+                        label="Restart Martin"
+                        loading={
+                          busyService?.id === 'martin' && busyService.action === 'restart'
+                        }
+                        loadingLabel="Restarting Martin…"
+                        disabled={busyService?.id === 'martin' && busyService.action === 'restart'}
+                        color="amber"
+                        onClick={() => void serviceAction('martin', 'restart')}
+                        className="mt-3 ml-2 text-xs px-3 py-1.5"
+                      />
+                    )}
+                  </>
+                )}
+              </ObsCard>
             </div>
-            {(bootstrapRunning || bootstrapLines.length > 0) && (
-              <div className="mt-4 rounded-lg border border-slate-800 bg-slate-950 p-3">
-                <p className="text-xs text-slate-500 mb-2">
-                  Memgraph bootstrap
-                  {bootstrapRunning ? ' (running — large grids may take 30+ min)' : ''}
-                </p>
-                <pre className="text-xs font-mono overflow-auto max-h-48 text-slate-300">
-                  {bootstrapLines.join('\n') || 'Waiting for output…'}
-                </pre>
-              </div>
-            )}
           </section>
         )}
-
-        <section className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
-          <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
-            <h2 className="text-sm font-semibold text-slate-300 uppercase tracking-wider">Log viewer</h2>
-            <select
-              value={selectedLog ?? ''}
-              onChange={(e) => {
-                if (e.target.value) void loadLog(e.target.value);
-                else {
-                  setSelectedLog(null);
-                  setLogTail(null);
-                }
-              }}
-              className="text-xs px-2 py-1.5 rounded border border-slate-700 bg-slate-800 text-slate-300"
-            >
-              <option value="">Select log…</option>
-              {logFiles.map((f) => (
-                <option key={f.name} value={f.name}>
-                  {f.name}
-                  {f.service_id ? ` (${f.service_id})` : ''}
-                </option>
-              ))}
-            </select>
-          </div>
-          {logLoading && <p className="text-xs text-slate-500">Loading log…</p>}
-          {logTail && (
-            <>
-              <p className="text-xs text-slate-600 mb-2">
-                {logTail.path} · showing last {logTail.lines.length} of {logTail.total_lines} lines
-              </p>
-              <pre className="text-xs font-mono bg-slate-950 border border-slate-800 rounded p-3 overflow-auto max-h-64 text-slate-300">
-                {logTail.lines.join('\n') || '(empty)'}
-              </pre>
-            </>
-          )}
-          {!selectedLog && !logLoading && (
-            <p className="text-xs text-slate-600">Pick a log file or use View log on a service card.</p>
-          )}
-        </section>
 
         {status && (
           <section>
@@ -527,31 +740,52 @@ export function App() {
                       {svc.status} · {svc.detail}
                       {svc.pid ? ` · pid ${svc.pid}` : ''}
                     </p>
-                    {selfManaged ? (
-                      <p className="text-xs text-slate-600 mt-3">Managed by start.sh</p>
-                    ) : (
-                      <div className="flex flex-wrap gap-1.5 mt-3">
-                        <Btn label="Start" color="emerald" disabled={busyId === svc.id} onClick={() => void serviceAction(svc.id, 'start')} />
-                        <Btn label="Restart" color="amber" disabled={busyId === svc.id} onClick={() => void serviceAction(svc.id, 'restart')} />
-                        <Btn
-                          label="Stop"
-                          color="slate"
-                          disabled={busyId === svc.id || svc.kind === 'supabase'}
-                          onClick={() => void serviceAction(svc.id, 'stop')}
-                        />
-                        {logName && (
-                          <Btn label="View log" color="slate" onClick={() => void loadLog(logName)} />
-                        )}
-                        {svc.id === 'memgraph' && (
-                          <Btn
-                            label={bootstrapRunning ? 'Syncing…' : 'Bootstrap'}
-                            color="violet"
-                            disabled={bootstrapRunning}
-                            onClick={() => runMemgraphBootstrap()}
-                          />
-                        )}
-                      </div>
+                    {selfManaged && svc.id === 'overseeyer-api' && (
+                      <p className="text-xs text-amber-500/90 mt-2">
+                        Stop/restart disconnects this UI briefly.
+                      </p>
                     )}
+                    <div className="flex flex-wrap gap-1.5 mt-3">
+                      <Btn
+                        label="Start"
+                        color="emerald"
+                        loading={busyService?.id === svc.id && busyService.action === 'start'}
+                        onClick={() => void serviceAction(svc.id, 'start')}
+                      />
+                      <Btn
+                        label="Restart"
+                        color="amber"
+                        loading={busyService?.id === svc.id && busyService.action === 'restart'}
+                        onClick={() => void serviceAction(svc.id, 'restart')}
+                      />
+                      <Btn
+                        label="Stop"
+                        color="slate"
+                        loading={busyService?.id === svc.id && busyService.action === 'stop'}
+                        disabled={svc.kind === 'supabase'}
+                        onClick={() => void serviceAction(svc.id, 'stop')}
+                      />
+                      {logName && (
+                        <Btn
+                          label="View log"
+                          color="slate"
+                          onClick={() => {
+                            openLogPanel(logName);
+                            void loadLog(logName);
+                          }}
+                        />
+                      )}
+                      {svc.id === 'memgraph' && (
+                        <Btn
+                          label="Bootstrap"
+                          color="violet"
+                          loading={bootstrapRunning}
+                          loadingLabel="Syncing…"
+                          disabled={bootstrapRunning}
+                          onClick={() => runMemgraphBootstrap()}
+                        />
+                      )}
+                    </div>
                   </article>
                 );
               })}
@@ -570,23 +804,49 @@ export function App() {
                 {migrations.db_error && <p className="text-xs text-amber-500 mt-1">{migrations.db_error}</p>}
               </div>
               <div className="flex gap-2">
-                <button
-                  type="button"
-                  className="text-xs px-3 py-1.5 rounded bg-cyan-900 text-white"
-                  onClick={() => void run('Apply migrations', () => applyMigrations('up'))}
-                >
-                  Apply pending
-                </button>
-                <button
-                  type="button"
-                  className="text-xs px-3 py-1.5 rounded bg-red-900 text-white"
+                <ActionButton
+                  label="Verify map tiles"
+                  loading={pendingAction === 'verify-map-tiles'}
+                  disabled={pendingAction === 'verify-map-tiles'}
+                  color="slate"
+                  onClick={() => void run('verify-map-tiles', 'Verify map tiles', () => verifyMapTiles())}
+                  className="text-xs px-3 py-1.5"
+                />
+                <ActionButton
+                  label="Apply pending"
+                  loading={pendingAction === 'apply-migrations'}
+                  disabled={pendingAction === 'apply-migrations'}
+                  color="cyan"
+                  onClick={() =>
+                    void run('apply-migrations', 'Apply migrations', async () => {
+                      await applyMigrations('up', false, (status) => {
+                        if (status.running) {
+                          const phase = status.phase?.replace(/_/g, ' ') ?? 'in progress';
+                          setMessage(`Applying migrations (${phase})…`);
+                        }
+                      });
+                    })
+                  }
+                  className="text-xs px-3 py-1.5"
+                />
+                <ActionButton
+                  label="DB reset"
+                  loading={pendingAction === 'db-reset'}
+                  disabled={pendingAction === 'db-reset'}
+                  color="red"
                   onClick={() => {
                     if (!window.confirm('Wipe DB and re-apply all migrations?')) return;
-                    void run('DB reset', () => applyMigrations('reset', true));
+                    void run('db-reset', 'DB reset', () =>
+                      applyMigrations('reset', true, (status) => {
+                        if (status.running) {
+                          const phase = status.phase?.replace(/_/g, ' ') ?? 'in progress';
+                          setMessage(`DB reset (${phase})…`);
+                        }
+                      }),
+                    );
                   }}
-                >
-                  DB reset
-                </button>
+                  className="text-xs px-3 py-1.5"
+                />
               </div>
             </div>
 
@@ -598,20 +858,21 @@ export function App() {
                 onChange={(e) => setMigrationName(e.target.value)}
                 className="text-sm flex-1 min-w-[200px] px-3 py-2 rounded border border-slate-700 bg-slate-800"
               />
-              <button
-                type="button"
-                className="text-xs px-4 py-2 rounded bg-violet-900 text-white"
+              <ActionButton
+                label="Create file"
+                loading={pendingAction === 'create-migration'}
+                disabled={pendingAction === 'create-migration' || !migrationName.trim()}
+                color="violet"
                 onClick={() => {
                   if (!migrationName.trim()) return;
-                  void run('Create migration', async () => {
+                  void run('create-migration', 'Create migration', async () => {
                     const r = await createMigration(migrationName.trim());
                     setMigrationName('');
                     setMessage(`Created ${r.filename}`);
                   });
                 }}
-              >
-                Create file
-              </button>
+                className="text-xs px-4 py-2"
+              />
             </div>
 
             <div className="overflow-auto max-h-80 rounded border border-slate-800">
@@ -640,6 +901,25 @@ export function App() {
           </section>
         )}
       </main>
+
+      <LogPanel
+        state={logPanel}
+        onStateChange={(patch) => setLogPanel((p) => ({ ...p, ...patch }))}
+        selectedLog={selectedLog}
+        logTail={logTail}
+        logLoading={logLoading}
+        logFiles={logFiles}
+        onSelectLog={selectLog}
+        activityLines={activityLines}
+        statusLine={pendingAction ?? (busyService ? `${busyService.action} ${busyService.id}` : null) ?? (bootstrapRunning ? 'Memgraph bootstrap' : null)}
+        busy={hasActiveTask}
+      />
+      {!logPanel.open && (
+        <LogFab
+          busy={hasActiveTask}
+          onClick={() => setLogPanel((p) => ({ ...p, open: true, minimized: false }))}
+        />
+      )}
     </div>
   );
 }
@@ -655,29 +935,28 @@ function ObsCard({ title, children }: { title: string; children: ReactNode }) {
 
 function Btn({
   label,
+  loadingLabel,
   color,
+  loading,
   disabled,
   onClick,
 }: {
   label: string;
+  loadingLabel?: string;
   color: 'emerald' | 'amber' | 'slate' | 'violet';
+  loading?: boolean;
   disabled?: boolean;
   onClick: () => void;
 }) {
-  const colors = {
-    emerald: 'bg-emerald-900 hover:bg-emerald-800',
-    amber: 'bg-amber-900 hover:bg-amber-800',
-    slate: 'bg-slate-700 hover:bg-slate-600',
-    violet: 'bg-violet-900 hover:bg-violet-800',
-  };
   return (
-    <button
-      type="button"
+    <ActionButton
+      label={label}
+      loadingLabel={loadingLabel}
+      loading={loading}
       disabled={disabled}
+      color={color}
       onClick={onClick}
-      className={`text-xs px-2 py-1 rounded text-white disabled:opacity-40 ${colors[color]}`}
-    >
-      {label}
-    </button>
+      className="text-xs px-2 py-1"
+    />
   );
 }

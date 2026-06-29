@@ -1,4 +1,4 @@
-import type { GiopStagingAsset, GiopTraceResponse, GiopGraphChunkResponse } from '../api/giop-api';
+import type { GiopStagingAsset, GiopTraceResponse, GiopGraphChunkResponse, GiopTopologyPayload } from '../api/giop-api';
 import type { GiopGraphQueryKey } from './giopGraphTypes';
 import type { PortalGraphResponse } from './giopGraphTypes';
 import { voltageEdgeColor } from './giopSldTheme';
@@ -24,6 +24,7 @@ function isCriticalAsset(name: string): boolean {
 
 function validationToRisk(validation?: string, connected = true): { band: RiskBand; level: number } {
   if (validation === 'IN_CONFLICT') return { band: 'critical', level: 92 };
+  if (validation === 'REJECTED') return { band: 'low', level: 10 };
   if (!connected) return { band: 'high', level: 75 };
   if (validation === 'PENDING_FIELD' || validation === 'STAGED') return { band: 'medium', level: 55 };
   return { band: 'low', level: 15 };
@@ -87,6 +88,21 @@ export function traceToPortalGraph(
   }).length;
   const criticalCount = trace.nodes.filter((n) => isCriticalAsset(n.name || '')).length;
 
+  const noteParts: string[] = [];
+  if (trace.graph_totals && trace.graph_totals.nodes > nodes.length) {
+    noteParts.push(
+      `Loaded ${nodes.length.toLocaleString()} of ${trace.graph_totals.nodes.toLocaleString()} network nodes (${trace.scope ?? 'traced'} scope).`,
+    );
+  }
+  if (trace.bounds?.truncated) {
+    noteParts.push(
+      `Result capped at ${trace.bounds.max_nodes.toLocaleString()} nodes / ${trace.bounds.max_hops} hops`,
+    );
+  }
+  if (trace.bounds?.mode === 'viewport_fallback') {
+    noteParts.push('Large network — showing viewport around seed');
+  }
+
   const fullGraph: PortalGraphResponse = {
     configured: true,
     query_key: queryKey,
@@ -102,14 +118,41 @@ export function traceToPortalGraph(
       external_trust_roles: 0,
       query_title: 'Grid topology',
       query_mode: queryKey,
-      note:
-        trace.graph_totals && trace.graph_totals.nodes > nodes.length
-          ? `Loaded ${nodes.length.toLocaleString()} of ${trace.graph_totals.nodes.toLocaleString()} network nodes (${trace.scope ?? 'traced'} scope).`
-          : undefined,
+      note: noteParts.length > 0 ? noteParts.join(' · ') : undefined,
     },
   };
 
   return capGraphForCanvas(filterGraphByQuery(fullGraph, queryKey));
+}
+
+export function topologyPayloadToPortalGraph(
+  payload: GiopTopologyPayload,
+  stagingAssets: GiopStagingAsset[] = [],
+  queryKey: GiopGraphQueryKey = 'topology_gaps',
+  title = 'Topology analysis',
+): PortalGraphResponse {
+  const traceLike: GiopTraceResponse = {
+    nodes: payload.nodes,
+    edges: payload.edges,
+    start_mrid: payload.start_mrid ?? '',
+    scope: 'full',
+  };
+  const graph = traceToPortalGraph(traceLike, stagingAssets, queryKey);
+  const noteParts: string[] = [];
+  if (payload.metrics?.orphan_count != null) {
+    noteParts.push(`${payload.metrics.orphan_count} orphan nodes in master`);
+  }
+  if (payload.metrics?.downstream_nodes != null) {
+    noteParts.push(`${payload.metrics.downstream_nodes} downstream nodes`);
+  }
+  if (payload.metrics?.truncated) {
+    noteParts.push('result truncated — narrow seed or raise max_nodes');
+  }
+  if (noteParts.length > 0) {
+    graph.metrics = { ...graph.metrics, note: noteParts.join(' · ') };
+  }
+  graph.title = title;
+  return graph;
 }
 
 export function filterGraphByQuery(
@@ -236,13 +279,14 @@ export function chunkToPortalGraph(
 }
 
 export function countValidationStats(assets: GiopStagingAsset[]) {
-  const stats = { approved: 0, pending: 0, staged: 0, conflict: 0, other: 0 };
+  const stats = { approved: 0, pending: 0, staged: 0, conflict: 0, rejected: 0, other: 0 };
   for (const asset of assets) {
     const v = asset.validation;
     if (v === 'APPROVED') stats.approved += 1;
     else if (v === 'PENDING_FIELD') stats.pending += 1;
     else if (v === 'STAGED') stats.staged += 1;
     else if (v === 'IN_CONFLICT') stats.conflict += 1;
+    else if (v === 'REJECTED') stats.rejected += 1;
     else stats.other += 1;
   }
   return stats;

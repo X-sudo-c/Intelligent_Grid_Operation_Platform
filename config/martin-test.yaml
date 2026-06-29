@@ -1,0 +1,11 @@
+listen_addresses: '0.0.0.0:3000'
+postgres:
+  connection_string: ${DATABASE_URL}
+  auto_bounds: skip
+  auto_publish: false
+  tables:
+    oh_conductor_11kv:
+      schema: gis
+      table: oh_conductor_11kv
+      srid: 4326
+      geometry_column: geom

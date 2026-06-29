@@ -1,0 +1,87 @@
+# GIOP Martin — publish only map layers (avoids 924k raw connectivity_nodes scan).
+listen_addresses: '0.0.0.0:3000'
+
+postgres:
+  connection_string: ${DATABASE_URL}
+  default_srid: 4326
+  auto_bounds: skip
+  pool_size: 10
+  auto_publish: false
+  tables:
+    map_connectivity_nodes:
+      schema: public
+      table: map_connectivity_nodes
+      srid: 4326
+      geometry_column: geom
+      geometry_type: POINT
+      bounds: [-3.5, 4.5, 1.5, 8.5]
+      properties:
+        mrid: text
+        boundary_feeder_id: text
+        name: text
+        validation: text
+    map_ac_line_segments:
+      schema: public
+      table: map_ac_line_segments
+      srid: 4326
+      geometry_column: geom
+      geometry_type: LINESTRING
+      bounds: [-3.5, 4.5, 1.5, 8.5]
+      properties:
+        mrid: text
+        nominal_voltage: text
+        phases: text
+        name: text
+        validation: text
+        installation_type: text
+    ug_cable_33kv:
+      schema: gis
+      table: ug_cable_33kv
+      srid: 4326
+      geometry_column: geom
+    ug_cable_11kv:
+      schema: gis
+      table: ug_cable_11kv
+      srid: 4326
+      geometry_column: geom
+    oh_conductor_33kv:
+      schema: gis
+      table: oh_conductor_33kv
+      srid: 4326
+      geometry_column: geom
+    oh_conductor_11kv:
+      schema: gis
+      table: oh_conductor_11kv
+      srid: 4326
+      geometry_column: geom
+    power_transformer:
+      schema: gis
+      table: power_transformer
+      srid: 4326
+      geometry_column: geom
+    distribution_transformer:
+      schema: gis
+      table: distribution_transformer
+      srid: 4326
+      geometry_column: geom
+    ecg_admin_boundaries:
+      schema: gis
+      table: ecg_admin_boundaries
+      srid: 4326
+      geometry_column: geom
+      geometry_type: MULTIPOLYGON
+      bounds: [-3.5, 4.5, 1.5, 8.5]
+      properties:
+        fid: int4
+        district: text
+        region: text
+    ecg_admin_regions:
+      schema: gis
+      table: ecg_admin_regions
+      srid: 4326
+      geometry_column: geom
+      geometry_type: MULTIPOLYGON
+      bounds: [-3.5, 4.5, 1.5, 8.5]
+      properties:
+        fid: int4
+        region: text

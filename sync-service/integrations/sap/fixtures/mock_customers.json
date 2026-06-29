@@ -1,0 +1,32 @@
+[
+  {
+    "business_partner_id": "1000001",
+    "account_number": "ECG-ACC-10001",
+    "customer_name": "Kwame Asante",
+    "balance_ghs": 142.5
+  },
+  {
+    "business_partner_id": "1000002",
+    "account_number": "ECG-ACC-10002",
+    "customer_name": "Ama Mensah",
+    "balance_ghs": 0.0
+  },
+  {
+    "business_partner_id": "1000003",
+    "account_number": "ECG-ACC-10003",
+    "customer_name": "East Legon Mini Mart",
+    "balance_ghs": 890.25
+  },
+  {
+    "business_partner_id": "1000004",
+    "account_number": "ECG-ACC-10004",
+    "customer_name": "Kofi Boateng",
+    "balance_ghs": 56.0
+  },
+  {
+    "business_partner_id": "1000005",
+    "account_number": "ECG-ACC-10005",
+    "customer_name": "Tema Industrial Park — Block C",
+    "balance_ghs": 12400.0
+  }
+]

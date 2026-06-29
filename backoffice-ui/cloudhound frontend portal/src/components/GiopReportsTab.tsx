@@ -50,15 +50,37 @@ export function GiopReportsTab({ isLightMode }: GiopReportsTabProps) {
 
   const card = isLightMode ? 'border-slate-200 bg-white' : 'border-slate-700 bg-slate-900/40';
 
-  const downloadJson = () => {
-    if (!metrics) return;
-    const blob = new Blob([JSON.stringify(metrics, null, 2)], { type: 'application/json' });
+  const downloadBlob = (content: string, mime: string, ext: string) => {
+    const blob = new Blob([content], { type: mime });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `regulatory-metrics-${periodStart}-${periodEnd}.json`;
+    a.download = `regulatory-metrics-${periodStart}-${periodEnd}.${ext}`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const downloadJson = () => {
+    if (!metrics) return;
+    downloadBlob(JSON.stringify(metrics, null, 2), 'application/json', 'json');
+  };
+
+  const downloadCsv = () => {
+    if (!metrics) return;
+    const escape = (value: string) => `"${value.replace(/"/g, '""')}"`;
+    const rows: Array<[string, string]> = [
+      ['period_start', `${periodStart}T00:00:00Z`],
+      ['period_end', `${periodEnd}T23:59:59Z`],
+      ['outage_count', String(metrics.outage_count)],
+      ['saidi_minutes', String(metrics.saidi_minutes)],
+      ['saifi_interruptions_per_customer', String(metrics.saifi_interruptions_per_customer)],
+      ['caidi_minutes', String(metrics.caidi_minutes)],
+      ['customer_minutes_interrupted', String(metrics.customer_minutes_interrupted)],
+      ['customers_affected_total', String(metrics.customers_affected_total)],
+    ];
+    if (metrics.methodology_note) rows.push(['methodology_note', metrics.methodology_note]);
+    const csv = ['metric,value', ...rows.map(([k, v]) => `${escape(k)},${escape(v)}`)].join('\r\n');
+    downloadBlob(csv, 'text/csv;charset=utf-8', 'csv');
   };
 
   return (
@@ -107,6 +129,14 @@ export function GiopReportsTab({ isLightMode }: GiopReportsTabProps) {
             className="text-xs px-3 py-1.5 bg-slate-700 rounded text-white"
           >
             Generate snapshot
+          </button>
+          <button
+            type="button"
+            onClick={downloadCsv}
+            disabled={!metrics}
+            className="text-xs px-3 py-1.5 bg-emerald-700 rounded text-white disabled:opacity-40"
+          >
+            Download CSV
           </button>
           <button
             type="button"

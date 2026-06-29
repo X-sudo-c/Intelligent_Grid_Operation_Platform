@@ -36,6 +36,7 @@ DOCKER_CONTAINERS=(
   my-memgraph
   giop-martin
   giop-timescale
+  giop-redis
 )
 
 CHECK_ONLY=0
@@ -522,8 +523,17 @@ main() {
 
   log "Docker services"
   ensure_docker_container my-memgraph "$MEMGRAPH_PORT" || true
-  ensure_docker_container giop-martin "$MARTIN_PORT" || true
+  if [[ -x "$ROOT/scripts/ensure_martin.sh" ]]; then
+    "$ROOT/scripts/ensure_martin.sh" >>"$LOG_DIR/martin.log" 2>&1 || ensure_docker_container giop-martin "$MARTIN_PORT" || true
+  else
+    ensure_docker_container giop-martin "$MARTIN_PORT" || true
+  fi
   ensure_docker_container giop-timescale "$TIMESCALE_PORT" || true
+  if [[ -x "$ROOT/scripts/ensure_redis.sh" ]]; then
+    "$ROOT/scripts/ensure_redis.sh" >>"$LOG_DIR/redis.log" 2>&1 || ensure_docker_container giop-redis "${REDIS_PORT:-6379}" || true
+  else
+    ensure_docker_container giop-redis "${REDIS_PORT:-6379}" || true
+  fi
   log ""
 
   log "Python services"

@@ -2,6 +2,8 @@
  * GIOP sync-service API client
  */
 
+import type { TerritoryGeoJson } from '../lib/giopTerritoryHighlight';
+
 const SYNC_BASE = import.meta.env.VITE_SYNC_URL || '/api/v1';
 const OCR_BASE = import.meta.env.VITE_OCR_URL || '/ocr-api/api/v1';
 
@@ -24,6 +26,8 @@ export interface GiopTraceEdge {
   source_lat?: number;
   target_lon?: number;
   target_lat?: number;
+  /** Simplified LineString [[lon, lat], ...] from ac_line_segments.geom when available. */
+  coordinates?: [number, number][];
 }
 
 export interface GiopTraceResponse {
@@ -32,6 +36,15 @@ export interface GiopTraceResponse {
   start_mrid: string;
   scope?: 'traced' | 'full';
   graph_totals?: { nodes: number; edges: number };
+  bounds?: {
+    max_hops: number;
+    max_nodes: number;
+    max_edges: number;
+    truncated: boolean;
+    mode: 'traced' | 'full_bounded' | 'viewport_fallback';
+    edges_truncated?: boolean;
+  };
+  bbox?: { west: number; south: number; east: number; north: number };
 }
 
 export interface GiopGraphChunkNode {
@@ -59,6 +72,7 @@ export interface GiopStagingAsset {
   name?: string;
   validation?: string;
   nominal_voltage?: string;
+  submitted_by?: string | null;
   geom?: { type: string; coordinates: [number, number] } | null;
 }
 
@@ -76,6 +90,27 @@ export interface GiopOcrResult {
   detail?: string;
 }
 
+export interface GiopH3CoverageFeature {
+  type: 'Feature';
+  geometry: { type: 'Polygon'; coordinates: number[][][] };
+  properties: {
+    h3: string;
+    resolution: number;
+    verified_count: number;
+    staged_count: number;
+    reference_count: number;
+    assigned_to?: string | null;
+    status?: string | null;
+  };
+}
+
+export interface GiopH3CoverageResponse {
+  type: 'FeatureCollection';
+  resolution: number;
+  features: GiopH3CoverageFeature[];
+  cell_count: number;
+}
+
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(url, options);
   if (!res.ok) {
@@ -86,11 +121,66 @@ async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export interface GiopTopologyPayload {
+  nodes: GiopTraceNode[];
+  edges: GiopTraceEdge[];
+  start_mrid?: string;
+  metrics?: Record<string, number | boolean | string | null | undefined>;
+}
+
+export interface GiopTopologyHealth {
+  status: string;
+  metrics: {
+    node_count: number;
+    edge_count: number;
+    edge_ratio: number;
+    orphan_count: number;
+    component_count?: number | null;
+    largest_component_nodes?: number | null;
+    graph_analysis?: string;
+  };
+}
+
+export async function getTopologyHealth(): Promise<GiopTopologyHealth> {
+  return fetchJson<GiopTopologyHealth>(`${SYNC_BASE}/topology/health`);
+}
+
+export async function getTopologyGaps(params?: {
+  limit?: number;
+  west?: number;
+  south?: number;
+  east?: number;
+  north?: number;
+}): Promise<GiopTopologyPayload> {
+  const query = new URLSearchParams();
+  if (params?.limit != null) query.set('limit', String(params.limit));
+  if (params?.west != null) query.set('west', String(params.west));
+  if (params?.south != null) query.set('south', String(params.south));
+  if (params?.east != null) query.set('east', String(params.east));
+  if (params?.north != null) query.set('north', String(params.north));
+  const suffix = query.toString() ? `?${query}` : '';
+  return fetchJson<GiopTopologyPayload>(`${SYNC_BASE}/topology/gaps${suffix}`);
+}
+
+export async function getTopologyImpact(
+  startMrid: string,
+  maxNodes = 5000,
+): Promise<GiopTopologyPayload> {
+  const query = new URLSearchParams({
+    start_mrid: startMrid,
+    max_nodes: String(maxNodes),
+  });
+  return fetchJson<GiopTopologyPayload>(`${SYNC_BASE}/topology/impact?${query}`);
+}
+
 export async function getTrace(
   startMrid: string,
   scope: 'traced' | 'full' = 'traced',
+  options?: { maxHops?: number; maxNodes?: number },
 ): Promise<GiopTraceResponse> {
   const query = new URLSearchParams({ start_mrid: startMrid, scope });
+  if (options?.maxHops != null) query.set('max_hops', String(options.maxHops));
+  if (options?.maxNodes != null) query.set('max_nodes', String(options.maxNodes));
   return fetchJson<GiopTraceResponse>(`${SYNC_BASE}/trace?${query}`);
 }
 
@@ -113,17 +203,245 @@ export async function getGraphChunk(params: {
   return fetchJson<GiopGraphChunkResponse>(`${SYNC_BASE}/graph/chunk?${query}`);
 }
 
-export async function getStagingAssets(): Promise<GiopStagingAsset[]> {
-  const data = await fetchJson<GiopStagingResponse>(`${SYNC_BASE}/assets/staging`);
+export async function getH3Coverage(params: {
+  west: number;
+  south: number;
+  east: number;
+  north: number;
+  res?: number;
+  includeReference?: boolean;
+}): Promise<GiopH3CoverageResponse> {
+  const query = new URLSearchParams({
+    west: String(params.west),
+    south: String(params.south),
+    east: String(params.east),
+    north: String(params.north),
+    res: String(params.res ?? 8),
+    include_reference: String(params.includeReference ?? true),
+  });
+  return fetchJson<GiopH3CoverageResponse>(`${SYNC_BASE}/h3/coverage?${query}`);
+}
+
+export const TERRITORY_H3_RES = 9;
+
+export interface GiopH3Status {
+  endpoints_ready: boolean;
+  h3_available: boolean;
+  import_error?: string | null;
+  default_res: number;
+}
+
+export async function getH3Status(): Promise<GiopH3Status> {
+  return fetchJson<GiopH3Status>(`${SYNC_BASE}/h3/status`);
+}
+
+export function formatH3ApiError(err: unknown, context: string): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg === 'Not Found' || msg.includes('404')) {
+    return (
+      `${context}: sync-service is running old code (H3 routes missing). ` +
+      'In OVERSEEYER: Stop then Start sync-service. If Stop fails, run ' +
+      'sudo pkill -f "uvicorn main:app.*--port 5000" then Start again.'
+    );
+  }
+  if (msg.includes('H3 spatial index unavailable') || msg.includes('503')) {
+    return `${context}: pip install -r sync-service/requirements.txt then restart sync-service.`;
+  }
+  return `${context}: ${msg}`;
+}
+
+export interface GiopH3AssignmentFeature {
+  type: 'Feature';
+  geometry: { type: 'Polygon'; coordinates: number[][][] };
+  properties: {
+    h3: string;
+    resolution: number;
+    assigned_to?: string | null;
+    status: string;
+    note?: string | null;
+    updated_at?: string | null;
+  };
+}
+
+export interface GiopH3AssignmentsGeoJson {
+  type: 'FeatureCollection';
+  features: GiopH3AssignmentFeature[];
+  cell_count: number;
+  bbox?: [number, number, number, number] | null;
+}
+
+export interface GiopH3CellAt {
+  h3: string;
+  resolution: number;
+  geometry: { type: 'Polygon'; coordinates: number[][][] };
+}
+
+export interface GiopH3GridGeoJson {
+  type: 'FeatureCollection';
+  resolution: number;
+  features: Array<{
+    type: 'Feature';
+    geometry: { type: 'Polygon'; coordinates: number[][][] };
+    properties: { h3: string; resolution: number };
+  }>;
+  cell_count: number;
+  truncated?: boolean;
+}
+
+export type GiopAssignmentStatus = 'ASSIGNED' | 'IN_PROGRESS' | 'DONE' | 'BLOCKED';
+
+export async function getH3AssignmentsGeoJson(params?: {
+  assignedTo?: string;
+  status?: string;
+}): Promise<GiopH3AssignmentsGeoJson> {
+  const query = new URLSearchParams();
+  if (params?.assignedTo) query.set('assigned_to', params.assignedTo);
+  if (params?.status) query.set('status', params.status);
+  const suffix = query.toString() ? `?${query}` : '';
+  return fetchJson<GiopH3AssignmentsGeoJson>(`${SYNC_BASE}/h3/assignments/geojson${suffix}`);
+}
+
+export async function getH3CellAt(
+  lat: number,
+  lng: number,
+  res = TERRITORY_H3_RES,
+): Promise<GiopH3CellAt> {
+  const query = new URLSearchParams({
+    lat: String(lat),
+    lng: String(lng),
+    res: String(res),
+  });
+  return fetchJson<GiopH3CellAt>(`${SYNC_BASE}/h3/cell-at?${query}`);
+}
+
+export async function getH3GridGeoJson(params: {
+  west: number;
+  south: number;
+  east: number;
+  north: number;
+  res?: number;
+}): Promise<GiopH3GridGeoJson> {
+  const query = new URLSearchParams({
+    west: String(params.west),
+    south: String(params.south),
+    east: String(params.east),
+    north: String(params.north),
+    res: String(params.res ?? TERRITORY_H3_RES),
+  });
+  return fetchJson<GiopH3GridGeoJson>(`${SYNC_BASE}/h3/grid/geojson?${query}`);
+}
+
+export async function batchAssignH3Cells(payload: {
+  h3_indexes: string[];
+  assigned_to: string;
+  resolution?: number;
+  status?: GiopAssignmentStatus;
+  note?: string;
+}): Promise<{ assignments: unknown[]; count: number }> {
+  return fetchJson(`${SYNC_BASE}/h3/assignments/batch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      resolution: TERRITORY_H3_RES,
+      status: 'ASSIGNED',
+      ...payload,
+    }),
+  });
+}
+
+export async function deleteH3Assignments(h3_indexes: string[]): Promise<{ deleted: number }> {
+  return fetchJson(`${SYNC_BASE}/h3/assignments`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ h3_indexes }),
+  });
+}
+
+export interface GiopAssetLocation {
+  mrid: string;
+  name?: string | null;
+  validation?: string | null;
+  longitude?: number | null;
+  latitude?: number | null;
+  boundary_feeder_id?: string | null;
+  nominal_voltage?: string | null;
+  tier?: 'master' | 'staging';
+}
+
+export async function getAssetLocation(mrid: string): Promise<GiopAssetLocation> {
+  return fetchJson(`${SYNC_BASE}/assets/${encodeURIComponent(mrid)}`);
+}
+
+export async function getStagingAssets(options?: {
+  includeRejected?: boolean;
+  submittedBy?: string;
+}): Promise<GiopStagingAsset[]> {
+  const query = new URLSearchParams();
+  if (options?.includeRejected) query.set('include_rejected', 'true');
+  if (options?.submittedBy) query.set('submitted_by', options.submittedBy);
+  const suffix = query.toString() ? `?${query}` : '';
+  const data = await fetchJson<GiopStagingResponse>(`${SYNC_BASE}/assets/staging${suffix}`);
   return data.assets ?? [];
 }
 
-export async function approveAsset(mrid: string): Promise<void> {
+export async function approveAsset(mrid: string, operatorId?: string): Promise<void> {
   await fetchJson(`${SYNC_BASE}/assets/${mrid}/validation`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ validation: 'APPROVED' }),
+    body: JSON.stringify({
+      validation: 'APPROVED',
+      ...(operatorId ? { operator_id: operatorId } : {}),
+    }),
   });
+}
+
+export async function rejectAsset(
+  mrid: string,
+  reason?: string,
+  operatorId?: string,
+): Promise<void> {
+  await fetchJson(`${SYNC_BASE}/assets/${mrid}/validation`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      validation: 'REJECTED',
+      ...(reason ? { reason } : {}),
+      ...(operatorId ? { operator_id: operatorId } : {}),
+    }),
+  });
+}
+
+export interface GiopFieldTechnician {
+  technician_id: string;
+  display_name?: string | null;
+  longitude: number;
+  latitude: number;
+  accuracy_m?: number | null;
+  heading_deg?: number | null;
+  speed_mps?: number | null;
+  work_order_id?: string | null;
+  session_started_at?: string | null;
+  reported_at?: string | null;
+  pending_submissions: number;
+  total_submissions: number;
+}
+
+export async function getFieldTechnicians(
+  staleMinutes = 30,
+): Promise<GiopFieldTechnician[]> {
+  const data = await fetchJson<{ technicians: GiopFieldTechnician[] }>(
+    `${SYNC_BASE}/field/technicians?stale_minutes=${staleMinutes}`,
+  );
+  return data.technicians ?? [];
+}
+
+export async function getTechnicianSubmissions(
+  technicianId: string,
+): Promise<GiopStagingAsset[]> {
+  const data = await fetchJson<{ submissions: GiopStagingAsset[] }>(
+    `${SYNC_BASE}/field/technicians/${encodeURIComponent(technicianId)}/submissions`,
+  );
+  return data.submissions ?? [];
 }
 
 export async function patchAssetName(mrid: string, name: string): Promise<void> {
@@ -145,11 +463,34 @@ export async function patchAssetVoltage(
   });
 }
 
-export async function repairTopology(targetMrid: string, radiusMeters = 50): Promise<unknown> {
+export interface GiopTopologyRepairResult {
+  status: string;
+  dry_run: boolean;
+  result: {
+    target_mrid: string;
+    tier: string;
+    dry_run: boolean;
+    target_kind?: string;
+    proposed?: Array<Record<string, unknown>>;
+    applied?: Array<Record<string, unknown>>;
+    skipped?: Array<Record<string, unknown>>;
+    repairs?: Array<Record<string, unknown>>;
+    radius_meters?: number;
+  };
+}
+
+export async function repairTopology(
+  targetMrid: string,
+  options?: { radiusMeters?: number; dryRun?: boolean },
+): Promise<GiopTopologyRepairResult> {
   return fetchJson(`${SYNC_BASE}/topology/repair`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ target_mrid: targetMrid, radius_meters: radiusMeters }),
+    body: JSON.stringify({
+      target_mrid: targetMrid,
+      radius_meters: options?.radiusMeters ?? 50,
+      dry_run: options?.dryRun ?? false,
+    }),
   });
 }
 
@@ -266,6 +607,25 @@ export async function getLineage(assetMrid: string, limit = 50): Promise<GiopLin
   return data.events ?? [];
 }
 
+export async function searchLineage(options: {
+  assetMrid?: string;
+  sourceType?: string;
+  actionType?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<GiopLineageEvent[]> {
+  const query = new URLSearchParams();
+  if (options.assetMrid) query.set('asset_mrid', options.assetMrid);
+  if (options.sourceType) query.set('source_type', options.sourceType);
+  if (options.actionType) query.set('action_type', options.actionType);
+  query.set('limit', String(options.limit ?? 50));
+  query.set('offset', String(options.offset ?? 0));
+  const data = await fetchJson<{ events: GiopLineageEvent[] }>(
+    `${SYNC_BASE}/lineage/search?${query}`,
+  );
+  return data.events ?? [];
+}
+
 export async function listConflicts(): Promise<GiopConflictProposal[]> {
   const data = await fetchJson<{ conflicts: GiopConflictProposal[] }>(`${SYNC_BASE}/conflicts`);
   return data.conflicts ?? [];
@@ -306,6 +666,754 @@ export async function runEnergyBalance(params: {
   });
 }
 
+export interface GiopDqRule {
+  rule_code: string;
+  domain: string;
+  severity: string;
+  description: string;
+  enabled: boolean;
+  blocks_promotion: boolean;
+}
+
+export interface GiopDqException {
+  id: string;
+  record_type: string;
+  record_mrid: string;
+  rule_code: string;
+  domain: string;
+  severity: string;
+  status: string;
+  error_message: string;
+  details?: Record<string, unknown> | null;
+  owner?: string | null;
+  resolution_note?: string | null;
+  resolved_by?: string | null;
+  created_at?: string | null;
+  resolved_at?: string | null;
+  asset_name?: string | null;
+}
+
+export interface GiopDqSummary {
+  open_total: number;
+  open_by_severity: Record<string, number>;
+  open_by_domain: Record<string, number>;
+}
+
+export interface GiopTopologyDqSummary {
+  live: {
+    approved_nodes: number;
+    orphan_nodes: number;
+    orphan_ratio: number;
+    dangling_lines: number;
+    lines_with_unapproved_endpoints: number;
+  };
+  exception_queue: Record<string, number>;
+  export_blocked: {
+    blocked: boolean;
+    reasons: string[];
+    caps: { open_topology_exceptions: number; orphan_ratio: number };
+  };
+  /** 'snapshot' = served from the last scan (fast); 'live' = freshly computed. */
+  source?: 'snapshot' | 'live';
+  /** ISO timestamp of the scan the snapshot came from (snapshot mode only). */
+  scanned_at?: string | null;
+  run_id?: string;
+}
+
+export interface GiopTopologyDqScanResult {
+  run_id: string;
+  status: string;
+  orphans_found: number;
+  orphans_inserted: number;
+  dangling_found: number;
+  dangling_inserted: number;
+  unapproved_endpoints_found: number;
+  unapproved_endpoints_inserted: number;
+  auto_cleared: number;
+  live: GiopTopologyDqSummary['live'];
+  exception_queue: Record<string, number>;
+  export_gate: GiopTopologyDqSummary['export_blocked'];
+}
+
+export async function getTopologyDqSummary(options?: {
+  clip?: { west: number; south: number; east: number; north: number };
+  /** 'snapshot' (default, fast) reads the last scan; 'live' forces recompute. */
+  mode?: 'snapshot' | 'live';
+}): Promise<GiopTopologyDqSummary> {
+  const q = new URLSearchParams();
+  const clip = options?.clip ?? GHANA_EXPORT_CLIP;
+  q.set('west', String(clip.west));
+  q.set('south', String(clip.south));
+  q.set('east', String(clip.east));
+  q.set('north', String(clip.north));
+  q.set('mode', options?.mode ?? 'snapshot');
+  return fetchJson(`${SYNC_BASE}/dq/topology/summary?${q}`);
+}
+
+export async function runTopologyDqScan(options?: {
+  clip?: { west: number; south: number; east: number; north: number };
+  operatorId?: string;
+}): Promise<{ run_id: string; status: string; message?: string }> {
+  return fetchJson(`${SYNC_BASE}/dq/topology/scan`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      clip: options?.clip ?? GHANA_EXPORT_CLIP,
+      operator_id: options?.operatorId,
+    }),
+  });
+}
+
+export interface GiopTopologyDqRun {
+  id: string;
+  scan_type: string;
+  status: string;
+  orphans_found: number;
+  orphans_inserted: number;
+  dangling_found: number;
+  dangling_inserted: number;
+  auto_cleared: number;
+  started_at?: string | null;
+  completed_at?: string | null;
+  error_message?: string | null;
+}
+
+export async function listTopologyDqRuns(limit = 10): Promise<GiopTopologyDqRun[]> {
+  const data = await fetchJson<{ runs: GiopTopologyDqRun[] }>(
+    `${SYNC_BASE}/dq/topology/runs?limit=${limit}`,
+  );
+  return data.runs ?? [];
+}
+
+export async function listDqExceptions(options?: {
+  status?: string;
+  severity?: string;
+  domain?: string;
+  recordMrid?: string;
+  limit?: number;
+}): Promise<GiopDqException[]> {
+  const query = new URLSearchParams();
+  query.set('status', options?.status ?? 'OPEN');
+  if (options?.severity) query.set('severity', options.severity);
+  if (options?.domain) query.set('domain', options.domain);
+  if (options?.recordMrid) query.set('record_mrid', options.recordMrid);
+  query.set('limit', String(options?.limit ?? 100));
+  const data = await fetchJson<{ exceptions: GiopDqException[] }>(
+    `${SYNC_BASE}/dq/exceptions?${query}`,
+  );
+  return data.exceptions ?? [];
+}
+
+export async function getDqSummary(): Promise<GiopDqSummary> {
+  return fetchJson<GiopDqSummary>(`${SYNC_BASE}/dq/summary`);
+}
+
+export async function listDqRules(): Promise<GiopDqRule[]> {
+  const data = await fetchJson<{ rules: GiopDqRule[] }>(`${SYNC_BASE}/dq/rules`);
+  return data.rules ?? [];
+}
+
+export async function resolveDqException(
+  exceptionId: string,
+  status: 'RESOLVED' | 'DEFERRED' | 'QUARANTINED' | 'REJECTED',
+  note?: string,
+): Promise<unknown> {
+  return fetchJson(`${SYNC_BASE}/dq/exceptions/${exceptionId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status, note }),
+  });
+}
+
+export async function runDqChecks(mrid: string, tier: 'staging' | 'master' = 'staging'): Promise<unknown> {
+  const query = new URLSearchParams({ mrid, tier });
+  return fetchJson(`${SYNC_BASE}/dq/run?${query}`, { method: 'POST' });
+}
+
+export interface GiopValidationRun {
+  id: string;
+  run_type: string;
+  status: string;
+  mode: string;
+  requested_by?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+export interface GiopKpiSnapshot {
+  topology_validity_pct?: number;
+  completeness_pct?: number;
+  critical_exception_count?: number;
+  open_exception_count?: number;
+  auto_fix_success_rate?: number | null;
+  pending_approval_count?: number;
+  export_blocked?: boolean;
+  escalation?: Array<{ code: string; message: string; action: string }>;
+}
+
+export interface GiopValidationProgress {
+  run_id: string;
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+  mode?: string;
+  run_type?: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  error_message?: string | null;
+  current_phase?: string | null;
+  phase_detail?: string | null;
+  completed_phases?: string[];
+  steps?: Array<{
+    agent_name?: string;
+    tool_name?: string | null;
+    policy_decision?: string | null;
+    output_summary?: Record<string, unknown> | null;
+    created_at?: string | null;
+  }>;
+  kpi?: GiopKpiSnapshot;
+  agent_summary?: {
+    content?: string;
+    findings?: string[];
+    actions?: string[];
+    agent?: Record<string, unknown>;
+  };
+}
+
+export interface GiopAgentsStatus {
+  engine: string;
+  llm_configured: boolean;
+  llm_model?: string | null;
+  agents: string[];
+}
+
+export interface GiopApprovalRequest {
+  id: string;
+  cleanup_id?: string | null;
+  exception_id?: string | null;
+  rationale?: string | null;
+  created_at?: string | null;
+  cleanup_mode?: string | null;
+  plan?: Record<string, unknown>;
+  target_mrid?: string | null;
+  rollback_sql?: string | null;
+  qgis_steps?: string | null;
+  rule_code?: string | null;
+  severity?: string | null;
+  error_message?: string | null;
+  proposal_id?: string | null;
+  change_summary?: Record<string, unknown> | null;
+  dry_run_result?: Record<string, unknown> | null;
+  proposed_by?: string | null;
+  proposal_status?: string | null;
+}
+
+export interface GiopTopologyProposal {
+  id: string;
+  exception_id?: string | null;
+  cleanup_id?: string | null;
+  approval_id?: string | null;
+  target_mrid?: string | null;
+  rule_code?: string | null;
+  proposed_by?: string | null;
+  ai_rationale?: string | null;
+  dry_run_result?: Record<string, unknown> | null;
+  change_summary?: Record<string, unknown> | null;
+  status?: string | null;
+  published_by?: string | null;
+  published_at?: string | null;
+  error_message?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  severity?: string | null;
+  exception_message?: string | null;
+}
+
+export async function runValidationCycle(options?: {
+  runType?: 'full_cycle' | 'asset_checks' | 'topology_master' | 'revalidation';
+  mode?: 'deterministic' | 'agent';
+  operatorId?: string;
+  async?: boolean;
+}): Promise<{ run_id: string; status: string; async?: boolean; kpi?: GiopKpiSnapshot }> {
+  const useAsync = options?.async !== false;
+  const url = useAsync ? `${SYNC_BASE}/validation/run?async=true` : `${SYNC_BASE}/validation/run?async=false`;
+  return fetchJson(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      run_type: options?.runType ?? 'full_cycle',
+      mode: options?.mode ?? 'deterministic',
+      operator_id: options?.operatorId,
+    }),
+  });
+}
+
+export async function getValidationRunProgress(runId: string): Promise<GiopValidationProgress> {
+  return fetchJson(`${SYNC_BASE}/validation/runs/${runId}/progress`);
+}
+
+export async function getAgentsStatus(): Promise<GiopAgentsStatus> {
+  return fetchJson(`${SYNC_BASE}/agents/status`);
+}
+
+export async function getLatestKpis(): Promise<GiopKpiSnapshot> {
+  return fetchJson(`${SYNC_BASE}/kpis/latest`);
+}
+
+export async function listPendingApprovals(): Promise<GiopApprovalRequest[]> {
+  const data = await fetchJson<{ approvals: GiopApprovalRequest[] }>(`${SYNC_BASE}/approvals/pending`);
+  return data.approvals ?? [];
+}
+
+export async function approveCleanupRequest(
+  approvalId: string,
+  note?: string,
+): Promise<unknown> {
+  return fetchJson(`${SYNC_BASE}/approvals/${approvalId}/approve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ note, execute: false }),
+  });
+}
+
+export async function rejectCleanupRequest(
+  approvalId: string,
+  note?: string,
+): Promise<unknown> {
+  return fetchJson(`${SYNC_BASE}/approvals/${approvalId}/reject`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ note }),
+  });
+}
+
+export async function listApprovedProposals(): Promise<GiopTopologyProposal[]> {
+  const data = await fetchJson<{ proposals: GiopTopologyProposal[] }>(
+    `${SYNC_BASE}/proposals/approved`,
+  );
+  return data.proposals ?? [];
+}
+
+export async function publishTopologyProposal(
+  proposalId: string,
+  operatorId?: string,
+): Promise<unknown> {
+  return fetchJson(`${SYNC_BASE}/proposals/${proposalId}/publish`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ operator_id: operatorId }),
+  });
+}
+
+export async function generateTopologyProposal(exceptionId: string): Promise<unknown> {
+  return fetchJson(`${SYNC_BASE}/proposals/generate/${exceptionId}`, { method: 'POST' });
+}
+
+export async function generateCleanupPlan(exceptionId: string): Promise<unknown> {
+  return fetchJson(`${SYNC_BASE}/cleanup/generate/${exceptionId}`, { method: 'POST' });
+}
+
+export async function portalAiChat(options: {
+  message: string;
+  exceptionId?: string;
+  mrid?: string;
+  context?: Record<string, unknown>;
+}): Promise<{
+  content: string;
+  findings: string[];
+  actions: string[];
+  ui_actions?: Array<Record<string, unknown>>;
+  agent?: Record<string, unknown>;
+}> {
+  return fetchJson(`${SYNC_BASE}/portal/ai/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      message: options.message,
+      exception_id: options.exceptionId,
+      mrid: options.mrid,
+      context: options.context,
+    }),
+  });
+}
+
+export interface GiopVoiceStatus {
+  stt: {
+    mode?: string;
+    available?: boolean;
+    model?: string;
+    hint?: string | null;
+    browser?: boolean;
+    note?: string;
+  };
+  tts: { enabled: boolean; available: boolean; url?: string; voice?: string; lang?: string };
+}
+
+export async function getVoiceCopilotStatus(): Promise<GiopVoiceStatus> {
+  return fetchJson(`${SYNC_BASE}/portal/ai/voice/status`);
+}
+
+export async function portalAiTranscribe(blob: Blob): Promise<{ text: string }> {
+  const form = new FormData();
+  const name = blob.type.includes('ogg') ? 'recording.ogg' : 'recording.webm';
+  form.append('audio', blob, name);
+  const res = await fetch(`${SYNC_BASE}/portal/ai/transcribe`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const detail = (err as { detail?: string }).detail || res.statusText;
+    throw new Error(detail || `HTTP ${res.status}`);
+  }
+  return res.json() as Promise<{ text: string }>;
+}
+
+export async function portalAiVoiceTurn(options: {
+  text: string;
+  sessionId?: string;
+  exceptionId?: string;
+  mrid?: string;
+  context?: Record<string, unknown>;
+}): Promise<{
+  content: string;
+  findings: string[];
+  actions: string[];
+  ui_actions?: Array<Record<string, unknown>>;
+  agent?: Record<string, unknown> & {
+    speak?: string;
+    session_id?: string;
+    fast_path?: boolean;
+    voice?: boolean;
+    tts?: GiopVoiceStatus['tts'];
+  };
+}> {
+  return fetchJson(`${SYNC_BASE}/portal/ai/voice-turn`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      text: options.text,
+      session_id: options.sessionId,
+      exception_id: options.exceptionId,
+      mrid: options.mrid,
+      context: options.context,
+    }),
+  });
+}
+
+export interface GiopStagingSummary {
+  pending_total: number;
+  by_validation: Record<string, number>;
+  in_conflict: number;
+  active_field_workers: number;
+}
+
+export interface GiopStagingTerritoryCount {
+  territory: string;
+  group_by: string;
+  asset_count: number;
+  pending_field: number;
+  staged: number;
+  in_conflict: number;
+}
+
+export async function getStagingSummary(): Promise<GiopStagingSummary> {
+  return fetchJson(`${SYNC_BASE}/staging/summary`);
+}
+
+export async function getStagingTerritoryCounts(options?: {
+  groupBy?: 'region' | 'district';
+  region?: string;
+  limit?: number;
+}): Promise<{ group_by: string; counts: GiopStagingTerritoryCount[] }> {
+  const params = new URLSearchParams();
+  if (options?.groupBy) params.set('group_by', options.groupBy);
+  if (options?.region) params.set('region', options.region);
+  if (options?.limit) params.set('limit', String(options.limit));
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  return fetchJson(`${SYNC_BASE}/staging/territory-counts${suffix}`);
+}
+
+export interface GiopSpatialTerritory {
+  district?: string | null;
+  region?: string | null;
+  polygon_count?: number;
+  center?: { lon: number; lat: number };
+  bbox?: { west: number; south: number; east: number; north: number };
+}
+
+export interface GiopSpatialInventory {
+  tier: string;
+  asset_kind_filter?: string | null;
+  total: number;
+  by_kind: Record<string, number>;
+  pole_total?: number;
+  district?: string | null;
+  region?: string | null;
+  bbox?: Record<string, number> | null;
+  note?: string;
+}
+
+export async function getSpatialTerritory(options?: {
+  district?: string;
+  region?: string;
+}): Promise<GiopSpatialTerritory> {
+  const params = new URLSearchParams();
+  if (options?.district) params.set('district', options.district);
+  if (options?.region) params.set('region', options.region);
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  return fetchJson(`${SYNC_BASE}/spatial/territory${suffix}`);
+}
+
+export async function getSpatialTerritoryGeojson(options?: {
+  district?: string;
+  region?: string;
+}): Promise<TerritoryGeoJson> {
+  const params = new URLSearchParams();
+  if (options?.district) params.set('district', options.district);
+  if (options?.region) params.set('region', options.region);
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  return fetchJson(`${SYNC_BASE}/spatial/territory/geojson${suffix}`);
+}
+
+export async function getSpatialInventory(options?: {
+  tier?: 'master' | 'staging';
+  assetKind?: string;
+  district?: string;
+  region?: string;
+  bbox?: { west: number; south: number; east: number; north: number };
+}): Promise<GiopSpatialInventory> {
+  const params = new URLSearchParams();
+  if (options?.tier) params.set('tier', options.tier);
+  if (options?.assetKind) params.set('asset_kind', options.assetKind);
+  if (options?.district) params.set('district', options.district);
+  if (options?.region) params.set('region', options.region);
+  if (options?.bbox) {
+    params.set('west', String(options.bbox.west));
+    params.set('south', String(options.bbox.south));
+    params.set('east', String(options.bbox.east));
+    params.set('north', String(options.bbox.north));
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  return fetchJson(`${SYNC_BASE}/spatial/inventory${suffix}`);
+}
+
+export interface GiopExportJob {
+  id: string;
+  format?: string;
+  status: string;
+  feature_count?: number | null;
+  created_at?: string | null;
+  completed_at?: string | null;
+}
+
+/** Ghana operating bbox — default CIM export window (matches sync-service). */
+export const GHANA_EXPORT_CLIP = {
+  west: -3.5,
+  south: 4.5,
+  east: 1.5,
+  north: 8.5,
+} as const;
+
+export async function createCimExport(options?: {
+  layers?: string[];
+  clip?: { west: number; south: number; east: number; north: number };
+  operatorId?: string;
+}): Promise<{ job: GiopExportJob }> {
+  return fetchJson(`${SYNC_BASE}/exports/cim`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      layers: options?.layers,
+      clip: options?.clip ?? GHANA_EXPORT_CLIP,
+      operator_id: options?.operatorId,
+    }),
+  });
+}
+
+export async function listCimExports(limit = 50): Promise<GiopExportJob[]> {
+  const data = await fetchJson<{ jobs: GiopExportJob[] }>(`${SYNC_BASE}/exports?limit=${limit}`);
+  return data.jobs ?? [];
+}
+
+export function downloadExportUrl(jobId: string): string {
+  return `${SYNC_BASE}/exports/${encodeURIComponent(jobId)}/download`;
+}
+
+/** @deprecated use downloadExportUrl */
+export function downloadCimExportUrl(jobId: string): string {
+  return downloadExportUrl(jobId);
+}
+
+export async function createDxfExport(options?: {
+  clip?: { west: number; south: number; east: number; north: number };
+  includeNodes?: boolean;
+  includeLines?: boolean;
+  operatorId?: string;
+}): Promise<{ job: GiopExportJob }> {
+  return fetchJson(`${SYNC_BASE}/exports/dxf`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      clip: options?.clip ?? GHANA_EXPORT_CLIP,
+      include_nodes: options?.includeNodes ?? true,
+      include_lines: options?.includeLines ?? true,
+      operator_id: options?.operatorId,
+    }),
+  });
+}
+
+export async function previewDxfExport(options?: {
+  limit?: number;
+  clip?: { west: number; south: number; east: number; north: number };
+}): Promise<{ counts: Record<string, number> }> {
+  const clip = options?.clip ?? GHANA_EXPORT_CLIP;
+  const limit = options?.limit ?? 50;
+  const q = new URLSearchParams({
+    limit: String(limit),
+    west: String(clip.west),
+    south: String(clip.south),
+    east: String(clip.east),
+    north: String(clip.north),
+  });
+  return fetchJson(`${SYNC_BASE}/exports/dxf/preview?${q}`);
+}
+
+export type GiopExportFormat =
+  | 'geopackage'
+  | 'kml'
+  | 'shapefile'
+  | 'csv'
+  | 'cim-xml'
+  | 'cim-rdf'
+  | 'mdms-csv'
+  | 'sap-csv';
+
+export const EXPORT_FORMAT_LABELS: Record<string, string> = {
+  'cim-json': 'CIM JSON',
+  dxf: 'AutoCAD DXF',
+  geopackage: 'GeoPackage',
+  kml: 'KML',
+  shapefile: 'Shapefile (zip)',
+  csv: 'CSV bundle (zip)',
+  'cim-xml': 'CIM RDF/XML (legacy name)',
+  'cim-rdf': 'CIM RDF/XML (IEC 61968/61970)',
+  'mdms-csv': 'MDMS batch CSV',
+  'sap-csv': 'SAP batch CSV',
+};
+
+export async function listExportFormats(): Promise<string[]> {
+  const data = await fetchJson<{ formats: string[] }>(`${SYNC_BASE}/exports/formats`);
+  return data.formats ?? [];
+}
+
+export async function createFormatExport(
+  format: GiopExportFormat,
+  options?: {
+    layers?: string[];
+    clip?: { west: number; south: number; east: number; north: number };
+    includeMeters?: boolean;
+    operatorId?: string;
+  },
+): Promise<{ job: GiopExportJob }> {
+  return fetchJson(`${SYNC_BASE}/exports/${encodeURIComponent(format)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      layers: options?.layers,
+      clip: format === 'mdms-csv' ? undefined : (options?.clip ?? GHANA_EXPORT_CLIP),
+      include_meters: options?.includeMeters ?? true,
+      operator_id: options?.operatorId,
+    }),
+  });
+}
+
+// --- FR-017 migration adapter (GeoPackage / DXF) ---------------------------
+export interface GiopMigrationRun {
+  id: string;
+  source_format: string;
+  source_name: string | null;
+  status: string;
+  feature_count: number;
+  committed_count: number;
+  failed_count: number;
+  requested_by: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface GiopMigrationFailed {
+  id: string;
+  source_ref: string | null;
+  primitive: string | null;
+  error_message: string;
+  dlq_id: string | null;
+  created_at: string | null;
+}
+
+export interface GiopMigrationResult {
+  run_id: string;
+  source_format: string;
+  source_name: string;
+  feature_count: number;
+  committed: number;
+  failed: number;
+  status: string;
+}
+
+export interface GiopAffineParams {
+  anchor_lon: number;
+  anchor_lat: number;
+  scale?: number;
+  rotation_deg?: number;
+  origin_x?: number;
+  origin_y?: number;
+}
+
+export async function migrateDxf(body: {
+  dxf_text?: string;
+  file_path?: string;
+  source_name?: string;
+  apply_affine: boolean;
+  affine?: GiopAffineParams;
+  default_feeder?: string | null;
+  default_utility?: string;
+  requested_by?: string | null;
+}): Promise<GiopMigrationResult> {
+  return fetchJson(`${SYNC_BASE}/migration/dxf`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function migrateGeopackage(body: {
+  file_path: string;
+  table?: string | null;
+  source_name?: string;
+  apply_affine: boolean;
+  affine?: GiopAffineParams;
+  default_feeder?: string | null;
+  default_utility?: string;
+  requested_by?: string | null;
+}): Promise<GiopMigrationResult> {
+  return fetchJson(`${SYNC_BASE}/migration/geopackage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function listMigrationRuns(limit = 50): Promise<GiopMigrationRun[]> {
+  const data = await fetchJson<{ runs: GiopMigrationRun[] }>(`${SYNC_BASE}/migration/runs?limit=${limit}`);
+  return data.runs ?? [];
+}
+
+export async function listMigrationFailed(runId: string): Promise<GiopMigrationFailed[]> {
+  const data = await fetchJson<{ failed: GiopMigrationFailed[] }>(
+    `${SYNC_BASE}/migration/runs/${encodeURIComponent(runId)}/failed`,
+  );
+  return data.failed ?? [];
+}
+
 export async function listDlq(status = 'OPEN'): Promise<GiopDlqItem[]> {
   const data = await fetchJson<{ items: GiopDlqItem[] }>(`${SYNC_BASE}/dlq?status=${encodeURIComponent(status)}`);
   return data.items ?? [];
@@ -323,8 +1431,56 @@ export async function discardDlq(dlqId: string): Promise<unknown> {
   });
 }
 
+export interface GiopSapIntegrationStatus {
+  enabled: boolean;
+  mode: string;
+  mock_mode: boolean;
+  base_url_configured: boolean;
+  customer_entity_path: string;
+  customer_accounts_total: number;
+  customer_accounts_sap_linked: number;
+  open_sap_dlq_count: number;
+  last_run?: {
+    id: string;
+    mode: string;
+    status: string;
+    fetched: number;
+    upserted: number;
+    failed: number;
+    error_summary?: string | null;
+    started_at?: string | null;
+    finished_at?: string | null;
+  } | null;
+}
+
+export interface GiopSapSyncResult {
+  run_id: string;
+  mode: string;
+  status: string;
+  fetched: number;
+  upserted: number;
+  failed: number;
+  errors: string[];
+}
+
+export async function getSapIntegrationStatus(): Promise<GiopSapIntegrationStatus> {
+  return fetchJson(`${SYNC_BASE}/integrations/sap/status`);
+}
+
+export async function syncSapCustomers(): Promise<GiopSapSyncResult> {
+  return fetchJson(`${SYNC_BASE}/integrations/sap/sync/customers`, { method: 'POST' });
+}
+
 export async function getHealthMetrics(): Promise<GiopHealthMetrics> {
   return fetchJson<GiopHealthMetrics>(`${SYNC_BASE}/health/metrics`);
+}
+
+/** Aggregated left-nav badge counts, keyed by portal tab id. */
+export type GiopNavBadgeCounts = Record<string, number>;
+
+export async function getNavBadges(): Promise<GiopNavBadgeCounts> {
+  const data = await fetchJson<{ badges: GiopNavBadgeCounts }>(`${SYNC_BASE}/ops/badges`);
+  return data.badges ?? {};
 }
 
 // --- Operational modules (Phase 2) ---
@@ -334,6 +1490,8 @@ export interface GiopContactCase {
   reference: string;
   channel: string;
   account_mrid?: string | null;
+  meter_mrid?: string | null;
+  asset_mrid?: string | null;
   classification: string;
   priority: number;
   status: string;
@@ -348,6 +1506,9 @@ export interface GiopTroubleTicket {
   id: string;
   reference: string;
   source: string;
+  account_mrid?: string | null;
+  meter_mrid?: string | null;
+  asset_mrid?: string | null;
   ticket_type: string;
   severity: string;
   priority: number;
@@ -367,8 +1528,11 @@ export interface GiopWorkOrder {
   status: string;
   assigned_crew?: string | null;
   assigned_user?: string | null;
+  asset_mrid?: string | null;
   summary: string;
   notes?: string | null;
+  longitude?: number | null;
+  latitude?: number | null;
   created_at?: string | null;
   links?: Array<Record<string, string>>;
 }
@@ -513,6 +1677,17 @@ export async function restoreOutage(outageId: string): Promise<GiopOutage> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({}),
+  });
+}
+
+export async function patchOutage(
+  outageId: string,
+  body: { is_published?: boolean; status?: string },
+): Promise<GiopOutage> {
+  return fetchJson(`${SYNC_BASE}/outages/${outageId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
 }
 

@@ -1,0 +1,2 @@
+# Optional — local voice copilot STT (offline, no Google network)
+faster-whisper>=1.1.0

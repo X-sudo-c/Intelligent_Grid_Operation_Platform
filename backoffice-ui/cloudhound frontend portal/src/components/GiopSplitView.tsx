@@ -3,7 +3,7 @@ import { GiopMapView } from './GiopMapView';
 import { GiopTopologyTab } from './GiopTopologyTab';
 import { SPLIT_VIEW_GRAPH_QUERY_OPTIONS, type GiopGraphQueryKey } from '../lib/giopGraphTypes';
 import type { PortalGraphResponse } from '../lib/giopGraphTypes';
-import type { GiopStagingAsset } from '../api/giop-api';
+import type { GiopFieldTechnician, GiopStagingAsset, GiopWorkOrder, GiopTopologyPayload } from '../api/giop-api';
 import { useGiopGraphChunk } from '../hooks/useGiopGraphChunk';
 import { chunkToPortalGraph } from '../lib/giopGraphAdapter';
 import type { MapBbox } from '../hooks/useGiopGraphChunk';
@@ -11,6 +11,7 @@ import type { MapBbox } from '../hooks/useGiopGraphChunk';
 interface GiopSplitViewProps {
   graph: PortalGraphResponse | null;
   loading: boolean;
+  revalidating?: boolean;
   error: string | null;
   graphQuery: GiopGraphQueryKey;
   onQueryChange: (key: GiopGraphQueryKey) => void;
@@ -21,8 +22,24 @@ interface GiopSplitViewProps {
   focusCoordinates?: [number, number] | null;
   stagingAssets?: GiopStagingAsset[];
   onMapNodeClick?: (mrid: string, coordinates?: [number, number]) => void;
+  onMapViewportChange?: (bbox: MapBbox, zoom: number, center: { lon: number; lat: number }) => void;
+  onTerritorySelect?: (territory: { district?: string; region?: string }) => void;
   mapRefreshToken?: number;
   startMrid?: string;
+  fieldTechnicians?: GiopFieldTechnician[];
+  onTechnicianClick?: (technicianId: string) => void;
+  fieldCrews?: {
+    selectedId: string | null;
+    submissions: GiopStagingAsset[];
+    loading?: boolean;
+    error?: string | null;
+    onSelect: (technicianId: string) => void;
+    onClear: () => void;
+    onFocusTechnician?: (technician: GiopFieldTechnician) => void;
+    onFocusAsset?: (mrid: string, coordinates?: [number, number]) => void;
+  };
+  workOrders?: GiopWorkOrder[];
+  impactOverlay?: GiopTopologyPayload | null;
 }
 
 const SPLIT_RATIO_KEY = 'giop.portal.splitRatio.v1';
@@ -40,6 +57,7 @@ function readSplitRatio(): number {
 export function GiopSplitView({
   graph,
   loading,
+  revalidating = false,
   error,
   graphQuery,
   onQueryChange,
@@ -50,8 +68,15 @@ export function GiopSplitView({
   focusCoordinates,
   stagingAssets = [],
   onMapNodeClick,
+  onMapViewportChange,
+  onTerritorySelect,
   mapRefreshToken = 0,
   startMrid,
+  fieldTechnicians = [],
+  onTechnicianClick,
+  fieldCrews,
+  workOrders = [],
+  impactOverlay = null,
 }: GiopSplitViewProps) {
   const ratio = readSplitRatio();
   const { chunk, loading: chunkLoading, error: chunkError, loadBbox } = useGiopGraphChunk(startMrid);
@@ -67,34 +92,42 @@ export function GiopSplitView({
     graphQuery === 'viewport_subgraph' ? chunkError || (viewportGraph ? null : error) : error;
 
   const handleViewportChange = useCallback(
-    (bbox: MapBbox, zoom: number) => {
+    (bbox: MapBbox, zoom: number, center: { lon: number; lat: number }) => {
       void loadBbox(bbox, zoom);
+      onMapViewportChange?.(bbox, zoom, center);
     },
-    [loadBbox],
+    [loadBbox, onMapViewportChange],
   );
 
   return (
     <div className="flex h-full min-h-0">
-      <div className="min-h-0 h-full border-r border-slate-800" style={{ width: `${ratio}%` }}>
+      <div className="relative min-h-0 h-full border-r border-slate-800" style={{ width: `${ratio}%` }}>
         <GiopMapView
           isLightMode={isLightMode}
           focusMrid={focusMrid}
           focusCoordinates={focusCoordinates}
           stagingAssets={stagingAssets}
+          fieldTechnicians={fieldTechnicians}
+          fieldCrews={fieldCrews}
           onNodeClick={onMapNodeClick}
+          onTechnicianClick={onTechnicianClick}
           onViewportChange={handleViewportChange}
+          onTerritorySelect={onTerritorySelect}
           refreshToken={mapRefreshToken}
           startMrid={startMrid}
           streamGraphChunk={false}
           graphChunk={chunk}
           chunkLoadingExternal={chunkLoading}
           chunkErrorExternal={chunkError}
+          workOrders={workOrders}
+          impactOverlay={impactOverlay}
         />
       </div>
       <div className="min-h-0 flex-1">
         <GiopTopologyTab
           graph={displayGraph}
           loading={displayLoading}
+          revalidating={revalidating}
           error={displayError}
           graphQuery={graphQuery}
           onQueryChange={onQueryChange}

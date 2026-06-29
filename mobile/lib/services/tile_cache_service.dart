@@ -12,7 +12,11 @@ class TileCacheService {
   final ApiConfig config;
   final Dio _dio;
 
-  static const _layerIds = ['connectivity_nodes', 'ac_line_segments'];
+  static const _layerIds = [
+    'map_ac_line_segments',
+    'map_connectivity_nodes',
+    'distribution_transformer',
+  ];
 
   Future<void> prefetchViewport({
     required double latitude,

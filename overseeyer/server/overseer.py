@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import socket
 import subprocess
 import threading
@@ -22,8 +23,17 @@ LOG_DIR = RUN_DIR / "logs"
 PID_DIR = RUN_DIR / "pids"
 MIGRATIONS_DIR = ROOT / "supabase" / "migrations"
 
+_DEFAULT_PYTHON = str(ROOT / ".venv" / "bin" / "python")
+GIOP_PYTHON = os.getenv("GIOP_PYTHON") or (
+    _DEFAULT_PYTHON if Path(_DEFAULT_PYTHON).is_file() else "python3"
+)
+
 OVERSEYER_API_PORT = int(os.getenv("OVERSEYER_API_PORT", "5190"))
 OVERSEYER_WEB_PORT = int(os.getenv("OVERSEYER_WEB_PORT", "5191"))
+SUPERTONIC_PORT = int(os.getenv("SUPERTONIC_PORT", "7788"))
+
+# Started/stopped via service_ctl.sh (self-shutdown from the running API).
+SELF_MANAGED_SERVICES = frozenset({"overseeyer-api", "overseeyer-web"})
 
 ServiceKind = Literal["docker", "process", "supabase", "external"]
 
@@ -52,7 +62,7 @@ SERVICES: list[ServiceDef] = [
         pid_name="overseeyer-api",
         workdir=OVERSEYER_DIR / "server",
         start_cmd=(
-            os.getenv("GIOP_PYTHON", "python3"),
+            GIOP_PYTHON,
             "-m",
             "uvicorn",
             "main:app",
@@ -60,6 +70,7 @@ SERVICES: list[ServiceDef] = [
             "0.0.0.0",
             "--port",
             str(OVERSEYER_API_PORT),
+            "--reload",
         ),
         log_name="overseeyer-api",
     ),
@@ -77,6 +88,7 @@ SERVICES: list[ServiceDef] = [
     ServiceDef("memgraph", "Memgraph", "docker", 7687, container="my-memgraph"),
     ServiceDef("martin", "Martin tiles", "docker", 3001, container="giop-martin"),
     ServiceDef("timescale", "TimescaleDB", "docker", 5433, container="giop-timescale"),
+    ServiceDef("redis", "Redis cache", "docker", 6379, container="giop-redis", log_name="redis"),
     ServiceDef(
         "sync-service",
         "Sync gateway",
@@ -86,7 +98,7 @@ SERVICES: list[ServiceDef] = [
         pid_name="sync-service",
         workdir=ROOT / "sync-service",
         start_cmd=(
-            os.getenv("GIOP_PYTHON", "python3"),
+            GIOP_PYTHON,
             "-m",
             "uvicorn",
             "main:app",
@@ -100,6 +112,15 @@ SERVICES: list[ServiceDef] = [
         log_name="sync-service",
     ),
     ServiceDef(
+        "supertonic",
+        "Supertonic TTS (voice)",
+        "process",
+        SUPERTONIC_PORT,
+        f"http://127.0.0.1:{SUPERTONIC_PORT}/docs",
+        pid_name="supertonic",
+        log_name="supertonic",
+    ),
+    ServiceDef(
         "ocr-service",
         "OCR service",
         "process",
@@ -108,7 +129,7 @@ SERVICES: list[ServiceDef] = [
         pid_name="ocr-service",
         workdir=ROOT / "ocr-service",
         start_cmd=(
-            os.getenv("GIOP_PYTHON", "python3"),
+            GIOP_PYTHON,
             "-m",
             "uvicorn",
             "main:app",
@@ -302,6 +323,57 @@ def stack_status() -> dict[str, Any]:
     }
 
 
+def _pids_listening_on_port(port: int) -> list[int]:
+    """Return PIDs bound to TCP *port* on localhost (best-effort)."""
+    try:
+        out = subprocess.run(
+            ["ss", "-ltnp"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    pids: list[int] = []
+    needle = f":{port}"
+    for line in out.stdout.splitlines():
+        if needle not in line:
+            continue
+        for match in re.finditer(r"pid=(\d+)", line):
+            pids.append(int(match.group(1)))
+    return sorted(set(pids))
+
+
+def _terminate_pid(pid: int) -> None:
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def _free_port(port: int, *, grace_seconds: float = 2.0) -> None:
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        pids = _pids_listening_on_port(port)
+        if not pids:
+            return
+        for pid in pids:
+            _terminate_pid(pid)
+        time.sleep(0.25)
+    for pid in _pids_listening_on_port(port):
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
 def _run_background(cmd: list[str], workdir: Path, log_name: str) -> int:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     PID_DIR.mkdir(parents=True, exist_ok=True)
@@ -319,15 +391,95 @@ def _run_background(cmd: list[str], workdir: Path, log_name: str) -> int:
     return proc.pid
 
 
+def _spawn_overseeyer_ctl(service_id: str, action: Literal["stop", "start", "restart"]) -> dict[str, Any]:
+    """Delegate stop/start/restart for OVERSEEYER API/UI to an external shell script."""
+    if service_id not in SELF_MANAGED_SERVICES:
+        raise ValueError(f"Not a self-managed service: {service_id}")
+    script = OVERSEYER_DIR / "scripts" / "service_ctl.sh"
+    if not script.is_file():
+        raise ValueError(f"Missing control script: {script}")
+    defn = next((s for s in SERVICES if s.id == service_id), None)
+    if not defn:
+        raise ValueError(f"Unknown service: {service_id}")
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_ctl = LOG_DIR / "overseeyer-ctl.log"
+    with log_ctl.open("a", encoding="utf-8") as log_handle:
+        subprocess.Popen(
+            ["bash", str(script), action, service_id],
+            cwd=str(ROOT),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    scheduled = service_id == "overseeyer-api" and action in ("stop", "restart")
+    if scheduled and action == "stop":
+        detail = (
+            "OVERSEEYER API will stop in ~1s — run ./overseeyer/scripts/start.sh "
+            "--api-only to bring it back"
+        )
+    elif scheduled and action == "restart":
+        detail = "OVERSEEYER API restart scheduled — UI reconnects in ~5s"
+    elif service_id == "overseeyer-web" and action == "restart":
+        detail = "OVERSEEYER UI restart scheduled"
+    else:
+        detail = f"{service_id} {action} scheduled"
+
+    return {
+        "service_id": service_id,
+        "action": action,
+        "scheduled": scheduled or action in ("start", "restart", "stop"),
+        "stopped": action == "stop" and not scheduled,
+        "detail": detail,
+        "result": _probe_service(defn),
+    }
+
+
+def _run_ensure_script(script_name: str, *, log_name: str | None = None, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+    script = ROOT / "scripts" / script_name
+    if not script.is_file():
+        raise FileNotFoundError(f"Missing script: {script}")
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logfile = LOG_DIR / f"{log_name or script_name.replace('.sh', '')}.log"
+    proc = subprocess.run(
+        [str(script)],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    with logfile.open("a", encoding="utf-8") as handle:
+        handle.write(f"\n--- {datetime.now(timezone.utc).isoformat()} {script_name} exit={proc.returncode} ---\n")
+        if proc.stdout:
+            handle.write(proc.stdout)
+        if proc.stderr:
+            handle.write(proc.stderr)
+    return proc
+
+
 def start_service(service_id: str) -> dict[str, Any]:
-    if service_id == "overseeyer-api":
-        raise ValueError("Cannot start overseeyer-api from within itself — use ./overseeyer/scripts/start.sh")
+    if service_id in SELF_MANAGED_SERVICES:
+        return _spawn_overseeyer_ctl(service_id, "start")
 
     defn = next((s for s in SERVICES if s.id == service_id), None)
     if not defn:
         raise ValueError(f"Unknown service: {service_id}")
 
     if defn.kind == "docker" and defn.container:
+        if service_id == "redis":
+            proc = _run_ensure_script("ensure_redis.sh", log_name="redis")
+            time.sleep(1)
+            return {
+                "service_id": service_id,
+                "action": "start",
+                "exit_code": proc.returncode,
+                "stdout": proc.stdout[-2000:] if proc.stdout else "",
+                "stderr": proc.stderr[-1000:] if proc.stderr else "",
+                "result": _probe_service(defn),
+            }
         subprocess.run(["docker", "start", defn.container], check=True, timeout=30)
         time.sleep(2)
         return {"service_id": service_id, "action": "start", "result": _probe_service(defn)}
@@ -360,6 +512,18 @@ def start_service(service_id: str) -> dict[str, Any]:
             time.sleep(1)
             return {"service_id": service_id, "action": "start", "pid": pid, "result": _probe_service(defn)}
 
+        if defn.id == "supertonic":
+            proc = _run_ensure_script("start-supertonic.sh", log_name="supertonic", timeout=300)
+            time.sleep(2)
+            return {
+                "service_id": service_id,
+                "action": "start",
+                "exit_code": proc.returncode,
+                "stdout": proc.stdout[-2000:] if proc.stdout else "",
+                "stderr": proc.stderr[-1000:] if proc.stderr else "",
+                "result": _probe_service(defn),
+            }
+
         if defn.start_cmd and defn.workdir:
             cmd = list(defn.start_cmd)
             if cmd[0] == "python3":
@@ -372,8 +536,8 @@ def start_service(service_id: str) -> dict[str, Any]:
 
 
 def stop_service(service_id: str) -> dict[str, Any]:
-    if service_id == "overseeyer-api":
-        raise ValueError("Cannot stop overseeyer-api from within itself")
+    if service_id in SELF_MANAGED_SERVICES:
+        return _spawn_overseeyer_ctl(service_id, "stop")
 
     defn = next((s for s in SERVICES if s.id == service_id), None)
     if not defn:
@@ -386,25 +550,87 @@ def stop_service(service_id: str) -> dict[str, Any]:
     if defn.kind == "process" and defn.pid_name:
         pid = _read_pid(defn.pid_name)
         if pid:
-            try:
-                os.kill(pid, 15)
-            except OSError:
-                pass
+            _terminate_pid(pid)
+        # Free the port regardless of pidfile state — covers orphans started by a
+        # previous overseer instance or processes whose pidfile was already removed.
+        if defn.port:
+            _free_port(defn.port)
+        # Only drop the pidfile once the process is actually gone, so a failed
+        # stop doesn't leave an untracked orphan behind.
+        still_running = bool(defn.port and _port_open("127.0.0.1", defn.port))
         pidfile = PID_DIR / f"{defn.pid_name}.pid"
-        if pidfile.is_file():
+        if not still_running and pidfile.is_file():
             pidfile.unlink()
-        return {"service_id": service_id, "action": "stop", "result": _probe_service(defn)}
+        result = _probe_service(defn)
+        if still_running:
+            result["detail"] = (
+                f"stop failed — port :{defn.port} still open "
+                "(check permissions / run start.sh as the owning user)"
+            )
+        return {
+            "service_id": service_id,
+            "action": "stop",
+            "stopped": not still_running,
+            "result": result,
+        }
 
     raise ValueError(f"Cannot stop service {service_id}")
 
 
 def restart_service(service_id: str) -> dict[str, Any]:
-    if service_id == "overseeyer-api":
-        raise ValueError("Cannot restart overseeyer-api from within itself")
+    if service_id in SELF_MANAGED_SERVICES:
+        return _spawn_overseeyer_ctl(service_id, "restart")
+    if service_id == "martin":
+        script = ROOT / "scripts" / "ensure_martin.sh"
+        if script.is_file():
+            proc = subprocess.run(
+                [str(script)],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            return {
+                "service_id": service_id,
+                "action": "restart",
+                "exit_code": proc.returncode,
+                "stdout": proc.stdout[-2000:] if proc.stdout else "",
+                "stderr": proc.stderr[-1000:] if proc.stderr else "",
+                "result": _probe_service(next(s for s in SERVICES if s.id == "martin")),
+            }
+    if service_id == "redis":
+        proc = _run_ensure_script("ensure_redis.sh", log_name="redis")
+        return {
+            "service_id": service_id,
+            "action": "restart",
+            "exit_code": proc.returncode,
+            "stdout": proc.stdout[-2000:] if proc.stdout else "",
+            "stderr": proc.stderr[-1000:] if proc.stderr else "",
+            "result": _probe_service(next(s for s in SERVICES if s.id == "redis")),
+        }
+    if service_id == "supertonic":
+        try:
+            stop_service(service_id)
+        except ValueError:
+            pass
+        time.sleep(1)
+        proc = _run_ensure_script("start-supertonic.sh", log_name="supertonic", timeout=300)
+        return {
+            "service_id": service_id,
+            "action": "restart",
+            "exit_code": proc.returncode,
+            "stdout": proc.stdout[-2000:] if proc.stdout else "",
+            "stderr": proc.stderr[-1000:] if proc.stderr else "",
+            "result": _probe_service(next(s for s in SERVICES if s.id == "supertonic")),
+        }
     try:
         stop_service(service_id)
     except ValueError:
         pass
+    defn = next((s for s in SERVICES if s.id == service_id), None)
+    if defn and defn.port:
+        _free_port(defn.port, grace_seconds=3.0)
     time.sleep(1)
     return start_service(service_id)
 
@@ -620,10 +846,18 @@ def create_migration(name: str, sql_body: str | None = None) -> dict[str, Any]:
     return {"filename": filename, "path": str(path.relative_to(ROOT)), "version": f"{next_num:05d}"}
 
 
-def apply_migrations(mode: Literal["up", "reset"] = "up") -> dict[str, Any]:
+def _run_apply_migrations_sync(mode: Literal["up", "reset"] = "up") -> dict[str, Any]:
+    martin_paused = False
+    if mode == "up" and _port_open("127.0.0.1", 3001):
+        try:
+            stop_service("martin")
+            martin_paused = True
+        except Exception:
+            martin_paused = False
+
     if mode == "reset":
         proc = subprocess.run(
-            ["npx", "supabase", "db", "reset"],
+            ["npx", "supabase", "db", "reset", "--local"],
             cwd=str(ROOT),
             capture_output=True,
             text=True,
@@ -632,17 +866,107 @@ def apply_migrations(mode: Literal["up", "reset"] = "up") -> dict[str, Any]:
         )
     else:
         proc = subprocess.run(
-            ["npx", "supabase", "migration", "up"],
+            ["npx", "supabase", "migration", "up", "--local"],
             cwd=str(ROOT),
             capture_output=True,
             text=True,
             timeout=600,
             check=False,
         )
+
+    martin_restarted = False
+    if martin_paused and proc.returncode == 0:
+        try:
+            script = ROOT / "scripts" / "ensure_martin.sh"
+            if script.is_file():
+                subprocess.run([str(script)], cwd=str(ROOT), capture_output=True, text=True, timeout=120, check=False)
+                martin_restarted = True
+            else:
+                start_service("martin")
+                martin_restarted = True
+        except Exception:
+            martin_restarted = False
+
     return {
         "mode": mode,
         "exit_code": proc.returncode,
         "stdout": proc.stdout[-8000:] if proc.stdout else "",
         "stderr": proc.stderr[-4000:] if proc.stderr else "",
+        "martin_paused": martin_paused,
+        "martin_restarted": martin_restarted,
         "migrations": list_migrations(),
     }
+
+
+def apply_migrations(mode: Literal["up", "reset"] = "up") -> dict[str, Any]:
+    """Synchronous apply — prefer start_apply_migrations() from the API."""
+    return _run_apply_migrations_sync(mode)
+
+
+_migration_lock = threading.Lock()
+_migration_job: dict[str, Any] | None = None
+
+
+def migration_apply_status() -> dict[str, Any]:
+    with _migration_lock:
+        if _migration_job is None:
+            return {"running": False}
+        return dict(_migration_job)
+
+
+def _set_migration_job(**fields: Any) -> dict[str, Any]:
+    global _migration_job
+    with _migration_lock:
+        if _migration_job is None:
+            _migration_job = {}
+        _migration_job.update(fields)
+        return dict(_migration_job)
+
+
+def _migration_worker(mode: Literal["up", "reset"]) -> None:
+    try:
+        _set_migration_job(phase="running_supabase")
+        result = _run_apply_migrations_sync(mode)
+        exit_code = result.get("exit_code")
+        error = None
+        if exit_code not in (0, None):
+            error = (result.get("stderr") or result.get("stdout") or "migration command failed").strip()
+        _set_migration_job(
+            running=False,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            phase="done",
+            exit_code=exit_code,
+            error=error[-4000:] if error else None,
+            result=result,
+        )
+    except Exception as exc:
+        _set_migration_job(
+            running=False,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            phase="error",
+            exit_code=-1,
+            error=str(exc),
+            result=None,
+        )
+
+
+def start_apply_migrations(mode: Literal["up", "reset"] = "up") -> dict[str, Any]:
+    """Start migration apply in a background thread; returns immediately."""
+    global _migration_job
+    with _migration_lock:
+        if _migration_job and _migration_job.get("running"):
+            raise ValueError("Migration apply already running")
+        _migration_job = {
+            "running": True,
+            "mode": mode,
+            "phase": "starting",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "exit_code": None,
+            "error": None,
+            "result": None,
+        }
+        job = dict(_migration_job)
+
+    threading.Thread(target=_migration_worker, args=(mode,), daemon=True).start()
+    return job

@@ -24,7 +24,18 @@ def insert_dlq(
             """,
             (source, json.dumps(payload), error_message[:2000]),
         )
-        return cur.fetchone()[0]
+        dlq_id = cur.fetchone()[0]
+    from lineage import log_dlq_event
+
+    log_dlq_event(
+        conn,
+        dlq_id=dlq_id,
+        source=source,
+        action_type="DLQ_OPEN",
+        payload=payload,
+        error_message=error_message,
+    )
+    return dlq_id
 
 
 def list_dlq(conn, status: Optional[str] = "OPEN", limit: int = 100) -> list[dict[str, Any]]:
@@ -77,7 +88,7 @@ def patch_dlq(conn, dlq_id: str, status: str, payload: dict[str, Any] | None = N
                 SET status = %s::integration_dlq_status, payload = %s::jsonb,
                     resolved_at = CASE WHEN %s IN ('RESOLVED', 'DISCARDED') THEN NOW() ELSE resolved_at END
                 WHERE id = %s::uuid
-                RETURNING id::text, status::text
+                RETURNING id::text, status::text, source::text, payload
                 """,
                 (status, json.dumps(payload), status, dlq_id),
             )
@@ -88,14 +99,14 @@ def patch_dlq(conn, dlq_id: str, status: str, payload: dict[str, Any] | None = N
                 SET status = %s::integration_dlq_status,
                     resolved_at = CASE WHEN %s IN ('RESOLVED', 'DISCARDED') THEN NOW() ELSE resolved_at END
                 WHERE id = %s::uuid
-                RETURNING id::text, status::text
+                RETURNING id::text, status::text, source::text, payload
                 """,
                 (status, status, dlq_id),
             )
         row = cur.fetchone()
         if not row:
             raise ValueError("DLQ item not found")
-    return {"id": row[0], "status": row[1]}
+    return {"id": row[0], "status": row[1], "source": row[2], "payload": row[3]}
 
 
 def mark_retrying(conn, dlq_id: str) -> dict[str, Any]:

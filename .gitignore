@@ -49,3 +49,6 @@ Thumbs.db
 
 # --- Cursor debug ---
 .cursor/debug-*.log
+
+# --- CIM export artifacts ---
+sync-service/exports/

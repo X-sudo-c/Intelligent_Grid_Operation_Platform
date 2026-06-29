@@ -19,14 +19,16 @@ Or start components manually:
 1. **Supabase** (Postgres + REST + Realtime):
    ```bash
    npx supabase start
-   npx supabase db reset   # applies migrations 00001–00016
+   npx supabase db reset   # applies migrations 00001–00017
    ```
 
 2. **Supporting services** (start containers individually):
    ```bash
-   docker start my-memgraph giop-martin giop-timescale
+   docker start my-memgraph giop-martin giop-timescale giop-redis
    .venv/bin/python memgraph/bootstrap.py   # reconcile Memgraph from Postgres (removes orphans)
    ```
+
+   Redis is optional but recommended for sync-service caching (`REDIS_URL` in `.env`). If Redis is down, the sync gateway continues without cache.
 
    After `npx supabase db reset`, always re-run bootstrap so topology matches Postgres.
 
@@ -219,7 +221,7 @@ Energy accounting requires TimescaleDB with `timescaledb/timescale.sql` applied 
 | 8 | Schematic SVG + energy accounting balance | Implemented |
 | 10 | Portal lineage, DLQ, schematic, insights, APM widget | Implemented |
 | 6 | Spot-bill sync, telemetry ingest | Implemented |
-| 7 | Map + topology + ops cross-panel selection | Implemented |
+| 7 | Map SLD voltage layers + enriched Martin tile views (`00017`) | Phase 1–2 done — see `docs/map_implementation_checklist.md` |
 | 7 | Viewport chunk topology (split view) | Implemented |
 | 7 | SLD voltage colors, ops name/voltage edit | Implemented |
 | 8 | Mobile offline captures + spot-bill queue | Implemented |

@@ -39,6 +39,7 @@ class CaptureService {
         substationName: substationName,
         boundaryFeederId: boundaryFeederId,
         offlineSessionStartedAt: DateTime.now().toUtc().toIso8601String(),
+        operatorId: api.operatorId,
       );
       if (result.conflict) {
         return CaptureResult(
@@ -72,6 +73,7 @@ class CaptureService {
           offlineSessionStartedAt:
               row['offline_session_started_at'] as String? ??
               DateTime.now().toUtc().toIso8601String(),
+          operatorId: api.operatorId,
         );
         if (result.conflict) {
           await OfflineDb.markCaptureConflicted(row['id'] as int);

@@ -1,21 +1,30 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   createOutage,
+  getTopologyImpact,
   listOutages,
+  patchOutage,
   restoreOutage,
   type GiopOutage,
+  type GiopTopologyPayload,
 } from '../api/giop-api';
+import { useGiopMapOverlay } from '../context/GiopMapOverlayContext';
 
 interface GiopOutagesTabProps {
   isLightMode: boolean;
 }
 
 export function GiopOutagesTab({ isLightMode }: GiopOutagesTabProps) {
+  const { focusOnMap } = useGiopMapOverlay();
   const [outages, setOutages] = useState<GiopOutage[]>([]);
   const [loading, setLoading] = useState(true);
   const [summary, setSummary] = useState('');
   const [affectedArea, setAffectedArea] = useState('');
+  const [assetMrid, setAssetMrid] = useState('');
   const [status, setStatus] = useState('');
+  const [impact, setImpact] = useState<GiopTopologyPayload | null>(null);
+  const [impactLoading, setImpactLoading] = useState(false);
+  const [mapBusy, setMapBusy] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -32,7 +41,23 @@ export function GiopOutagesTab({ isLightMode }: GiopOutagesTabProps) {
     void load();
   }, [load]);
 
+  const showFaultOnMap = async (mrid: string, impactPayload?: GiopTopologyPayload | null) => {
+    setMapBusy(true);
+    setStatus('');
+    try {
+      await focusOnMap(mrid, { impact: impactPayload ?? null });
+      setStatus('Opened on map');
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : 'Could not focus map');
+    } finally {
+      setMapBusy(false);
+    }
+  };
+
   const card = isLightMode ? 'border-slate-200 bg-white' : 'border-slate-700 bg-slate-900/40';
+  const btnSecondary = `text-xs px-2 py-1 rounded text-white disabled:opacity-50 ${
+    isLightMode ? 'bg-slate-600 hover:bg-slate-500' : 'bg-slate-700 hover:bg-slate-600'
+  }`;
 
   return (
     <div className="h-full overflow-auto p-6">
@@ -52,6 +77,51 @@ export function GiopOutagesTab({ isLightMode }: GiopOutagesTabProps) {
           placeholder="Affected area"
           className="w-full text-sm rounded border px-2 py-1 mb-2 bg-transparent"
         />
+        <input
+          value={assetMrid}
+          onChange={(e) => setAssetMrid(e.target.value)}
+          placeholder="Fault asset mrid (connectivity node UUID)"
+          className="w-full text-sm rounded border px-2 py-1 mb-2 bg-transparent font-mono text-xs"
+        />
+        <div className="flex flex-wrap gap-2 mb-2">
+          <button
+            type="button"
+            className="text-xs px-3 py-1.5 bg-slate-700 rounded text-white disabled:opacity-50"
+            disabled={impactLoading || !assetMrid.trim()}
+            onClick={async () => {
+              setImpactLoading(true);
+              setStatus('');
+              try {
+                const data = await getTopologyImpact(assetMrid.trim());
+                setImpact(data);
+                setStatus(
+                  `Downstream estimate: ${data.metrics?.downstream_nodes ?? data.nodes.length} nodes · ${data.metrics?.edge_count ?? data.edges.length} lines`,
+                );
+              } catch (err) {
+                setImpact(null);
+                setStatus(err instanceof Error ? err.message : 'Impact estimate failed');
+              } finally {
+                setImpactLoading(false);
+              }
+            }}
+          >
+            {impactLoading ? 'Estimating…' : 'Estimate downstream impact'}
+          </button>
+          <button
+            type="button"
+            className={btnSecondary}
+            disabled={mapBusy || !assetMrid.trim()}
+            onClick={() => void showFaultOnMap(assetMrid.trim(), impact)}
+          >
+            {mapBusy ? 'Opening…' : impact ? 'Show impact on map' : 'Show on map'}
+          </button>
+        </div>
+        {impact && (
+          <p className="text-xs text-slate-500 mb-2">
+            Seed {impact.start_mrid ?? assetMrid} · total {impact.metrics?.total_nodes ?? impact.nodes.length} nodes
+            {impact.metrics?.truncated ? ' (truncated)' : ''}
+          </p>
+        )}
         <button
           type="button"
           className="text-xs px-3 py-1.5 bg-amber-700 rounded text-white"
@@ -93,23 +163,39 @@ export function GiopOutagesTab({ isLightMode }: GiopOutagesTabProps) {
               {o.affected_area ?? '—'} · {o.customers_affected} customers
               {o.is_published ? ' · published' : ''}
             </p>
-            {o.status !== 'RESTORED' && o.status !== 'CANCELLED' && (
+            <div className="flex flex-wrap gap-2 mt-2">
               <button
                 type="button"
-                className="text-xs px-2 py-1 mt-2 bg-green-800 rounded text-white"
+                className={btnSecondary}
                 onClick={async () => {
                   try {
-                    await restoreOutage(o.id);
-                    setStatus(`Outage ${o.reference} restored`);
+                    await patchOutage(o.id, { is_published: !o.is_published });
                     await load();
                   } catch (err) {
-                    setStatus(err instanceof Error ? err.message : 'Restore failed');
+                    setStatus(err instanceof Error ? err.message : 'Update failed');
                   }
                 }}
               >
-                Mark restored
+                {o.is_published ? 'Unpublish' : 'Publish'}
               </button>
-            )}
+              {o.status !== 'RESTORED' && o.status !== 'CANCELLED' && (
+                <button
+                  type="button"
+                  className="text-xs px-2 py-1 bg-green-800 rounded text-white"
+                  onClick={async () => {
+                    try {
+                      await restoreOutage(o.id);
+                      setStatus(`Outage ${o.reference} restored`);
+                      await load();
+                    } catch (err) {
+                      setStatus(err instanceof Error ? err.message : 'Restore failed');
+                    }
+                  }}
+                >
+                  Mark restored
+                </button>
+              )}
+            </div>
           </div>
         ))}
       </div>

@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
 
@@ -13,12 +15,13 @@ class OfflineDb {
     final dbPath = await getDatabasesPath();
     _db = await openDatabase(
       join(dbPath, 'giop_field.db'),
-      version: 5,
+      version: 8,
         onCreate: (db, version) async {
         await _createV1Tables(db);
         await _createCacheTable(db);
         await _createV3Tables(db);
         await _createV5Tables(db);
+        await _createV6Tables(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -32,6 +35,15 @@ class OfflineDb {
         }
         if (oldVersion < 5) {
           await _createV5Tables(db);
+        }
+        if (oldVersion < 6) {
+          await _createV6Tables(db);
+        }
+        if (oldVersion < 7) {
+          await _createV7Columns(db);
+        }
+        if (oldVersion < 8) {
+          await _createV8Columns(db);
         }
       },
     );
@@ -84,6 +96,8 @@ class OfflineDb {
         boundary_feeder_id TEXT,
         operating_utility TEXT,
         substation_name TEXT,
+        asset_kind TEXT,
+        wire_degree INTEGER NOT NULL DEFAULT 0,
         cached_at TEXT NOT NULL DEFAULT (datetime('now'))
       )
     ''');
@@ -158,6 +172,39 @@ class OfflineDb {
     ''');
     await db.execute(
       'CREATE INDEX IF NOT EXISTS idx_wo_status_dirty ON work_order_status_updates (is_dirty)',
+    );
+  }
+
+  static Future<void> _createV7Columns(Database db) async {
+    try {
+      await db.execute(
+        "ALTER TABLE cached_map_nodes ADD COLUMN asset_kind TEXT",
+      );
+    } catch (_) {
+      // column may already exist
+    }
+  }
+
+  static Future<void> _createV8Columns(Database db) async {
+    try {
+      await db.execute(
+        'ALTER TABLE cached_map_nodes ADD COLUMN wire_degree INTEGER NOT NULL DEFAULT 0',
+      );
+    } catch (_) {
+      // column may already exist
+    }
+  }
+
+  static Future<void> _createV6Tables(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS cached_node_topology (
+        node_mrid TEXT PRIMARY KEY,
+        topology_json TEXT NOT NULL,
+        cached_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_cached_node_topology_at ON cached_node_topology (cached_at DESC)',
     );
   }
 
@@ -344,6 +391,75 @@ class OfflineDb {
     final db = await instance();
     final rows = await db.query('cached_map_nodes', orderBy: 'name ASC');
     return rows.map(AssetNode.fromCacheRow).toList();
+  }
+
+  static Future<void> cacheNodeTopologyBatch(
+    Map<String, dynamic> connectionsByMrid, {
+    bool replaceAll = false,
+  }) async {
+    if (connectionsByMrid.isEmpty) return;
+    final db = await instance();
+    final batch = db.batch();
+    if (replaceAll) {
+      batch.delete('cached_node_topology');
+    }
+    for (final entry in connectionsByMrid.entries) {
+      final topo = entry.value;
+      if (topo is! Map) continue;
+      batch.insert(
+        'cached_node_topology',
+        {
+          'node_mrid': entry.key,
+          'topology_json': jsonEncode(topo),
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    }
+    await batch.commit(noResult: true);
+  }
+
+  static Future<void> upsertNodeTopology(
+    String mrid,
+    Map<String, dynamic> topology,
+  ) async {
+    final db = await instance();
+    await db.insert(
+      'cached_node_topology',
+      {
+        'node_mrid': mrid,
+        'topology_json': jsonEncode(topology),
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  static Future<Map<String, dynamic>?> getCachedNodeTopology(String mrid) async {
+    final db = await instance();
+    final rows = await db.query(
+      'cached_node_topology',
+      where: 'node_mrid = ?',
+      whereArgs: [mrid],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    final raw = rows.first['topology_json'];
+    if (raw is! String) return null;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) return decoded;
+      if (decoded is Map) return Map<String, dynamic>.from(decoded);
+    } catch (_) {
+      return null;
+    }
+    return null;
+  }
+
+  static Future<int> cachedTopologyCount() async {
+    final db = await instance();
+    return Sqflite.firstIntValue(
+          await db.rawQuery('SELECT COUNT(*) FROM cached_node_topology'),
+        ) ??
+        0;
   }
 
   static double estimateTariffGhs(double consumption) {

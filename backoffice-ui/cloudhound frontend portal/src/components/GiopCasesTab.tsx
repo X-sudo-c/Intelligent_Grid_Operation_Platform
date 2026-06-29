@@ -6,6 +6,7 @@ import {
   listCases,
   type GiopContactCase,
 } from '../api/giop-api';
+import { useGiopMapOverlay } from '../context/GiopMapOverlayContext';
 
 interface GiopCasesTabProps {
   isLightMode: boolean;
@@ -14,12 +15,34 @@ interface GiopCasesTabProps {
 const CHANNELS = ['PHONE', 'WEB', 'WALK_IN', 'EMAIL', 'SMS', 'MOBILE_APP'];
 
 export function GiopCasesTab({ isLightMode }: GiopCasesTabProps) {
+  const { focusOnMap } = useGiopMapOverlay();
   const [cases, setCases] = useState<GiopContactCase[]>([]);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState('');
   const [channel, setChannel] = useState('PHONE');
   const [summary, setSummary] = useState('');
   const [classification, setClassification] = useState('GENERAL');
+  const [mapBusyId, setMapBusyId] = useState<string | null>(null);
+
+  const showOnMap = useCallback(
+    async (c: GiopContactCase) => {
+      const mrid = c.asset_mrid ?? c.meter_mrid;
+      if (!mrid) {
+        setStatus(`Case ${c.reference} has no linked asset to locate`);
+        return;
+      }
+      setMapBusyId(c.id);
+      try {
+        await focusOnMap(mrid, { name: c.summary, coordinates: null });
+        setStatus(`Opened ${c.reference} on map`);
+      } catch (err) {
+        setStatus(err instanceof Error ? err.message : 'Could not focus map');
+      } finally {
+        setMapBusyId(null);
+      }
+    },
+    [focusOnMap],
+  );
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -131,6 +154,16 @@ export function GiopCasesTab({ isLightMode }: GiopCasesTabProps) {
               >
                 → Work order
               </button>
+              {(c.asset_mrid || c.meter_mrid) && (
+                <button
+                  type="button"
+                  disabled={mapBusyId === c.id}
+                  className="text-xs px-2 py-1 bg-slate-700 rounded text-white disabled:opacity-40"
+                  onClick={() => void showOnMap(c)}
+                >
+                  {mapBusyId === c.id ? 'Opening…' : 'Show on map'}
+                </button>
+              )}
             </div>
           </div>
         ))}

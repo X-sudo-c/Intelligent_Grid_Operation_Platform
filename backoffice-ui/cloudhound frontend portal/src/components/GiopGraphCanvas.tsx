@@ -737,6 +737,10 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
 
   const focusId = hoverId || activeId || searchMatches[0]?.id || null;
   const selectedNode = useMemo(() => (focusId ? renderGraph.nodes.find((node) => node.id === focusId) || null : null), [focusId, renderGraph.nodes]);
+  const hoverNode = useMemo(
+    () => (hoverId ? renderGraph.nodes.find((node) => node.id === hoverId) || null : null),
+    [hoverId, renderGraph.nodes],
+  );
   const relatedNodes = useMemo(() => {
     if (!focusId) return [] as NodeRecord[];
     const ids = adjacency.neighbors.get(focusId) || new Set<string>();
@@ -1274,11 +1278,19 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         const isAiQueryNode = isAiQueryGraph && aiQueryNodeIds.has(node.id);
         const currentAiAssist = aiAssistRef.current;
         const isAiAssistNode = currentAiAssist?.isOpen && currentAiAssist.nodeId === node.id;
+        const nodeValidation =
+          typeof node.properties?.validation === 'string' ? node.properties.validation : undefined;
+        const isStagingNode =
+          nodeValidation === 'PENDING_FIELD' || nodeValidation === 'STAGED';
+        const stagingPulseColor = nodeValidation === 'STAGED' ? '#3b82f6' : '#f59e0b';
         const dimmed = !!activeRef.current && !focused && !hovered && !inFocusNeighborhood && !isPathNode;
-        const pulseStrength = isAiAssistNode ? (Math.sin(animationTimeRef.current * 4.6) + 1) * 0.5 : 0;
-        const pulseScale = isAiAssistNode ? 1 + pulseStrength * 0.018 : 1;
-        const ripplePhase = isAiAssistNode ? (animationTimeRef.current * 0.72) % 1 : 0;
-        const ripplePhaseSecondary = isAiAssistNode ? (ripplePhase + 0.5) % 1 : 0;
+        const shouldPulse = isAiAssistNode || isStagingNode;
+        const pulseStrength = shouldPulse ? (Math.sin(animationTimeRef.current * 4.6) + 1) * 0.5 : 0;
+        const pulseScale = shouldPulse
+          ? 1 + pulseStrength * (isStagingNode && !isAiAssistNode ? 0.012 : 0.018)
+          : 1;
+        const ripplePhase = shouldPulse ? (animationTimeRef.current * 0.72) % 1 : 0;
+        const ripplePhaseSecondary = shouldPulse ? (ripplePhase + 0.5) % 1 : 0;
         const heatColor = heatMapEnabledRef.current ? node.riskColor : null;
         const nodeDisplayColor = isAiAssistNode ? node.color : focused ? '#f8fafc' : searchHit ? '#f4d06f' : heatColor ?? node.color;
         const radius = Math.max(4, node.size * nodeSizeMultRef.current * (focused ? 1.5 : hovered ? 1.25 : isPathNode ? 1.3 : 1) * pulseScale);
@@ -1286,9 +1298,11 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         const label = labelVisible ? node.fullLabel : node.label;
         ctx2d.save();
         ctx2d.globalAlpha = dimmed ? 0.35 : 1;
-        if (focused || hovered || heatColor || node.isHvt || node.trustExternal || node.dangerousPolicy || isPathNode || isAiAssistNode || isAiQueryNode) {
+        if (focused || hovered || heatColor || node.isHvt || node.trustExternal || node.dangerousPolicy || isPathNode || isAiAssistNode || isAiQueryNode || isStagingNode) {
           ctx2d.shadowColor = isAiAssistNode
             ? node.color
+            : isStagingNode
+            ? stagingPulseColor
             : isPathNode
             ? 'rgba(255,215,0,0.4)'
             : isAiQueryNode
@@ -1304,7 +1318,19 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                 : focused
                   ? 'rgba(248,250,252,0.35)'
                   : 'rgba(159,174,255,0.25)';
-                  ctx2d.shadowBlur = isAiAssistNode ? 9 + pulseStrength * 4 : isAiQueryNode ? 10 : heatColor ? 16 : node.dangerousPolicy ? 16 : node.isHvt || node.trustExternal ? 12 : 14;
+          ctx2d.shadowBlur = isAiAssistNode
+            ? 9 + pulseStrength * 4
+            : isStagingNode
+            ? 8 + pulseStrength * 5
+            : isAiQueryNode
+            ? 10
+            : heatColor
+            ? 16
+            : node.dangerousPolicy
+            ? 16
+            : node.isHvt || node.trustExternal
+            ? 12
+            : 14;
         }
         ctx2d.fillStyle = nodeDisplayColor;
         ctx2d.beginPath(); ctx2d.arc(p.x, p.y, radius, 0, Math.PI * 2); ctx2d.fill();
@@ -1324,6 +1350,22 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
 
           drawRipple(ripplePhase, 1.2);
           drawRipple(ripplePhaseSecondary, 0.9);
+        }
+
+        if (isStagingNode && !isAiAssistNode) {
+          const drawStagingRipple = (phase: number, baseWidth: number) => {
+            ctx2d.save();
+            ctx2d.globalAlpha = Math.max(0, 0.22 * (1 - phase));
+            ctx2d.strokeStyle = stagingPulseColor;
+            ctx2d.lineWidth = baseWidth + (1 - phase) * 0.4;
+            ctx2d.beginPath();
+            ctx2d.arc(p.x, p.y, radius + 2.5 + phase * 9, 0, Math.PI * 2);
+            ctx2d.stroke();
+            ctx2d.restore();
+          };
+
+          drawStagingRipple(ripplePhase, 1.15);
+          drawStagingRipple(ripplePhaseSecondary, 0.9);
         }
 
         if (heatColor) {
@@ -1678,8 +1720,12 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         simNodes.forEach((node) => {
           const currentAiAssist = aiAssistRef.current;
           const isAiAssistNode = currentAiAssist?.isOpen && currentAiAssist.nodeId === node.id;
+          const nodeValidation =
+            typeof node.properties?.validation === 'string' ? node.properties.validation : undefined;
+          const isStagingNode =
+            nodeValidation === 'PENDING_FIELD' || nodeValidation === 'STAGED';
           const isFocusedNode = activeRef.current === node.id;
-          const driftMultiplier = isAiAssistNode ? 0.22 : isFocusedNode ? 0.55 : 1;
+          const driftMultiplier = isAiAssistNode ? 0.22 : isStagingNode ? 0.45 : isFocusedNode ? 0.55 : 1;
           const sway = node.driftRadius * (0.08 + alpha * 0.18) * dt * driftMultiplier;
           node.vx = (node.vx || 0) + Math.cos(time * node.driftSpeed + node.drift) * sway;
           node.vy = (node.vy || 0) + Math.sin(time * node.driftSpeed * 0.87 + node.drift * 1.1) * sway;
@@ -2906,7 +2952,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
               </div>
               <div><p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">Focus controls</p><div className="mt-3 space-y-3 rounded-lg border border-slate-800 bg-slate-900/70 p-3"><div><div className="mb-1 flex items-center justify-between text-xs text-slate-400"><span>Depth</span><span>{depth} hops</span></div><input type="range" min={1} max={4} value={depth} onChange={(e) => setDepth(Number(e.target.value))} className="w-full accent-sky-400" /></div><div className="flex items-center justify-between text-xs text-slate-400"><span>Focused node</span><span className="truncate pl-2 text-slate-200">{focusId ? (selectedNode?.label || selectedNode?.fullLabel || focusId) : 'None'}</span></div></div></div>
               <div><p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">Legend</p><div className="mt-3 space-y-1 text-sm text-slate-300"><p className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">Node types</p><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#9ec5ff]" /><span>User</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#c9a9ff]" /><span>Role</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#7fd6c9]" /><span>Policy</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#ffd08a]" /><span>Group</span></div><p className="text-[10px] uppercase tracking-widest text-slate-500 mt-2 mb-1">Security signals</p><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-4 h-4 rounded-full border-2 border-[#f4d06f]" /><span>High-value target</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-4 h-4 rounded-full border-2 border-[#ff915a]" /><span>External trust role</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-4 h-4 rounded-full border-2 border-[#ef4444] bg-[#ef4444]/20" /><span>Dangerous policy</span></div><p className="text-[10px] uppercase tracking-widest text-slate-500 mt-2 mb-1">Edge relationships</p><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#ef4444'}} /><span>Privilege escalation path</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#7fd6c9'}} /><span>Attached / Has Policy</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#ff915a'}} /><span>Assumes / Trusts Role</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#ffd08a'}} /><span>Member of Group</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#a881ff'}} /><span>Granted / Grants</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#9aa4b3'}} /><span>Other</span></div></div></div>
-              <div><p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">Selection</p><div className="mt-3 rounded-lg border border-slate-800 bg-slate-900/70 p-3 text-xs text-slate-300">{hoverId ? `Hovering ${hoverId}` : 'Hover nodes to preview, click to lock focus.'}</div></div>
+              <div><p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">Selection</p><div className="mt-3 rounded-lg border border-slate-800 bg-slate-900/70 p-3 text-xs text-slate-300">{hoverNode ? <div className="space-y-1"><p className="font-semibold text-slate-100">{hoverNode.fullLabel || hoverNode.label}</p><p className="text-[10px] uppercase tracking-wide text-slate-500">{hoverNode.nodeType}</p><p className="font-mono text-[10px] text-slate-400">{hoverNode.id}</p>{hoverNode.properties?.validation ? <p className="text-slate-400">Status: {String(hoverNode.properties.validation)}</p> : null}</div> : 'Hover nodes to preview, click to lock focus.'}</div></div>
                 </div>
               </div>
             </div>

@@ -29,7 +29,7 @@ Backend services running locally:
 
 ```bash
 npx supabase start                    # :54321 REST, :54322 Postgres
-docker start my-memgraph giop-martin giop-timescale
+docker start my-memgraph giop-martin giop-timescale giop-redis
 cd sync-service && uvicorn main:app --host 0.0.0.0 --port 5000 --reload
 cd ocr-service && uvicorn main:app --host 0.0.0.0 --port 5002 --reload
 ```
@@ -41,6 +41,36 @@ npx supabase db reset
 ```
 
 After changing `supabase/config.toml` schemas, restart Supabase so PostgREST exposes the `staging` schema.
+
+## Android emulator (dev)
+
+Two AVDs under `~/Android/Sdk` (API 34). Prefer **`giop_light`** — it uses less RAM and is less likely to show “System UI isn’t responding” on Kali/Linux without KVM.
+
+| AVD | Device | Notes |
+|-----|--------|--------|
+| `giop_light` | medium phone | **Default** — use this first |
+| `giop_pixel` | Pixel 6 | Heavier; use only if you need Pixel profile |
+
+```bash
+# Terminal 1 — wait until "Emulator ready" before flutter run
+./scripts/start-android-emulator.sh          # giop_light
+# ./scripts/start-android-emulator.sh giop_pixel
+
+# Terminal 2
+cd mobile && flutter run
+```
+
+In the app: **Settings → Android emulator preset → Save**. GPS is preset to Accra.
+
+If the emulator freezes or ANRs: close it and rerun the script. Last resort:
+
+```bash
+$HOME/Android/Sdk/emulator/emulator -avd giop_light -wipe-data -gpu swiftshader_indirect
+```
+
+```bash
+flutter emulators              # should list giop_light and giop_pixel
+```
 
 ## Run the app
 

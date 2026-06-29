@@ -5,6 +5,7 @@ import type { GiopPortalTab } from '../lib/giopPortalRouting';
 export interface PortalNavItem {
   id: GiopPortalTab;
   label: string;
+  badge?: number;
 }
 
 export interface PortalNavGroup {
@@ -80,7 +81,19 @@ export function PortalShell({
                     onClick={() => onTabChange(item.id)}
                     className={navButtonClass(activeTab === item.id)}
                   >
-                    {item.label}
+                    <span className="flex items-center justify-between gap-2 w-full">
+                      <span>{item.label}</span>
+                      {item.badge != null && item.badge > 0 && (
+                        <span
+                          className={`min-w-[1.25rem] px-1.5 py-0.5 text-[10px] font-semibold rounded-full text-center leading-none ${
+                            isLightMode ? 'bg-amber-600 text-white' : 'bg-amber-500 text-slate-950'
+                          }`}
+                          aria-label={`${item.badge} items need attention`}
+                        >
+                          {item.badge > 99 ? '99+' : item.badge}
+                        </span>
+                      )}
+                    </span>
                   </button>
                 ))}
               </div>

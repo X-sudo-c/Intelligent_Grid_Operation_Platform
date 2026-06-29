@@ -1,11 +1,47 @@
-"""Data lineage read helpers (FR-003)."""
+"""Data lineage read/write helpers (FR-003)."""
 
 from __future__ import annotations
 
 import json
 from typing import Any, Optional
 
-import psycopg2
+LINEAGE_TARGET_KEYS = (
+    "mrid",
+    "asset_mrid",
+    "meter_mrid",
+    "target_mrid",
+    "account_mrid",
+    "target_uuid",
+)
+
+
+def target_mrid_from_payload(payload: dict[str, Any] | None) -> str | None:
+    if not payload:
+        return None
+    for key in LINEAGE_TARGET_KEYS:
+        val = payload.get(key)
+        if isinstance(val, str) and len(val) >= 36:
+            return val
+    return None
+
+
+def set_lineage_context(
+    conn,
+    *,
+    source_type: str | None = None,
+    operator_id: str | None = None,
+    provenance_ref: str | None = None,
+    skip: bool = False,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT public.giop_set_lineage_context(
+              %s::lineage_source_type, %s, %s, %s
+            )
+            """,
+            (source_type, operator_id, provenance_ref, skip),
+        )
 
 
 def log_lineage(
@@ -69,6 +105,85 @@ def fetch_lineage(conn, asset_mrid: str, limit: int = 50) -> list[dict[str, Any]
     ]
 
 
+def search_lineage(
+    conn,
+    *,
+    asset_mrid: str | None = None,
+    source_type: str | None = None,
+    action_type: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    filters: list[str] = []
+    params: list[Any] = []
+    if asset_mrid:
+        filters.append("target_mrid = %s::uuid")
+        params.append(asset_mrid)
+    if source_type:
+        filters.append("source_type = %s::lineage_source_type")
+        params.append(source_type)
+    if action_type:
+        filters.append("action_type ILIKE %s")
+        params.append(f"%{action_type}%")
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    params.extend([limit, offset])
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT id, target_mrid::text, source_type::text, action_type,
+                   operator_id, provenance_ref, before_state, after_state, created_at
+            FROM public.data_lineage
+            {where}
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "id": row[0],
+            "target_mrid": row[1],
+            "source_type": row[2],
+            "action_type": row[3],
+            "operator_id": row[4],
+            "provenance_ref": row[5],
+            "before_state": row[6],
+            "after_state": row[7],
+            "created_at": row[8].isoformat() if row[8] else None,
+        }
+        for row in rows
+    ]
+
+
+def log_dlq_event(
+    conn,
+    *,
+    dlq_id: str,
+    source: str,
+    action_type: str,
+    payload: dict[str, Any] | None,
+    error_message: str | None = None,
+    operator_id: str | None = None,
+) -> int | None:
+    target = target_mrid_from_payload(payload)
+    if not target:
+        return None
+    return log_lineage(
+        conn,
+        target_mrid=target,
+        source_type="DLQ_RETRY" if action_type.startswith("DLQ_") else "SYSTEM",
+        action_type=action_type,
+        operator_id=operator_id,
+        provenance_ref=f"integration_dlq:{dlq_id}",
+        after_state={
+            "dlq_source": source,
+            "payload": payload,
+            "error_message": error_message,
+        },
+    )
+
+
 def fetch_asset_updated_at(conn, mrid: str, tier: str) -> Optional[Any]:
     table = "staging.identified_objects" if tier == "staging" else "public.identified_objects"
     with conn.cursor() as cur:
@@ -96,6 +211,20 @@ def insert_conflict_proposal(
             (asset_mrid, offline_session_started_at, server_updated_at, json.dumps(proposed_payload)),
         )
         conflict_id = cur.fetchone()[0]
+        log_lineage(
+            conn,
+            target_mrid=asset_mrid,
+            source_type="FIELD_SYNC",
+            action_type="CONFLICT_DETECTED",
+            provenance_ref=conflict_id,
+            after_state={
+                "offline_session_started_at": offline_session_started_at,
+                "server_updated_at": server_updated_at.isoformat()
+                if hasattr(server_updated_at, "isoformat")
+                else server_updated_at,
+                "proposed_payload": proposed_payload,
+            },
+        )
         cur.execute(
             """
             UPDATE staging.identified_objects
@@ -187,6 +316,14 @@ def resolve_conflict(
                     """,
                     (asset_mrid,),
                 )
+            log_lineage(
+                conn,
+                target_mrid=asset_mrid,
+                source_type="FIELD_SYNC",
+                action_type="CONFLICT_RESOLVED_MASTER",
+                provenance_ref=conflict_id,
+                after_state={"resolution": "master"},
+            )
         elif resolution == "field":
             new_status = "RESOLVED_FIELD"
             payload = proposed or {}
@@ -234,6 +371,14 @@ def resolve_conflict(
             cur.execute(
                 "UPDATE staging.identified_objects SET validation = 'STAGED', updated_at = NOW() WHERE mrid = %s::uuid",
                 (asset_mrid,),
+            )
+            log_lineage(
+                conn,
+                target_mrid=asset_mrid,
+                source_type="FIELD_SYNC",
+                action_type="CONFLICT_DISCARDED",
+                provenance_ref=conflict_id,
+                after_state={"resolution": "discard"},
             )
         else:
             raise ValueError("resolution must be master, field, or discard")

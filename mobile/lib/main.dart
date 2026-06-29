@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'config/api_config.dart';
@@ -5,12 +7,28 @@ import 'screens/map_screen.dart';
 import 'screens/meter_screen.dart';
 import 'screens/settings_screen.dart';
 import 'screens/work_orders_screen.dart';
+import 'services/field_map_refresh_bus.dart';
 import 'services/giop_api.dart';
+import 'services/rejection_notification_service.dart';
 import 'services/settings_service.dart';
 
 void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(const GiopFieldApp());
+  runZonedGuarded(
+    () {
+      WidgetsFlutterBinding.ensureInitialized();
+      FlutterError.onError = (details) {
+        FlutterError.presentError(details);
+      };
+      runApp(const GiopFieldApp());
+    },
+    (error, stack) {
+      final label = error.toString();
+      if (label == 'Cancelled' || label.contains('CancellationException')) {
+        return;
+      }
+      debugPrint('Uncaught error: $error\n$stack');
+    },
+  );
 }
 
 class GiopFieldApp extends StatefulWidget {
@@ -91,15 +109,75 @@ class HomeShell extends StatefulWidget {
   State<HomeShell> createState() => _HomeShellState();
 }
 
-class _HomeShellState extends State<HomeShell> {
+class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   int _index = 0;
   int _mapRefreshTrigger = 0;
+  int _rejectionBadge = 0;
+  RejectionNotificationService? _rejectionNotifications;
+  final _scaffoldKey = GlobalKey<ScaffoldMessengerState>();
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _rejectionNotifications = RejectionNotificationService(widget.api)
+      ..onRejection = _onAssetRejected
+      ..start();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _rejectionNotifications?.stop();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _rejectionNotifications?.poll();
+      if (_index == 0) {
+        _mapRefreshTrigger++;
+      }
+    }
+  }
+
+  void _onAssetRejected(FieldNotification notification) {
+    if (!mounted) return;
+    setState(() => _rejectionBadge++);
+    final label = notification.name ?? notification.mrid ?? 'Asset';
+    if (notification.latitude != null && notification.longitude != null) {
+      FieldMapRefreshBus.instance.requestAt(
+        notification.latitude!,
+        notification.longitude!,
+        ringK: 1,
+      );
+    }
+    _scaffoldKey.currentState?.showSnackBar(
+      SnackBar(
+        content: Text('Rejected: $label'),
+        action: SnackBarAction(
+          label: 'Work',
+          onPressed: () => setState(() => _index = 1),
+        ),
+      ),
+    );
+  }
+
+  void _clearRejectionBadge() {
+    if (_rejectionBadge > 0) {
+      setState(() => _rejectionBadge = 0);
+    }
+  }
 
   void _onTabSelected(int i) {
     setState(() {
       _index = i;
       if (i == 0) {
         _mapRefreshTrigger++;
+      }
+      if (i == 1) {
+        _clearRejectionBadge();
       }
     });
   }
@@ -119,29 +197,36 @@ class _HomeShellState extends State<HomeShell> {
       ),
     ];
 
-    return Scaffold(
-      body: IndexedStack(index: _index, children: pages),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _index,
-        onDestinationSelected: _onTabSelected,
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.map),
-            label: 'Map',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.assignment),
-            label: 'Work',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.speed),
-            label: 'Meter',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.settings),
-            label: 'Settings',
-          ),
-        ],
+    return ScaffoldMessenger(
+      key: _scaffoldKey,
+      child: Scaffold(
+        body: IndexedStack(index: _index, children: pages),
+        bottomNavigationBar: NavigationBar(
+          selectedIndex: _index,
+          onDestinationSelected: _onTabSelected,
+          destinations: [
+            const NavigationDestination(
+              icon: Icon(Icons.map),
+              label: 'Map',
+            ),
+            NavigationDestination(
+              icon: Badge(
+                isLabelVisible: _rejectionBadge > 0,
+                label: Text('$_rejectionBadge'),
+                child: const Icon(Icons.assignment),
+              ),
+              label: 'Work',
+            ),
+            const NavigationDestination(
+              icon: Icon(Icons.speed),
+              label: 'Meter',
+            ),
+            const NavigationDestination(
+              icon: Icon(Icons.settings),
+              label: 'Settings',
+            ),
+          ],
+        ),
       ),
     );
   }
