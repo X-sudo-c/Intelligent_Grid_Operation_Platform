@@ -72,6 +72,9 @@ export interface GiopStagingAsset {
   name?: string;
   validation?: string;
   nominal_voltage?: string;
+  asset_kind?: string;
+  work_order_id?: string | null;
+  photo_url?: string | null;
   submitted_by?: string | null;
   geom?: { type: string; coordinates: [number, number] } | null;
 }
@@ -1326,6 +1329,218 @@ export async function createFormatExport(
   });
 }
 
+// --- GIS reference layers & boundary import ---------------------------------
+
+export interface GiopReferenceLayer {
+  slug: string;
+  display_name: string;
+  description?: string | null;
+  kind: 'boundary' | 'network' | 'overlay' | string;
+  target_schema: string;
+  target_table: string;
+  martin_source_id?: string | null;
+  gpkg_layer_name?: string | null;
+  geometry_type?: string | null;
+  min_zoom?: number | null;
+  max_zoom?: number | null;
+  sort_order: number;
+  active: boolean;
+  requires_post_import_refresh: boolean;
+  feature_count?: number | null;
+  last_imported_at?: string | null;
+  render_mode?: 'martin' | 'geojson_static' | 'geojson_bbox' | 'none' | string;
+  built_in_map_style?: boolean;
+  bbox?: { west: number; south: number; east: number; north: number } | null;
+  vertex_count?: number | null;
+  table_bytes?: number | null;
+  render_stats?: Record<string, unknown>;
+  parent_slug?: string | null;
+  dissolve_column?: string | null;
+  label_field?: string | null;
+  detail_min_zoom?: number | null;
+  is_overview_derived?: boolean;
+}
+
+export interface GiopInspectLayer {
+  name: string;
+  feature_count: number;
+  geometry_type?: string | null;
+  fields: { name: string; type?: string }[];
+  error?: string;
+}
+
+export interface GiopInspectResult {
+  inspect_id: string;
+  filename: string;
+  layer_count: number;
+  layers: GiopInspectLayer[];
+}
+
+export interface GiopBoundaryFieldSuggest {
+  dissolve_column: string | null;
+  label_field: string | null;
+}
+
+export interface GiopReferenceMapLayerConfig {
+  slug: string;
+  display_name: string;
+  kind: string;
+  render_mode: 'martin' | 'geojson_static' | 'geojson_bbox' | 'none';
+  built_in_map_style: boolean;
+  geometry_type?: string | null;
+  min_zoom?: number | null;
+  max_zoom?: number | null;
+  feature_count?: number;
+  bbox?: { west: number; south: number; east: number; north: number } | null;
+  parent_slug?: string | null;
+  is_overview_derived?: boolean;
+  detail_min_zoom?: number | null;
+  label_field?: string | null;
+  martin?: { source_id: string; tiles: string[] };
+  geojson?: { url_template: string; bbox_fetch: boolean };
+}
+
+export interface GiopGisImportJob {
+  id: string;
+  format?: string;
+  status: string;
+  layers?: string[] | null;
+  feature_count?: number | null;
+  error_message?: string | null;
+  created_at?: string | null;
+  completed_at?: string | null;
+}
+
+export async function listReferenceLayers(): Promise<GiopReferenceLayer[]> {
+  const data = await fetchJson<{ layers: GiopReferenceLayer[] }>(`${SYNC_BASE}/reference-layers`);
+  return data.layers ?? [];
+}
+
+/** True when an active catalog network layer has been imported and is renderable. */
+export function referenceNetworkReady(layers: GiopReferenceLayer[]): boolean {
+  return layers.some(
+    (layer) =>
+      layer.kind === 'network' &&
+      layer.active &&
+      layer.render_mode !== 'none' &&
+      (layer.feature_count ?? 0) > 0,
+  );
+}
+
+export async function getReferenceMapConfig(): Promise<GiopReferenceMapLayerConfig[]> {
+  const data = await fetchJson<{ layers: GiopReferenceMapLayerConfig[] }>(
+    `${SYNC_BASE}/reference-layers/map-config`,
+  );
+  return data.layers ?? [];
+}
+
+export async function getReferenceLayerGeojson(
+  slug: string,
+  bbox?: { west: number; south: number; east: number; north: number },
+): Promise<GeoJSON.FeatureCollection> {
+  const params = new URLSearchParams();
+  if (bbox) {
+    params.set('west', String(bbox.west));
+    params.set('south', String(bbox.south));
+    params.set('east', String(bbox.east));
+    params.set('north', String(bbox.north));
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  return fetchJson<GeoJSON.FeatureCollection>(
+    `${SYNC_BASE}/reference-layers/${encodeURIComponent(slug)}/geojson${suffix}`,
+  );
+}
+
+export async function listGisImports(limit = 50): Promise<GiopGisImportJob[]> {
+  const data = await fetchJson<{ jobs: GiopGisImportJob[] }>(`${SYNC_BASE}/imports?limit=${limit}`);
+  return data.jobs ?? [];
+}
+
+export async function importBoundaryGeopackage(
+  file: File,
+  layerSlug = 'ecg-admin-boundaries',
+): Promise<{ job: GiopGisImportJob }> {
+  const form = new FormData();
+  form.append('file', file);
+  const params = new URLSearchParams({ layer_slug: layerSlug });
+  const res = await fetch(`${SYNC_BASE}/imports/boundaries?${params.toString()}`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const detail = (err as { detail?: string }).detail || `Import HTTP ${res.status}`;
+    if (res.status === 404) {
+      throw new Error(
+        `${detail} — restart sync-service (./scripts/start_giop_stack.sh) to load GIS import routes`,
+      );
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<{ job: GiopGisImportJob }>;
+}
+
+export async function importBundledBoundaries(
+  filePath = '../supabase/Power System.gpkg',
+): Promise<{ job: GiopGisImportJob }> {
+  return fetchJson(`${SYNC_BASE}/imports/boundaries/bundled`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ file_path: filePath, layer_slugs: ['ecg-admin-boundaries'] }),
+  });
+}
+
+export async function inspectGisUpload(file: File): Promise<GiopInspectResult> {
+  const form = new FormData();
+  form.append('file', file);
+  const res = await fetch(`${SYNC_BASE}/imports/inspect`, { method: 'POST', body: form });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { detail?: string }).detail || `Inspect HTTP ${res.status}`);
+  }
+  return res.json() as Promise<GiopInspectResult>;
+}
+
+export async function getInspectPreview(
+  inspectId: string,
+  layer: string,
+): Promise<GeoJSON.FeatureCollection> {
+  const params = new URLSearchParams({ layer });
+  return fetchJson<GeoJSON.FeatureCollection>(
+    `${SYNC_BASE}/imports/inspect/${encodeURIComponent(inspectId)}/preview?${params.toString()}`,
+  );
+}
+
+export async function suggestInspectFields(
+  inspectId: string,
+  layer: string,
+): Promise<GiopBoundaryFieldSuggest> {
+  const params = new URLSearchParams({ layer });
+  return fetchJson<GiopBoundaryFieldSuggest>(
+    `${SYNC_BASE}/imports/inspect/${encodeURIComponent(inspectId)}/suggest?${params.toString()}`,
+  );
+}
+
+export interface ReferenceImportConfig {
+  inspect_id: string;
+  display_name: string;
+  source_layer: string;
+  dissolve_column?: string | null;
+  label_field?: string | null;
+  detail_min_zoom?: number;
+  catalog_slug?: string | null;
+}
+
+export async function commitReferenceImport(
+  config: ReferenceImportConfig,
+): Promise<{ job: GiopGisImportJob }> {
+  return fetchJson(`${SYNC_BASE}/imports/reference`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+}
+
 // --- FR-017 migration adapter (GeoPackage / DXF) ---------------------------
 export interface GiopMigrationRun {
   id: string;
@@ -1737,6 +1952,21 @@ export const MARTIN_URL = resolvePublicBaseUrl(
   import.meta.env.VITE_MARTIN_URL,
   'http://127.0.0.1:3001',
 );
+
+/** Whether legacy GIS network overview layers (conductors, transformers) are loaded. */
+export async function probeGisOverviewAvailable(
+  _martinUrl: string = MARTIN_URL,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${SYNC_BASE}/reference-layers`, { signal });
+    if (!res.ok) return false;
+    const data = (await res.json()) as { layers?: GiopReferenceLayer[] };
+    return referenceNetworkReady(data.layers ?? []);
+  } catch {
+    return false;
+  }
+}
 
 export const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'http://127.0.0.1:54321';
 export const SUPABASE_ANON_KEY =

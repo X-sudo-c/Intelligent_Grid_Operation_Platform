@@ -15,6 +15,7 @@ interface GiopMapLegendProps {
   mapRef: React.RefObject<MapLibreMap | null>;
   mapZoom: number;
   mapReady?: boolean;
+  includeGisOverview?: boolean;
 }
 
 function LegendSwatch({ entry }: { entry: GiopLegendGroup }) {
@@ -74,8 +75,12 @@ export function GiopMapLegend({
   mapRef,
   mapZoom,
   mapReady = true,
+  includeGisOverview = false,
 }: GiopMapLegendProps) {
-  const groups = useMemo(() => buildGiopLegendGroups(isLightMode), [isLightMode]);
+  const groups = useMemo(
+    () => buildGiopLegendGroups(isLightMode, { includeGisOverview }),
+    [isLightMode, includeGisOverview],
+  );
   const [visibility, setVisibility] = useState<GiopLegendVisibilityState>(() =>
     createDefaultGiopLegendVisibility(groups),
   );

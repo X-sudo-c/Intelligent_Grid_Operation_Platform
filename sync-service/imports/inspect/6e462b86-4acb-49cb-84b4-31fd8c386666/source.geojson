@@ -1,0 +1,21 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "district": "Accra Central", "region": "Greater Accra" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-0.2, 5.55], [-0.19, 5.55], [-0.19, 5.56], [-0.2, 5.56], [-0.2, 5.55]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "district": "Tema", "region": "Greater Accra" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-0.05, 5.65], [-0.04, 5.65], [-0.04, 5.66], [-0.05, 5.66], [-0.05, 5.65]]]
+      }
+    }
+  ]
+}

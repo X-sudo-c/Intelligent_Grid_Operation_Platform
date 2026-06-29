@@ -1,0 +1,10 @@
+{
+"type": "FeatureCollection",
+"name": "territory",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+"features": [
+{ "type": "Feature", "properties": { "Name": "Takoradi", "tessellate": -1, "extrude": 0, "visibility": -1, "district": "Takoradi", "region": "Western" }, "geometry": { "type": "Polygon", "coordinates": [ [ [ -1.78, 4.88 ], [ -1.76, 4.88 ], [ -1.76, 4.9 ], [ -1.78, 4.9 ], [ -1.78, 4.88 ] ] ] } },
+{ "type": "Feature", "properties": { "Name": "Sekondi", "tessellate": -1, "extrude": 0, "visibility": -1, "district": "Sekondi", "region": "Western" }, "geometry": { "type": "Polygon", "coordinates": [ [ [ -1.74, 4.92 ], [ -1.72, 4.92 ], [ -1.72, 4.94 ], [ -1.74, 4.94 ], [ -1.74, 4.92 ] ] ] } },
+{ "type": "Feature", "properties": { "Name": "Kumasi Central", "tessellate": -1, "extrude": 0, "visibility": -1, "district": "Kumasi Central", "region": "Ashanti" }, "geometry": { "type": "Polygon", "coordinates": [ [ [ -1.63, 6.68 ], [ -1.61, 6.68 ], [ -1.61, 6.7 ], [ -1.63, 6.7 ], [ -1.63, 6.68 ] ] ] } }
+]
+}

@@ -2,6 +2,8 @@ import 'dart:math' as math;
 
 import 'package:dio/dio.dart';
 
+import 'package:latlong2/latlong.dart';
+
 import '../config/api_config.dart';
 import 'offline_db.dart';
 
@@ -66,5 +68,35 @@ class TileCacheService {
         }
       }
     }
+  }
+
+  Future<void> prefetchForBounds(List<LatLng> points, {int zoom = 14}) async {
+    if (points.isEmpty) return;
+    var minLat = points.first.latitude;
+    var maxLat = points.first.latitude;
+    var minLon = points.first.longitude;
+    var maxLon = points.first.longitude;
+    for (final p in points) {
+      minLat = math.min(minLat, p.latitude);
+      maxLat = math.max(maxLat, p.latitude);
+      minLon = math.min(minLon, p.longitude);
+      maxLon = math.max(maxLon, p.longitude);
+    }
+    final center = LatLng((minLat + maxLat) / 2, (minLon + maxLon) / 2);
+    await prefetchViewport(
+      latitude: center.latitude,
+      longitude: center.longitude,
+      zoom: zoom.toDouble(),
+    );
+    await prefetchViewport(
+      latitude: minLat,
+      longitude: minLon,
+      zoom: zoom.toDouble(),
+    );
+    await prefetchViewport(
+      latitude: maxLat,
+      longitude: maxLon,
+      zoom: zoom.toDouble(),
+    );
   }
 }

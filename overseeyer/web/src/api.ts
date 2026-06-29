@@ -93,9 +93,17 @@ export interface VoiceTtsCheck {
   status: string;
   port?: number;
   url?: string;
+  phase?: string;
+  installed?: boolean;
+  pid?: number | null;
+  port_open?: boolean;
+  docs_ok?: boolean;
+  start_job_running?: boolean;
+  log_name?: string;
+  log_tail?: string[];
   hint?: string | null;
   voice_api?: {
-    stt?: { browser?: boolean; note?: string };
+    stt?: { available?: boolean; mode?: string; model?: string; hint?: string | null };
     tts?: { enabled?: boolean; available?: boolean; url?: string; voice?: string };
   } | null;
 }
@@ -128,6 +136,44 @@ export interface MapTilesCheck {
   martin_error?: string | null;
 }
 
+export interface TrialCheck {
+  status: string;
+  running?: boolean;
+  action?: string | null;
+  latest_backup?: string | null;
+  backup_count?: number;
+  counts?: Record<string, number>;
+  sync_reachable?: boolean;
+  postgres_reachable?: boolean;
+  reason?: string;
+}
+
+export interface TrialStatus {
+  running: boolean;
+  action: string | null;
+  log_name: string;
+  backup_dir: string;
+  latest_backup: string | null;
+  counts?: Record<string, number>;
+  counts_status?: string;
+  sync_reachable: boolean;
+  postgres_reachable: boolean;
+}
+
+export interface TrialBackupInfo {
+  path: string;
+  name: string;
+  size_bytes: number;
+  modified_at: string;
+}
+
+export interface TrialBackups {
+  status: string;
+  backup_dir: string;
+  latest: string | null;
+  backups: TrialBackupInfo[];
+}
+
 export interface LogFileInfo {
   name: string;
   service_id: string | null;
@@ -156,6 +202,7 @@ export interface ObservabilitySnapshot {
   voice_tts?: VoiceTtsCheck;
   data_plane: DataPlaneCheck;
   map_tiles: MapTilesCheck;
+  trial?: TrialCheck;
   logs: LogFileInfo[];
   migrations: MigrationInfo;
 }
@@ -325,4 +372,54 @@ export function getMemgraphBootstrapStatus(): Promise<MemgraphBootstrapStatus> {
 
 export function memgraphBootstrapStreamUrl(): string {
   return `${API_BASE}/memgraph/bootstrap/stream`;
+}
+
+export function supertonicStartStreamUrl(): string {
+  return `${API_BASE}/supertonic/start/stream`;
+}
+
+export function getSupertonicStatus(): Promise<{
+  installed: boolean;
+  running: boolean;
+  pid: number | null;
+  port: number;
+  url: string;
+  port_open: boolean;
+  docs_ok: boolean;
+  phase: string;
+  log_name: string;
+  hint: string | null;
+  start_job_running: boolean;
+}> {
+  return fetchJson('/supertonic/status');
+}
+
+export function getTrialStatus(): Promise<TrialStatus> {
+  return fetchJson<TrialStatus>('/trial/status');
+}
+
+export function getTrialBackups(): Promise<TrialBackups> {
+  return fetchJson<TrialBackups>('/trial/backups');
+}
+
+export type TrialRunParams = {
+  action: string;
+  confirm?: boolean;
+  empty_master?: boolean;
+  fresh_staging?: boolean;
+  dump_file?: string;
+  count?: number;
+  run_validation?: boolean;
+};
+
+export function trialRunStreamUrl(params: TrialRunParams): string {
+  const q = new URLSearchParams();
+  q.set('action', params.action);
+  if (params.confirm) q.set('confirm', 'true');
+  if (params.empty_master) q.set('empty_master', 'true');
+  if (params.fresh_staging) q.set('fresh_staging', 'true');
+  if (params.dump_file) q.set('dump_file', params.dump_file);
+  if (params.count != null) q.set('count', String(params.count));
+  if (params.run_validation) q.set('run_validation', 'true');
+  return `${API_BASE}/trial/run/stream?${q}`;
 }

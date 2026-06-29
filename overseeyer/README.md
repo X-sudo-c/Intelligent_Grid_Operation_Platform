@@ -52,6 +52,11 @@ npm run dev
 | `GET /api/verify/map-tiles` | Verify `map_*` PostGIS views + Martin catalog (migration 00017) |
 | `GET /api/memgraph/bootstrap/status` | Memgraph bootstrap job state |
 | `GET /api/memgraph/bootstrap/stream` | SSE stream — runs `.venv/bin/python memgraph/bootstrap.py` with live output |
+| `GET /api/supertonic/status` | Supertonic install/phase/pid readiness |
+| `GET /api/supertonic/start/stream` | SSE stream — runs `scripts/start-supertonic.sh` with live log + readiness wait |
+| `GET /api/trial/status` | Trial job state, DB counts, latest backup path |
+| `GET /api/trial/backups` | List trial `*.dump` files under `TRIAL_BACKUP_DIR` |
+| `GET /api/trial/run/stream` | SSE stream — runs `scripts/trial/*` (backup, prep, restore, simulate, …) |
 
 ### Observability checks
 
@@ -64,6 +69,7 @@ The `/api/observability` payload includes:
 - **voice_tts** — Supertonic on :7788 for GIOP copilot spoken replies; sync-service `GET /api/v1/portal/ai/voice/status`
 - **data_plane** — staging asset count, open conflicts, Timescale `meter_readings` check
 - **map_tiles** — `map_connectivity_nodes` / `map_ac_line_segments` row counts, voltage mix, Martin `map_*` layer catalog
+- **trial** — master/staging counts, latest pg_dump backup, trial job running state
 - **logs** — metadata for all files in `.giop/logs/`
 
 ### Service IDs

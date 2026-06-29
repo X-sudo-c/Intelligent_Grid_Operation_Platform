@@ -64,6 +64,23 @@ echo
 
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -q -c "CREATE SCHEMA IF NOT EXISTS gis;"
 
+if [[ "${BOUNDARIES_ONLY:-0}" == "1" ]]; then
+  echo "==> Boundaries-only import (skipping network layers and post_import_refresh)"
+  import_layer "ECG-Admin_Boundaries" "ecg_admin_boundaries"
+  psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -q -c \
+    "GRANT SELECT ON ALL TABLES IN SCHEMA gis TO anon, authenticated, service_role;" || true
+  psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -q -c \
+    "UPDATE gis.reference_layers
+     SET feature_count = (SELECT COUNT(*) FROM gis.ecg_admin_boundaries),
+         last_imported_at = NOW(), updated_at = NOW()
+     WHERE slug = 'ecg-admin-boundaries';" 2>/dev/null || true
+  echo
+  echo "Done. Boundaries imported."
+  psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -c \
+    "SELECT COUNT(*) AS district_polygons FROM gis.ecg_admin_boundaries;"
+  exit 0
+fi
+
 import_layer "power_transformer" "power_transformer"
 import_layer "distribution_transformer" "distribution_transformer"
 import_layer "ECG-Admin_Boundaries" "ecg_admin_boundaries"

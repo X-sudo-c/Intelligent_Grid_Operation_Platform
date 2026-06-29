@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { PortalShell } from './PortalShell';
+import { EnhancedPortalShell } from './EnhancedPortalShell';
 import { GiopTopologyTab } from './GiopTopologyTab';
 import { GiopMapView } from './GiopMapView';
 import { GiopSplitView } from './GiopSplitView';
@@ -11,6 +11,7 @@ import { GiopDlqTab } from './GiopDlqTab';
 import { GiopAuditTab } from './GiopAuditTab';
 import { GiopDataQualityTab } from './GiopDataQualityTab';
 import { GiopExportsTab } from './GiopExportsTab';
+import { GiopGisReferenceTab } from './GiopGisReferenceTab';
 import { GiopMigrationTab } from './GiopMigrationTab';
 import { GiopApmWidget } from './GiopApmWidget';
 import { GiopCasesTab } from './GiopCasesTab';
@@ -36,8 +37,9 @@ import {
 import type { GiopGraphQueryKey } from '../lib/giopGraphTypes';
 import { normalizeMapCoordinates } from '../lib/giopMapCoordinates';
 import { useGiopNavBadges } from '../hooks/useGiopNavBadges';
-import type { PortalNavGroup } from './PortalShell';
-import { GiopCopilotPanel, isGiopPortalTab } from './GiopCopilotPanel';
+import type { PortalNavGroup } from './EnhancedPortalShell';
+import { EnhancedCopilotPanel } from './EnhancedCopilotPanel';
+import { isGiopPortalTab } from './GiopCopilotPanel';
 import type {
   GiopCopilotPortalContext,
   GiopCopilotUiAction,
@@ -65,6 +67,7 @@ const NAV_GROUPS: PortalNavGroup[] = [
       { id: 'audit', label: 'Audit ledger' },
       { id: 'data-quality', label: 'Data quality' },
       { id: 'exports', label: 'CIM export' },
+      { id: 'references', label: 'GIS references' },
       { id: 'migration', label: 'Migration' },
     ],
   },
@@ -120,6 +123,10 @@ const TAB_META: Record<GiopPortalTab, { title: string; subtitle: string }> = {
   exports: {
     title: 'CIM Export',
     subtitle: 'CIM-aligned JSON export of approved master data for enterprise integration',
+  },
+  references: {
+    title: 'GIS Reference Layers',
+    subtitle: 'Import boundary and network overlays for field capture context — stored in gis.*, not master',
   },
   migration: {
     title: 'Migration Adapter',
@@ -689,6 +696,10 @@ function GiopPortalInner() {
 
       {route.tab === 'exports' && <GiopExportsTab isLightMode={isLightMode} />}
 
+      {route.tab === 'references' && (
+        <GiopGisReferenceTab isLightMode={isLightMode} onMapRefresh={refreshMap} />
+      )}
+
       {route.tab === 'migration' && <GiopMigrationTab isLightMode={isLightMode} />}
 
       {route.tab === 'ocr' && <GiopMeterOcr isLightMode={isLightMode} />}
@@ -719,7 +730,7 @@ function GiopPortalInner() {
   const meta = TAB_META[route.tab];
 
   return (
-    <PortalShell
+    <EnhancedPortalShell
       activeTab={route.tab}
       onTabChange={goToTab}
       isLightMode={isLightMode}
@@ -733,12 +744,12 @@ function GiopPortalInner() {
       <GiopWorkspaceLayout sideOpen={sideMap.open} sidePanel={sideMapPanel}>
         {tabContent}
       </GiopWorkspaceLayout>
-      <GiopCopilotPanel
+      <EnhancedCopilotPanel
         isLightMode={isLightMode}
         portalContext={copilotContext}
         onUiAction={handleCopilotUiAction}
       />
-    </PortalShell>
+    </EnhancedPortalShell>
   );
 }
 

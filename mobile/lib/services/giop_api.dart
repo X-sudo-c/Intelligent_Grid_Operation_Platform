@@ -2,10 +2,12 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
+import 'package:latlong2/latlong.dart';
 
 import '../map/giop_martin_theme.dart';
 import '../config/api_config.dart';
 import '../models/asset_node.dart';
+import '../models/asset_kind.dart';
 import '../models/hex_assignment.dart';
 import 'offline_db.dart';
 
@@ -90,6 +92,8 @@ class TechnicianSubmission {
     required this.validation,
     this.errorLog,
     this.updatedAt,
+    this.latitude,
+    this.longitude,
   });
 
   final String mrid;
@@ -97,14 +101,121 @@ class TechnicianSubmission {
   final String validation;
   final String? errorLog;
   final String? updatedAt;
+  final double? latitude;
+  final double? longitude;
 
   factory TechnicianSubmission.fromJson(Map<String, dynamic> json) {
+    double? lat;
+    double? lon;
+    final geom = json['geom'];
+    if (geom is Map) {
+      final coords = geom['coordinates'];
+      if (coords is List && coords.length >= 2) {
+        lon = (coords[0] as num).toDouble();
+        lat = (coords[1] as num).toDouble();
+      }
+    }
     return TechnicianSubmission(
       mrid: json['mrid'] as String? ?? '',
       name: json['name'] as String? ?? '',
       validation: json['validation'] as String? ?? '',
       errorLog: json['error_log'] as String?,
       updatedAt: json['updated_at'] as String?,
+      latitude: lat,
+      longitude: lon,
+    );
+  }
+}
+
+class NearbyAssetHit {
+  const NearbyAssetHit({
+    required this.mrid,
+    required this.name,
+    required this.tier,
+    required this.distanceM,
+    this.assetKind,
+  });
+
+  final String mrid;
+  final String name;
+  final String tier;
+  final double distanceM;
+  final String? assetKind;
+
+  factory NearbyAssetHit.fromJson(Map<String, dynamic> json) {
+    return NearbyAssetHit(
+      mrid: json['mrid'] as String? ?? '',
+      name: json['name'] as String? ?? '',
+      tier: json['tier'] as String? ?? '',
+      distanceM: (json['distance_m'] as num?)?.toDouble() ?? 0,
+      assetKind: json['asset_kind'] as String?,
+    );
+  }
+}
+
+class SnapPointResult {
+  const SnapPointResult({
+    required this.snapped,
+    required this.longitude,
+    required this.latitude,
+    this.snapType,
+    this.snappedToName,
+    this.snappedToMrid,
+    this.distanceM,
+  });
+
+  final bool snapped;
+  final double longitude;
+  final double latitude;
+  final String? snapType;
+  final String? snappedToName;
+  final String? snappedToMrid;
+  final double? distanceM;
+
+  factory SnapPointResult.fromJson(Map<String, dynamic> json) {
+    return SnapPointResult(
+      snapped: json['snapped'] as bool? ?? false,
+      longitude: (json['longitude'] as num).toDouble(),
+      latitude: (json['latitude'] as num).toDouble(),
+      snapType: json['snap_type'] as String?,
+      snappedToName: json['snapped_to_name'] as String?,
+      snappedToMrid: json['snapped_to_mrid'] as String?,
+      distanceM: (json['distance_m'] as num?)?.toDouble(),
+    );
+  }
+}
+
+class StagingSpan {
+  const StagingSpan({
+    required this.mrid,
+    required this.sourceNodeId,
+    required this.targetNodeId,
+    required this.points,
+    this.name,
+  });
+
+  final String mrid;
+  final String sourceNodeId;
+  final String targetNodeId;
+  final List<LatLng> points;
+  final String? name;
+
+  factory StagingSpan.fromJson(Map<String, dynamic> json) {
+    final points = <LatLng>[];
+    final geom = json['geom'];
+    if (geom is Map && geom['coordinates'] is List) {
+      for (final c in geom['coordinates'] as List) {
+        if (c is List && c.length >= 2) {
+          points.add(LatLng((c[1] as num).toDouble(), (c[0] as num).toDouble()));
+        }
+      }
+    }
+    return StagingSpan(
+      mrid: json['mrid'] as String? ?? '',
+      name: json['name'] as String?,
+      sourceNodeId: json['source_node_id'] as String? ?? '',
+      targetNodeId: json['target_node_id'] as String? ?? '',
+      points: points,
     );
   }
 }
@@ -196,6 +307,7 @@ class GiopApi {
           longitude: (row['longitude'] as num).toDouble(),
           tier: 'staging',
           layer: MapNodeLayer.queuedLocal,
+          assetKind: assetKindFromString(row['asset_kind'] as String?),
         ),
       );
     }
@@ -853,8 +965,13 @@ class GiopApi {
     required double longitude,
     required double latitude,
     String operatingUtility = 'ECG_SOUTHERN',
+    AssetKind assetKind = AssetKind.poleLv,
     String? substationName,
     String? boundaryFeederId,
+    String? workOrderId,
+    String? photoUrl,
+    String? h3Index,
+    bool enforceHexAssignment = false,
     String? mrid,
     String? offlineSessionStartedAt,
     String? operatorId,
@@ -867,8 +984,13 @@ class GiopApi {
           'longitude': longitude,
           'latitude': latitude,
           'operating_utility': operatingUtility,
+          'asset_kind': assetKindToApiValue(assetKind),
           if (substationName != null) 'substation_name': substationName,
           if (boundaryFeederId != null) 'boundary_feeder_id': boundaryFeederId,
+          if (workOrderId != null) 'work_order_id': workOrderId,
+          if (photoUrl != null) 'photo_url': photoUrl,
+          if (h3Index != null) 'h3_index': h3Index,
+          'enforce_hex_assignment': enforceHexAssignment,
           if (mrid != null) 'mrid': mrid,
           if (offlineSessionStartedAt != null)
             'offline_session_started_at': offlineSessionStartedAt,
@@ -893,6 +1015,123 @@ class GiopApi {
       }
       rethrow;
     }
+  }
+
+  Future<SnapPointResult> fetchSnapPoint({
+    required double latitude,
+    required double longitude,
+    double snapM = 15,
+  }) async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      '$_syncUrl/api/v1/field/snap-point',
+      queryParameters: {
+        'lat': latitude,
+        'lng': longitude,
+        'snap_m': snapM,
+      },
+    );
+    return SnapPointResult.fromJson(response.data ?? {});
+  }
+
+  Future<List<NearbyAssetHit>> fetchNearbyCheck({
+    required double latitude,
+    required double longitude,
+    double radiusM = 5,
+  }) async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      '$_syncUrl/api/v1/field/nearby-check',
+      queryParameters: {
+        'lat': latitude,
+        'lng': longitude,
+        'radius_m': radiusM,
+      },
+    );
+    final hits = response.data?['hits'] as List<dynamic>? ?? [];
+    return hits
+        .map((e) => NearbyAssetHit.fromJson(Map<String, dynamic>.from(e as Map)))
+        .toList();
+  }
+
+  Future<List<String>> fetchFeederLookup({String? q}) async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      '$_syncUrl/api/v1/field/lookup/feeders',
+      queryParameters: {if (q != null && q.isNotEmpty) 'q': q},
+    );
+    final list = response.data?['feeders'] as List<dynamic>? ?? [];
+    return list.map((e) => e.toString()).toList();
+  }
+
+  Future<List<String>> fetchSubstationLookup({String? q}) async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      '$_syncUrl/api/v1/field/lookup/substations',
+      queryParameters: {if (q != null && q.isNotEmpty) 'q': q},
+    );
+    final list = response.data?['substations'] as List<dynamic>? ?? [];
+    return list.map((e) => e.toString()).toList();
+  }
+
+  Future<String?> fetchH3CellAt({
+    required double latitude,
+    required double longitude,
+  }) async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      '$_syncUrl/api/v1/h3/cell-at',
+      queryParameters: {'lat': latitude, 'lng': longitude},
+    );
+    return response.data?['h3'] as String? ?? response.data?['index'] as String?;
+  }
+
+  Future<String> uploadFieldPhoto(File file) async {
+    final formData = FormData.fromMap({
+      'file': await MultipartFile.fromFile(
+        file.path,
+        filename: file.path.split('/').last,
+      ),
+    });
+    final response = await _dio.post<Map<String, dynamic>>(
+      '$_syncUrl/api/v1/field/photos',
+      data: formData,
+    );
+    final url = response.data?['photo_url'] as String?;
+    if (url == null || url.isEmpty) {
+      throw StateError('Upload failed');
+    }
+    if (url.startsWith('/')) {
+      return '$_syncUrl$url';
+    }
+    return url;
+  }
+
+  Future<FieldSubmitResult> submitFieldSpan({
+    required String sourceNodeId,
+    required String targetNodeId,
+    String? boundaryFeederId,
+    String? workOrderId,
+    String? name,
+  }) async {
+    final response = await _dio.post<Map<String, dynamic>>(
+      '$_syncUrl/api/v1/field/spans',
+      data: {
+        'source_node_id': sourceNodeId,
+        'target_node_id': targetNodeId,
+        if (boundaryFeederId != null) 'boundary_feeder_id': boundaryFeederId,
+        if (workOrderId != null) 'work_order_id': workOrderId,
+        if (name != null) 'name': name,
+        'operator_id': operatorId,
+      },
+      options: Options(contentType: 'application/json'),
+    );
+    return FieldSubmitResult(success: true, mrid: response.data?['mrid'] as String?);
+  }
+
+  Future<List<StagingSpan>> fetchStagingSpans() async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      '$_syncUrl/api/v1/assets/staging/spans',
+    );
+    final spans = response.data?['spans'] as List<dynamic>? ?? [];
+    return spans
+        .map((e) => StagingSpan.fromJson(Map<String, dynamic>.from(e as Map)))
+        .toList();
   }
 
   Future<Map<String, dynamic>> runMeterOcr(File imageFile) async {

@@ -267,18 +267,51 @@ def _probe_service(defn: ServiceDef) -> dict[str, Any]:
             detail = "npx supabase start"
 
     elif defn.kind == "process":
-        pid = _read_pid(defn.pid_name or defn.id)
-        port_up = defn.port and _port_open("127.0.0.1", defn.port)
-        health_up = defn.health_url and _http_reachable(defn.health_url)
-        if port_up or health_up:
-            status = "up"
-            detail = f":{defn.port}" if defn.port else "running"
-        elif pid:
-            status = "partial"
-            detail = f"pid {pid} but port closed"
+        if defn.id == "supertonic":
+            try:
+                from supertonic_ops import supertonic_status
+
+                st = supertonic_status()
+                pid = st.get("pid")
+                phase = st.get("phase", "down")
+                if phase == "ready":
+                    status = "up"
+                    detail = f":{defn.port} ready"
+                elif phase in ("starting", "warming") or st.get("start_job_running"):
+                    status = "partial"
+                    detail = phase + (f" · pid {pid}" if pid else "")
+                elif pid:
+                    status = "partial"
+                    detail = f"pid {pid} · {phase}"
+                else:
+                    status = "down"
+                    detail = st.get("hint") or f":{defn.port} offline"
+            except Exception as exc:
+                pid = _read_pid(defn.pid_name or defn.id)
+                port_up = defn.port and _port_open("127.0.0.1", defn.port)
+                health_up = defn.health_url and _http_reachable(defn.health_url)
+                if port_up or health_up:
+                    status = "up"
+                    detail = f":{defn.port}" if defn.port else "running"
+                elif pid:
+                    status = "partial"
+                    detail = f"pid {pid} but port closed"
+                else:
+                    status = "down"
+                    detail = str(exc)[:120]
         else:
-            status = "down"
-            detail = f":{defn.port}" if defn.port else "offline"
+            pid = _read_pid(defn.pid_name or defn.id)
+            port_up = defn.port and _port_open("127.0.0.1", defn.port)
+            health_up = defn.health_url and _http_reachable(defn.health_url)
+            if port_up or health_up:
+                status = "up"
+                detail = f":{defn.port}" if defn.port else "running"
+            elif pid:
+                status = "partial"
+                detail = f"pid {pid} but port closed"
+            else:
+                status = "down"
+                detail = f":{defn.port}" if defn.port else "offline"
 
     log_path = str(LOG_DIR / f"{(defn.log_name or defn.id)}.log") if defn.log_name else None
     return {
@@ -485,14 +518,18 @@ def start_service(service_id: str) -> dict[str, Any]:
         return {"service_id": service_id, "action": "start", "result": _probe_service(defn)}
 
     if defn.kind == "supabase":
-        subprocess.run(
-            ["npx", "supabase", "start"],
-            cwd=str(ROOT),
-            check=False,
-            timeout=300,
-        )
+        import supabase_ops
+
+        proc_result = supabase_ops.start_local()
         time.sleep(3)
-        return {"service_id": service_id, "action": "start", "result": _probe_service(defn)}
+        return {
+            "service_id": service_id,
+            "action": "start",
+            "exit_code": proc_result.get("exit_code"),
+            "stdout": proc_result.get("stdout", ""),
+            "stderr": proc_result.get("stderr", ""),
+            "result": _probe_service(defn),
+        }
 
     if defn.kind == "process":
         if defn.id in ("giop-portal", "overseeyer-web"):
@@ -847,6 +884,8 @@ def create_migration(name: str, sql_body: str | None = None) -> dict[str, Any]:
 
 
 def _run_apply_migrations_sync(mode: Literal["up", "reset"] = "up") -> dict[str, Any]:
+    import supabase_ops
+
     martin_paused = False
     if mode == "up" and _port_open("127.0.0.1", 3001):
         try:
@@ -855,24 +894,18 @@ def _run_apply_migrations_sync(mode: Literal["up", "reset"] = "up") -> dict[str,
         except Exception:
             martin_paused = False
 
-    if mode == "reset":
-        proc = subprocess.run(
-            ["npx", "supabase", "db", "reset", "--local"],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=600,
-            check=False,
-        )
-    else:
-        proc = subprocess.run(
-            ["npx", "supabase", "migration", "up", "--local"],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            timeout=600,
-            check=False,
-        )
+    try:
+        proc = supabase_ops.run_db_command(mode)
+    except FileNotFoundError as exc:
+        return {
+            "mode": mode,
+            "exit_code": 127,
+            "stdout": "",
+            "stderr": str(exc),
+            "martin_paused": martin_paused,
+            "martin_restarted": False,
+            "migrations": list_migrations(),
+        }
 
     martin_restarted = False
     if martin_paused and proc.returncode == 0:

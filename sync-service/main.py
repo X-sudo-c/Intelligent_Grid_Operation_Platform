@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 import psycopg2
@@ -19,6 +20,17 @@ from neo4j import GraphDatabase
 from pydantic import BaseModel, Field
 
 from dlq import list_dlq, mark_retrying, patch_dlq
+from field_capture import (
+    distinct_feeders,
+    distinct_substations,
+    ensure_upload_dir,
+    list_staging_spans,
+    nearby_assets,
+    save_field_photo,
+    snap_placement_point,
+    submit_field_span,
+    technician_hex_allowed,
+)
 from field_ops import (
     fetch_staging_validation,
     list_active_technicians,
@@ -169,6 +181,26 @@ from shapefile_export import create_shapefile_export_job
 from csv_export import create_csv_export_job
 from cim_xml_export import create_cim_rdf_export_job, create_cim_xml_export_job
 from integration_export import create_mdms_export_job, create_sap_export_job
+from reference_import import (
+    create_boundary_import_job,
+    create_reference_import_from_inspect,
+    get_job as get_import_job,
+    list_import_jobs,
+    list_reference_layers,
+    process_boundary_import_job,
+    save_import_upload,
+)
+from reference_inspect import (
+    inspect_uploaded,
+    layer_preview_geojson,
+    save_inspect_upload,
+    suggest_boundary_fields,
+)
+from reference_render import (
+    build_map_config,
+    refresh_all_render_policies,
+    reference_layer_geojson,
+)
 from work_orders import create_work_order, get_work_order, list_work_orders, patch_work_order
 from migration_engine import (
     list_failed as list_migration_failed,
@@ -779,6 +811,15 @@ class TelemetryPayload(BaseModel):
 
 GhanaUtility = Literal["ECG_SOUTHERN", "NEDCO_NORTHERN", "GRIDCO_TRANSMISSION"]
 
+FieldAssetKind = Literal[
+    "distribution_transformer",
+    "power_transformer",
+    "pole_11kv",
+    "pole_33kv",
+    "pole_lv",
+    "connectivity_node",
+]
+
 
 class FieldNodePayload(BaseModel):
     name: str = Field(min_length=1, max_length=200)
@@ -787,6 +828,11 @@ class FieldNodePayload(BaseModel):
     operating_utility: GhanaUtility = "ECG_SOUTHERN"
     substation_name: str | None = Field(default=None, max_length=100)
     boundary_feeder_id: str | None = Field(default=None, max_length=50)
+    asset_kind: FieldAssetKind = "connectivity_node"
+    work_order_id: str | None = Field(default=None, max_length=100)
+    photo_url: str | None = Field(default=None, max_length=500)
+    h3_index: str | None = Field(default=None, max_length=32)
+    enforce_hex_assignment: bool = False
     mrid: str | None = None
     offline_session_started_at: str | None = None
     operator_id: str | None = Field(default=None, max_length=100)
@@ -808,6 +854,15 @@ class FieldLocationPayload(BaseModel):
 class BulkNodeConnectionsPayload(BaseModel):
     mrids: list[str] = Field(min_length=1, max_length=1500)
     limit_per_node: int = Field(default=25, ge=1, le=100)
+
+
+class FieldSpanPayload(BaseModel):
+    source_node_id: str = Field(min_length=1, max_length=50)
+    target_node_id: str = Field(min_length=1, max_length=50)
+    boundary_feeder_id: str | None = Field(default=None, max_length=50)
+    work_order_id: str | None = Field(default=None, max_length=100)
+    name: str | None = Field(default=None, max_length=200)
+    operator_id: str | None = Field(default=None, max_length=100)
 
 
 class AssetUpdatePayload(BaseModel):
@@ -1230,7 +1285,10 @@ async def list_staging_assets(
                       ga.operating_utility::text,
                       ga.substation_name,
                       NULL::text AS nominal_voltage,
-                      io.submitted_by
+                      io.submitted_by,
+                      COALESCE(ga.asset_kind, 'connectivity_node') AS asset_kind,
+                      io.work_order_id,
+                      io.photo_url
                     FROM staging.connectivity_nodes cn
                     JOIN staging.identified_objects io ON cn.mrid = io.mrid
                     LEFT JOIN staging.ghana_grid_assets ga ON cn.mrid = ga.mrid
@@ -1254,6 +1312,9 @@ async def list_staging_assets(
                     "substation_name": r[6],
                     "nominal_voltage": r[7],
                     "submitted_by": r[8],
+                    "asset_kind": r[9],
+                    "work_order_id": r[10],
+                    "photo_url": r[11],
                     "tier": "staging",
                 }
                 for r in rows
@@ -1270,6 +1331,21 @@ async def list_staging_assets(
 async def submit_field_node(payload: FieldNodePayload):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+
+    if payload.enforce_hex_assignment and payload.operator_id and payload.h3_index:
+        conn_check = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            if not technician_hex_allowed(
+                conn_check,
+                technician_id=payload.operator_id,
+                h3_index=payload.h3_index,
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Capture location is outside your assigned work hex",
+                )
+        finally:
+            conn_check.close()
 
     if payload.idempotency_key:
         ikey = idempotency_key("field-nodes", payload.idempotency_key)
@@ -1332,10 +1408,18 @@ async def submit_field_node(payload: FieldNodePayload):
                                 validation = 'PENDING_FIELD',
                                 error_log = NULL,
                                 submitted_by = COALESCE(%s, submitted_by),
+                                work_order_id = COALESCE(%s, work_order_id),
+                                photo_url = COALESCE(%s, photo_url),
                                 updated_at = NOW()
                             WHERE mrid = %s
                             """,
-                            (payload.name, payload.operator_id, mrid),
+                            (
+                                payload.name,
+                                payload.operator_id,
+                                payload.work_order_id,
+                                payload.photo_url,
+                                mrid,
+                            ),
                         )
                         cur.execute(
                             """
@@ -1355,12 +1439,14 @@ async def submit_field_node(payload: FieldNodePayload):
                             """
                             UPDATE staging.ghana_grid_assets
                             SET operating_utility = %s::ghana_utility_enum,
-                                substation_name = COALESCE(%s, substation_name)
+                                substation_name = COALESCE(%s, substation_name),
+                                asset_kind = %s
                             WHERE mrid = %s
                             """,
                             (
                                 payload.operating_utility,
                                 payload.substation_name or payload.name,
+                                payload.asset_kind,
                                 mrid,
                             ),
                         )
@@ -1382,6 +1468,7 @@ async def submit_field_node(payload: FieldNodePayload):
                             "longitude": payload.longitude,
                             "latitude": payload.latitude,
                             "boundary_feeder_id": payload.boundary_feeder_id,
+                            "asset_kind": payload.asset_kind,
                             "recaptured": True,
                         }
                         if payload.idempotency_key:
@@ -1405,11 +1492,18 @@ async def submit_field_node(payload: FieldNodePayload):
             cur.execute(
                 """
                 INSERT INTO staging.identified_objects (
-                  mrid, name, lifecycle_state, validation, submitted_by
+                  mrid, name, lifecycle_state, validation, submitted_by,
+                  work_order_id, photo_url
                 )
-                VALUES (%s, %s, 'IN_SERVICE', 'PENDING_FIELD', %s)
+                VALUES (%s, %s, 'IN_SERVICE', 'PENDING_FIELD', %s, %s, %s)
                 """,
-                (mrid, payload.name, payload.operator_id),
+                (
+                    mrid,
+                    payload.name,
+                    payload.operator_id,
+                    payload.work_order_id,
+                    payload.photo_url,
+                ),
             )
             cur.execute(
                 """
@@ -1423,10 +1517,12 @@ async def submit_field_node(payload: FieldNodePayload):
             )
             cur.execute(
                 """
-                INSERT INTO staging.ghana_grid_assets (mrid, operating_utility, substation_name)
-                VALUES (%s, %s::ghana_utility_enum, %s)
+                INSERT INTO staging.ghana_grid_assets (
+                  mrid, operating_utility, substation_name, asset_kind
+                )
+                VALUES (%s, %s::ghana_utility_enum, %s, %s)
                 """,
-                (mrid, payload.operating_utility, substation),
+                (mrid, payload.operating_utility, substation, payload.asset_kind),
             )
             log_lineage(
                 conn,
@@ -1454,6 +1550,7 @@ async def submit_field_node(payload: FieldNodePayload):
         "longitude": payload.longitude,
         "latitude": payload.latitude,
         "boundary_feeder_id": feeder_id,
+        "asset_kind": payload.asset_kind,
     }
     if payload.idempotency_key:
         store_idempotent_response(
@@ -1462,6 +1559,161 @@ async def submit_field_node(payload: FieldNodePayload):
         )
     invalidate_after_staging_write()
     return result
+
+
+@app.get("/api/v1/field/snap-point")
+async def get_field_snap_point(
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+    snap_m: float = Query(default=15.0, ge=1, le=100),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            return snap_placement_point(conn, longitude=lng, latitude=lat, snap_m=snap_m)
+        finally:
+            conn.close()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/field/nearby-check")
+async def get_field_nearby_check(
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+    radius_m: float = Query(default=5.0, ge=1, le=50),
+    limit: int = Query(default=10, ge=1, le=50),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            hits = nearby_assets(
+                conn, longitude=lng, latitude=lat, radius_m=radius_m, limit=limit
+            )
+        finally:
+            conn.close()
+        return {"hits": hits, "duplicate_warning": len(hits) > 0}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/field/lookup/feeders")
+async def get_field_feeder_lookup(
+    q: str | None = Query(default=None, max_length=100),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            feeders = distinct_feeders(conn, q=q, limit=limit)
+        finally:
+            conn.close()
+        return {"feeders": feeders}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/field/lookup/substations")
+async def get_field_substation_lookup(
+    q: str | None = Query(default=None, max_length=100),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            substations = distinct_substations(conn, q=q, limit=limit)
+        finally:
+            conn.close()
+        return {"substations": substations}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/assets/staging/spans")
+async def list_staging_spans_endpoint(
+    submitted_by: str | None = Query(default=None),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            spans = list_staging_spans(conn, submitted_by=submitted_by)
+        finally:
+            conn.close()
+        return {"spans": spans}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/field/spans")
+async def post_field_span(payload: FieldSpanPayload):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URI)
+        try:
+            result = submit_field_span(
+                conn,
+                source_node_id=payload.source_node_id,
+                target_node_id=payload.target_node_id,
+                operator_id=payload.operator_id,
+                boundary_feeder_id=payload.boundary_feeder_id,
+                work_order_id=payload.work_order_id,
+                name=payload.name,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        invalidate_after_staging_write()
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/field/photos")
+async def upload_field_photo(file: UploadFile = File(...)):
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty upload")
+    if len(content) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Photo exceeds 8MB limit")
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".jpg", ".jpeg", ".png", ".webp", ""}:
+        raise HTTPException(status_code=400, detail="Unsupported image type")
+    if not suffix:
+        suffix = ".jpg"
+    try:
+        url = save_field_photo(content, suffix=suffix)
+        return {"photo_url": url}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/field/photos/{filename}")
+async def get_field_photo(filename: str):
+    if ".." in filename or "/" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    path = ensure_upload_dir() / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Photo not found")
+    data = path.read_bytes()
+    media = "image/jpeg"
+    if filename.endswith(".png"):
+        media = "image/png"
+    elif filename.endswith(".webp"):
+        media = "image/webp"
+    return Response(content=data, media_type=media)
 
 
 @app.post("/api/v1/field/location")
@@ -2199,7 +2451,18 @@ async def update_asset_validation(
                         )
                     if payload.operator_id:
                         set_lineage_context(conn, operator_id=payload.operator_id)
-                    cur.execute("SELECT promote_staged_asset(%s::uuid)", (mrid,))
+                    cur.execute(
+                        "SELECT 1 FROM staging.ac_line_segments WHERE mrid = %s::uuid",
+                        (mrid,),
+                    )
+                    is_line = cur.fetchone() is not None
+                    if is_line:
+                        cur.execute(
+                            "SELECT promote_staged_line_segment(%s::uuid)",
+                            (mrid,),
+                        )
+                    else:
+                        cur.execute("SELECT promote_staged_asset(%s::uuid)", (mrid,))
                     result = cur.fetchone()[0]
                     conn.commit()
                     invalidate_after_promote()
@@ -4027,6 +4290,290 @@ async def download_export(job_id: str):
         media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+def _run_boundary_import_job(job_id: str) -> None:
+    if not SUPABASE_DB_URI:
+        return
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        process_boundary_import_job(conn, job_id)
+        invalidate_ops_cache()
+    except Exception:
+        conn.rollback()
+        import logging
+
+        logging.getLogger(__name__).exception("boundary import job %s failed", job_id)
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/reference-layers")
+async def api_list_reference_layers():
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT gis.refresh_reference_layer_counts()")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        refresh_all_render_policies(conn)
+        conn.commit()
+        layers = list_reference_layers(conn)
+    finally:
+        conn.close()
+    return {"layers": layers}
+
+
+@app.get("/api/v1/reference-layers/map-config")
+async def api_reference_map_config():
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    martin_url = os.getenv("MARTIN_URL", "http://127.0.0.1:3001")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        try:
+            refresh_all_render_policies(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        config = build_map_config(conn, martin_url=martin_url)
+    finally:
+        conn.close()
+    return {"layers": config}
+
+
+@app.get("/api/v1/reference-layers/{slug}/geojson")
+async def api_reference_layer_geojson(
+    slug: str,
+    west: float | None = Query(default=None),
+    south: float | None = Query(default=None),
+    east: float | None = Query(default=None),
+    north: float | None = Query(default=None),
+    limit: int = Query(default=10_000, ge=1, le=50_000),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        return reference_layer_geojson(
+            conn,
+            slug,
+            west=west,
+            south=south,
+            east=east,
+            north=north,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/imports")
+async def api_list_imports(limit: int = Query(default=50, ge=1, le=200)):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        jobs = list_import_jobs(conn, limit=limit)
+    finally:
+        conn.close()
+    return {"jobs": jobs}
+
+
+@app.get("/api/v1/imports/{job_id}")
+async def api_get_import(job_id: str):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        job = get_import_job(conn, job_id)
+    finally:
+        conn.close()
+    if not job or job.get("direction") != "import":
+        raise HTTPException(status_code=404, detail="Import job not found")
+    return job
+
+
+@app.post("/api/v1/imports/boundaries")
+async def api_import_boundaries(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    layer_slug: str = Query(default="ecg-admin-boundaries"),
+    operator_id: str | None = Query(default=None),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    if not file.filename:
+        raise HTTPException(status_code=422, detail="Missing upload filename")
+    body = await file.read()
+    if not body:
+        raise HTTPException(status_code=422, detail="Empty upload")
+
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        job = create_boundary_import_job(
+            conn,
+            storage_bucket=None,
+            storage_path="pending",
+            layer_slugs=[layer_slug],
+            requested_by=operator_id,
+        )
+        bucket, storage_path = save_import_upload(job["id"], body, file.filename or "source.gpkg")
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE public.gis_transfer_jobs
+                SET storage_bucket = %s, storage_path = %s, updated_at = NOW()
+                WHERE id = %s::uuid
+                """,
+                (bucket, storage_path, job["id"]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    background_tasks.add_task(_run_boundary_import_job, job["id"])
+    return {"job": job}
+
+
+class BundledBoundaryImportPayload(BaseModel):
+    file_path: str
+    layer_slugs: list[str] | None = None
+    operator_id: str | None = None
+
+
+@app.post("/api/v1/imports/boundaries/bundled")
+async def api_import_boundaries_bundled(
+    payload: BundledBoundaryImportPayload,
+    background_tasks: BackgroundTasks,
+):
+    """Import boundaries from a server-local GPKG path (dev / ops)."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    candidates = [
+        Path(payload.file_path),
+        Path(__file__).resolve().parent.parent / payload.file_path,
+    ]
+    path = next((p for p in candidates if p.is_file()), None)
+    if path is None:
+        raise HTTPException(status_code=400, detail=f"File not found: {payload.file_path}")
+
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        job = create_boundary_import_job(
+            conn,
+            storage_bucket=None,
+            storage_path=str(path.resolve()),
+            layer_slugs=payload.layer_slugs,
+            requested_by=payload.operator_id,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    background_tasks.add_task(_run_boundary_import_job, job["id"])
+    return {"job": job}
+
+
+class ReferenceImportPayload(BaseModel):
+    inspect_id: str
+    display_name: str
+    source_layer: str
+    dissolve_column: str | None = None
+    label_field: str | None = None
+    detail_min_zoom: float = 10
+    catalog_slug: str | None = None
+    operator_id: str | None = None
+
+
+@app.post("/api/v1/imports/inspect")
+async def api_inspect_import(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=422, detail="Missing upload filename")
+    body = await file.read()
+    if not body:
+        raise HTTPException(status_code=422, detail="Empty upload")
+    try:
+        inspect_id, _path = save_inspect_upload(body, file.filename)
+        result = inspect_uploaded(inspect_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return result
+
+
+@app.get("/api/v1/imports/inspect/{inspect_id}")
+async def api_get_inspect(inspect_id: str):
+    try:
+        return inspect_uploaded(inspect_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/imports/inspect/{inspect_id}/preview")
+async def api_inspect_preview(
+    inspect_id: str,
+    layer: str | None = Query(default=None),
+    limit: int = Query(default=150, ge=1, le=500),
+):
+    try:
+        return layer_preview_geojson(inspect_id, layer, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/imports/inspect/{inspect_id}/suggest")
+async def api_inspect_suggest(inspect_id: str, layer: str = Query(...)):
+    try:
+        data = inspect_uploaded(inspect_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    match = next((l for l in data.get("layers", []) if l.get("name") == layer), None)
+    if not match:
+        raise HTTPException(status_code=404, detail=f"Layer not found: {layer}")
+    return suggest_boundary_fields(match.get("fields") or [])
+
+
+@app.post("/api/v1/imports/reference")
+async def api_import_reference(
+    payload: ReferenceImportPayload,
+    background_tasks: BackgroundTasks,
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = psycopg2.connect(SUPABASE_DB_URI)
+    try:
+        job = create_reference_import_from_inspect(
+            conn,
+            inspect_id=payload.inspect_id,
+            display_name=payload.display_name,
+            source_layer=payload.source_layer,
+            dissolve_column=payload.dissolve_column,
+            label_field=payload.label_field,
+            detail_min_zoom=payload.detail_min_zoom,
+            catalog_slug=payload.catalog_slug,
+            requested_by=payload.operator_id,
+        )
+        conn.commit()
+    except ValueError as exc:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+    background_tasks.add_task(_run_boundary_import_job, job["id"])
+    return {"job": job}
 
 
 def _resolve_affine(payload) -> dict[str, float]:

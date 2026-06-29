@@ -1,0 +1,2 @@
+-- Optional post-migration seed (see supabase/migrations/00002_seed.sql for core test data).
+-- Kept empty so `supabase db reset` does not fail when [db.seed] is enabled.

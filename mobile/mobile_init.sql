@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS field_captured_assets (
   name TEXT NOT NULL,
   longitude REAL NOT NULL,
   latitude REAL NOT NULL,
+  asset_kind TEXT NOT NULL DEFAULT 'pole_lv',
   validation TEXT DEFAULT 'PENDING_FIELD',
   is_dirty INTEGER NOT NULL DEFAULT 1,
   captured_at TEXT NOT NULL DEFAULT (datetime('now'))

@@ -22,6 +22,7 @@ dist-ssr/
 
 # --- GIOP runtime ---
 .giop/
+sync-service/uploads/
 
 # --- Logs ---
 *.log
@@ -29,6 +30,10 @@ dist-ssr/
 # --- Supabase local ---
 supabase/.branches/
 supabase/.temp/
+
+# --- Local CLI binaries (install via scripts/ensure_supabase_cli.sh) ---
+.tools/supabase/supabase
+.tools/supabase/supabase-go
 
 # --- GIS datasets (import locally; see scripts/import_power_system_gpkg.sh) ---
 supabase/Power System.gpkg

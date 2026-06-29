@@ -1,0 +1,9 @@
+{
+"type": "FeatureCollection",
+"name": "substations",
+"features": [
+{ "type": "Feature", "properties": { "lon": -0.19, "lat": 5.56, "name": "Sub-Accra" }, "geometry": { "type": "Point", "coordinates": [ -0.19, 5.56 ] } },
+{ "type": "Feature", "properties": { "lon": -0.87, "lat": 9.33, "name": "Sub-Tamale" }, "geometry": { "type": "Point", "coordinates": [ -0.87, 9.33 ] } },
+{ "type": "Feature", "properties": { "lon": -1.27, "lat": 5.11, "name": "Sub-CapeCoast" }, "geometry": { "type": "Point", "coordinates": [ -1.27, 5.11 ] } }
+]
+}

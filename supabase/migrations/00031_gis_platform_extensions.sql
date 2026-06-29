@@ -102,6 +102,20 @@ END;
 $pgmq$;
 
 -- ---------------------------------------------------------------------------
+-- ECG admin boundaries (GPKG import fills this; stub for fresh schema-only DBs)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS gis.ecg_admin_boundaries (
+  fid int4 PRIMARY KEY,
+  district text,
+  region text,
+  geom geometry(MultiPolygon, 4326)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ecg_admin_boundaries_geom
+  ON gis.ecg_admin_boundaries USING GIST (geom);
+
+-- ---------------------------------------------------------------------------
 -- pg_trgm search indexes
 -- ---------------------------------------------------------------------------
 

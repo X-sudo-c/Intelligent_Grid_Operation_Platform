@@ -24,19 +24,30 @@ import '../services/navigation_location_settings.dart';
 import '../services/offline_db.dart';
 import '../services/tile_cache_service.dart';
 import '../utils/geo.dart';
+import '../models/capture_prefill.dart';
+import '../services/capture_preferences.dart';
+import '../utils/polygon.dart';
 import '../widgets/field_capture_sheet.dart';
 import '../widgets/giop_map_legend.dart';
 import '../widgets/layer_panel_sheet.dart';
 import '../widgets/map_crosshair.dart';
 import '../widgets/user_location_marker.dart';
 
-enum MapTool { pan, addPoint }
+enum MapTool { pan, addPoint, drawSpan }
 
 class MapScreen extends StatefulWidget {
-  const MapScreen({super.key, required this.api, this.refreshTrigger = 0});
+  const MapScreen({
+    super.key,
+    required this.api,
+    this.refreshTrigger = 0,
+    this.recapturePrefill,
+    this.onRecaptureConsumed,
+  });
 
   final GiopApi api;
   final int refreshTrigger;
+  final CapturePrefill? recapturePrefill;
+  final VoidCallback? onRecaptureConsumed;
 
   @override
   State<MapScreen> createState() => _MapScreenState();
@@ -59,6 +70,9 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   bool _syncing = false;
   int _pendingCount = 0;
   MapTool _tool = MapTool.pan;
+  String? _spanSourceMrid;
+  List<StagingSpan> _stagingSpans = const [];
+  CapturePrefill? _pendingPrefill;
   Position? _position;
   double? _heading;
   double _headingConfidence = 0;
@@ -173,6 +187,28 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     _mapDeltaSub = FieldMapRefreshBus.instance.stream.listen((request) {
       unawaited(_refreshH3Delta(request));
     });
+    unawaited(_loadStagingSpans());
+  }
+
+  Future<void> _loadStagingSpans() async {
+    try {
+      final spans = await widget.api.fetchStagingSpans();
+      if (mounted) setState(() => _stagingSpans = spans);
+    } catch (_) {}
+  }
+
+  Future<void> _handleRecapturePrefill() async {
+    final pre = _pendingPrefill;
+    if (pre == null) return;
+    _pendingPrefill = null;
+    widget.onRecaptureConsumed?.call();
+    if (pre.latitude != null && pre.longitude != null) {
+      _mapController.move(LatLng(pre.latitude!, pre.longitude!), 17);
+      await _openCaptureForm(
+        LatLng(pre.latitude!, pre.longitude!),
+        prefill: pre,
+      );
+    }
   }
 
   /// Load the current technician's assigned hexagons (work territory overlay).
@@ -191,6 +227,10 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
           !_hasFittedToAssignments) {
         _hasFittedToAssignments = true;
         _fitToAssignments();
+      }
+      if (assignments.isNotEmpty) {
+        final points = assignments.expand((h) => h.ring).toList();
+        unawaited(_tileCacheService.prefetchForBounds(points));
       }
     } catch (e) {
       // #region agent log
@@ -251,6 +291,11 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   @override
   void didUpdateWidget(MapScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (widget.recapturePrefill != null &&
+        widget.recapturePrefill != oldWidget.recapturePrefill) {
+      _pendingPrefill = widget.recapturePrefill;
+      unawaited(_handleRecapturePrefill());
+    }
     if (oldWidget.api.config.martinBaseUrl != widget.api.config.martinBaseUrl ||
         oldWidget.api.config.syncBaseUrl != widget.api.config.syncBaseUrl ||
         oldWidget.api.config.technicianId != widget.api.config.technicianId) {
@@ -263,6 +308,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     if (oldWidget.refreshTrigger != widget.refreshTrigger) {
       _syncPending();
       _loadAssignments(force: true);
+      unawaited(_loadStagingSpans());
       final anchor = _nodesFetchAnchor();
       if (_h3Streaming && anchor != null) {
         unawaited(
@@ -418,6 +464,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
             longitude: (row['longitude'] as num).toDouble(),
             tier: 'staging',
             layer: MapNodeLayer.queuedLocal,
+            assetKind: assetKindFromString(row['asset_kind'] as String?),
           ),
         );
         seen.add(mrid ?? 'local-$localId');
@@ -1005,6 +1052,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   void _setTool(MapTool tool) {
     setState(() {
       _tool = tool;
+      if (tool != MapTool.drawSpan) _spanSourceMrid = null;
       if (tool == MapTool.addPoint) {
         _followMe = false;
         _headingUp = false;
@@ -1035,6 +1083,26 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     if (isValidLatLng(center)) return center;
     return latLngIfValid(_position?.latitude, _position?.longitude) ??
         _defaultCenter;
+  }
+
+  Future<(LatLng point, String? snappedName)> _resolvePlacement(LatLng raw) async {
+    try {
+      final snap = await widget.api.fetchSnapPoint(
+        latitude: raw.latitude,
+        longitude: raw.longitude,
+        snapM: _snapMeters,
+      );
+      if (snap.snapped) {
+        return (
+          LatLng(snap.latitude, snap.longitude),
+          snap.snappedToName,
+        );
+      }
+    } catch (_) {
+      // fall back to local node snap
+    }
+    final (placed, snappedName) = _placementPoint(raw);
+    return (placed, snappedName);
   }
 
   (LatLng point, String? snappedName) _placementPoint(LatLng raw) {
@@ -1079,6 +1147,28 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     if (!isValidLatLng(point)) return;
     if (_tool == MapTool.addPoint) {
       _openCaptureForm(point);
+      return;
+    }
+    if (_tool == MapTool.drawSpan) {
+      final node = _nodeNear(point);
+      if (node == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Tap a pole or node to connect')),
+        );
+        return;
+      }
+      if (_spanSourceMrid == null) {
+        setState(() {
+          _spanSourceMrid = node.mrid;
+          _selectedNodeMrid = node.mrid;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('From ${node.name} — tap the next node')),
+        );
+        return;
+      }
+      if (_spanSourceMrid == node.mrid) return;
+      unawaited(_submitSpan(_spanSourceMrid!, node.mrid));
       return;
     }
     final node = _nodeNear(point);
@@ -1240,21 +1330,50 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     );
   }
 
-  Future<void> _openCaptureForm(LatLng rawPoint) async {
-    final (placed, snappedName) = _placementPoint(rawPoint);
+  Future<void> _submitSpan(String sourceId, String targetId) async {
+    final workOrderId = await CapturePreferences.activeWorkOrderId();
+    final ok = await _captureService.submitSpan(
+      sourceNodeId: sourceId,
+      targetNodeId: targetId,
+      workOrderId: workOrderId,
+    );
+    if (!mounted) return;
+    setState(() {
+      _spanSourceMrid = null;
+      _tool = MapTool.pan;
+      _selectedNodeMrid = null;
+    });
+    await _loadStagingSpans();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(ok ? 'Span saved to staging' : 'Span queued offline'),
+      ),
+    );
+  }
+
+  Future<void> _openCaptureForm(
+    LatLng rawPoint, {
+    CapturePrefill? prefill,
+  }) async {
+    final (placed, snappedName) = await _resolvePlacement(rawPoint);
     final result = await showModalBottomSheet<CaptureResult>(
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
       builder: (ctx) => FieldCaptureSheet(
+        api: widget.api,
         captureService: _captureService,
         latitude: placed.latitude,
         longitude: placed.longitude,
         snappedToName: snappedName,
+        gpsAccuracyM: _position?.accuracy,
+        assignments: _assignments,
+        prefill: prefill,
       ),
     );
     if (result != null && mounted) {
       await _refreshPendingCount();
+      unawaited(_loadStagingSpans());
       unawaited(
         _refreshH3Delta(
           FieldMapDeltaRequest(
@@ -1386,6 +1505,20 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
                         borderStrokeWidth: 2,
                         borderColor: Colors.white.withValues(alpha: 0.9),
                       ),
+                  ],
+                ),
+              if (_stagingSpans.isNotEmpty)
+                PolylineLayer(
+                  polylines: [
+                    for (final span in _stagingSpans)
+                      if (span.points.length >= 2)
+                        Polyline(
+                          points: span.points,
+                          color: Colors.orange.shade700.withValues(alpha: 0.9),
+                          strokeWidth: 4,
+                          borderStrokeWidth: 1.5,
+                          borderColor: Colors.white,
+                        ),
                   ],
                 ),
               MarkerLayer(
@@ -1546,6 +1679,24 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
                 ),
               ),
             ),
+          if (_tool == MapTool.drawSpan)
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: 88,
+              child: Card(
+                color: Colors.orange.shade50,
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Text(
+                    _spanSourceMrid == null
+                        ? 'Span mode: tap the first pole or node'
+                        : 'Tap the second node to save the span',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
+              ),
+            ),
 
           // Bottom toolbar (QField-style)
           Positioned(
@@ -1559,6 +1710,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
               loading: _loading,
               onPan: () => _setTool(MapTool.pan),
               onAdd: () => _setTool(MapTool.addPoint),
+              onDrawSpan: () => _setTool(MapTool.drawSpan),
               onLayers: _showLayers,
               onLocate: _centerOnMe,
               onRefresh: () {
@@ -1782,6 +1934,7 @@ class _MapToolbar extends StatelessWidget {
     required this.loading,
     required this.onPan,
     required this.onAdd,
+    required this.onDrawSpan,
     required this.onLayers,
     required this.onLocate,
     required this.onRefresh,
@@ -1793,6 +1946,7 @@ class _MapToolbar extends StatelessWidget {
   final bool loading;
   final VoidCallback onPan;
   final VoidCallback onAdd;
+  final VoidCallback onDrawSpan;
   final VoidCallback onLayers;
   final VoidCallback onLocate;
   final VoidCallback onRefresh;
@@ -1820,6 +1974,12 @@ class _MapToolbar extends StatelessWidget {
                 label: 'Add',
                 selected: tool == MapTool.addPoint,
                 onTap: onAdd,
+              ),
+              _ToolButton(
+                icon: Icons.timeline,
+                label: 'Span',
+                selected: tool == MapTool.drawSpan,
+                onTap: onDrawSpan,
               ),
               _ToolButton(
                 icon: Icons.layers,

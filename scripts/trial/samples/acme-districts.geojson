@@ -1,0 +1,46 @@
+{
+  "type": "FeatureCollection",
+  "name": "districts",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "district": "Tamale Metro", "region": "Northern" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-0.88, 9.32], [-0.86, 9.32], [-0.86, 9.34], [-0.88, 9.34], [-0.88, 9.32]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "district": "Savelugu", "region": "Northern" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-0.84, 9.30], [-0.82, 9.30], [-0.82, 9.32], [-0.84, 9.32], [-0.84, 9.30]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "district": "Accra Central", "region": "Greater Accra" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-0.20, 5.55], [-0.18, 5.55], [-0.18, 5.57], [-0.20, 5.57], [-0.20, 5.55]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "district": "Tema", "region": "Greater Accra" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-0.05, 5.65], [-0.03, 5.65], [-0.03, 5.67], [-0.05, 5.67], [-0.05, 5.65]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "district": "Cape Coast", "region": "Central" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-1.28, 5.10], [-1.26, 5.10], [-1.26, 5.12], [-1.28, 5.12], [-1.28, 5.10]]]
+      }
+    }
+  ]
+}

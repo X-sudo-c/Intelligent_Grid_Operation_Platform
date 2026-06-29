@@ -320,6 +320,7 @@ export function isGiopPortalTab(value: string): value is GiopPortalTab {
     'combined',
     'data-quality',
     'exports',
+    'references',
     'migration',
     'ocr',
     'insights',

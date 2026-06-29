@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import maplibregl from '../lib/maplibreSetup';
-import { MARTIN_URL, getAssetLocation, getH3Coverage } from '../api/giop-api';
+import { MARTIN_URL, getAssetLocation, getH3Coverage, probeGisOverviewAvailable, getReferenceMapConfig } from '../api/giop-api';
+import type { GiopReferenceMapLayerConfig } from '../api/giop-api';
 import type { GiopStagingAsset, GiopGraphChunkResponse, GiopFieldTechnician, GiopWorkOrder, GiopTopologyPayload } from '../api/giop-api';
 import { useGiopGraphChunk } from '../hooks/useGiopGraphChunk';
 import { chunkToNodeGeoJson, chunkToTracedNodeGeoJson } from '../lib/giopChunkGeoJson';
@@ -19,6 +20,7 @@ import {
   CHUNK_NODE_MIN_ZOOM,
   chunkNodeCirclePaint,
   MARTIN_REFRESH_SOURCE_IDS,
+  MARTIN_MASTER_REFRESH_SOURCE_IDS,
   martinLayerPath,
   MIN_MAP_ZOOM,
   NODE_DETAIL_ZOOM,
@@ -27,6 +29,15 @@ import {
   flyToNodeFocus,
   panToNodeFocus,
 } from '../lib/giopMapLayers';
+import {
+  applyReferenceMapConfig,
+  refreshReferenceBboxLayers,
+} from '../lib/giopReferenceMapLayers';
+import {
+  applyAllBoundaryVisibility,
+  boundaryHitLayerIds,
+  listBoundaryOverlayProducts,
+} from '../lib/giopReferenceBoundaryOverlays';
 import { refreshGiopMapIcons, registerGiopMapIcons } from '../lib/giopMapIcons';
 import { attachGiopMapHover } from '../lib/giopMapHover';
 import {
@@ -42,10 +53,8 @@ import {
   clearTerritoryHighlight as removeTerritoryHighlightLayers,
 } from '../lib/giopTerritoryHighlight';
 import {
-  ECG_BOUNDARY_HIT_LAYER_IDS,
   applyEcgBoundaryTheme,
   ecgBoundaryPopupHtml,
-  setEcgBoundaryVisibility,
   territoryFromBoundaryFeature,
 } from '../lib/giopBoundaries';
 import { GiopMapControlPanel } from './GiopMapControlPanel';
@@ -90,6 +99,9 @@ interface GiopMapViewProps {
 
 const DEFAULT_CENTER: [number, number] = [-0.2941, 5.6812];
 const EMPTY_FC = { type: 'FeatureCollection' as const, features: [] };
+
+/** Avoid re-probing Martin on every side-map remount (Show on map opens a fresh map). */
+let cachedGisOverviewAvailable: boolean | undefined;
 
 const H3_COVERAGE_FILL = 'h3-coverage-fill';
 const H3_COVERAGE_OUTLINE = 'h3-coverage-outline';
@@ -210,11 +222,15 @@ export function GiopMapView({
   const isLightModeRef = useRef(isLightMode);
   const [mapBusy, setMapBusy] = useState(true);
   const [mapZoom, setMapZoom] = useState(11);
+  const [gisOverviewAvailable, setGisOverviewAvailable] = useState<boolean | null>(() =>
+    cachedGisOverviewAvailable !== undefined ? cachedGisOverviewAvailable : null,
+  );
+  const [referenceMapConfig, setReferenceMapConfig] = useState<GiopReferenceMapLayerConfig[]>([]);
   const [zoomHintVisible, setZoomHintVisible] = useState(false);
   const hideZoomHintTimerRef = useRef<number | undefined>(undefined);
   const [showCoverage, setShowCoverage] = useState(false);
-  const [showBoundaries, setShowBoundaries] = useState(false);
-  const showBoundariesRef = useRef(false);
+  const [boundaryVisibility, setBoundaryVisibility] = useState<Record<string, boolean>>({});
+  const boundaryVisibilityRef = useRef(boundaryVisibility);
   const boundaryPopupRef = useRef<maplibregl.Popup | null>(null);
   const identifyPopupRef = useRef<maplibregl.Popup | null>(null);
   const [showWorkOrdersLayer, setShowWorkOrdersLayer] = useState(true);
@@ -230,7 +246,35 @@ export function GiopMapView({
   const chunk = streamGraphChunk ? internalChunk : graphChunkExternal;
 
   territoryActiveRef.current = territoryActive;
-  showBoundariesRef.current = showBoundaries;
+  boundaryVisibilityRef.current = boundaryVisibility;
+
+  const boundaryOverlayProducts = useMemo(
+    () => listBoundaryOverlayProducts(referenceMapConfig),
+    [referenceMapConfig],
+  );
+
+  const anyBoundaryVisible = useMemo(
+    () => boundaryOverlayProducts.some((p) => boundaryVisibility[p.slug]),
+    [boundaryOverlayProducts, boundaryVisibility],
+  );
+
+  const toggleBoundaryOverlay = useCallback((slug: string) => {
+    setBoundaryVisibility((prev) => ({ ...prev, [slug]: !prev[slug] }));
+  }, []);
+
+  useEffect(() => {
+    setBoundaryVisibility((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const product of boundaryOverlayProducts) {
+        if (!(product.slug in next)) {
+          next[product.slug] = false;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [boundaryOverlayProducts]);
 
   isLightModeRef.current = isLightMode;
 
@@ -278,6 +322,23 @@ export function GiopMapView({
   isLightModeRef.current = isLightMode;
 
   useEffect(() => {
+    const controller = new AbortController();
+    if (cachedGisOverviewAvailable !== undefined) {
+      setGisOverviewAvailable(cachedGisOverviewAvailable);
+    } else {
+      void probeGisOverviewAvailable(MARTIN_URL, controller.signal).then((available) => {
+        cachedGisOverviewAvailable = available;
+        setGisOverviewAvailable(available);
+      });
+    }
+    void getReferenceMapConfig()
+      .then(setReferenceMapConfig)
+      .catch(() => setReferenceMapConfig([]));
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    if (gisOverviewAvailable === null) return;
     if (!containerRef.current || mapRef.current) return;
 
     const light = isLightModeRef.current;
@@ -287,7 +348,7 @@ export function GiopMapView({
 
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: buildGiopMapStyle(MARTIN_URL, light),
+      style: buildGiopMapStyle(MARTIN_URL, light, { includeGisOverview: gisOverviewAvailable }),
       center: DEFAULT_CENTER,
       zoom: 13,
       minZoom: MIN_MAP_ZOOM,
@@ -334,7 +395,9 @@ export function GiopMapView({
     };
 
     const bindMartinClicks = () => {
-      for (const layerId of ['nodes', 'nodes-transformers-dt', 'nodes-transformers-pt'] as const) {
+      const nodeLayers = ['nodes'] as const;
+      const transformerLayers = ['nodes-transformers-dt', 'nodes-transformers-pt'] as const;
+      for (const layerId of gisOverviewAvailable ? [...nodeLayers, ...transformerLayers] : nodeLayers) {
         map.on('click', layerId, (e) => {
           handleNodeFeatureClickInit(e.features?.[0], e.lngLat, layerId);
         });
@@ -361,9 +424,6 @@ export function GiopMapView({
       bindMartinClicks();
       detachHover = attachGiopMapHover(map, host, () => isLightModeRef.current);
       detachPulse = attachGiopMapPulseLoop(map);
-      if (showBoundariesRef.current) {
-        setEcgBoundaryVisibility(map, true);
-      }
       resizeMap();
       markMapReady();
       revealZoomHint();
@@ -382,7 +442,7 @@ export function GiopMapView({
       map.remove();
       mapRef.current = null;
     };
-  }, []);
+  }, [gisOverviewAvailable]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -450,14 +510,87 @@ export function GiopMapView({
     if (!map || refreshToken === 0) return;
 
     const v = Date.now();
-    for (const id of MARTIN_REFRESH_SOURCE_IDS) {
+    const refreshIds = gisOverviewAvailable
+      ? MARTIN_REFRESH_SOURCE_IDS
+      : MARTIN_MASTER_REFRESH_SOURCE_IDS;
+    for (const id of refreshIds) {
       const src = map.getSource(id) as maplibregl.VectorTileSource | undefined;
       if (!src || typeof src.setTiles !== 'function') continue;
       const layer = martinLayerPath(id);
       src.setTiles([`${MARTIN_URL}/${layer}/{z}/{x}/{y}?v=${v}`]);
     }
     map.triggerRepaint();
+  }, [refreshToken, gisOverviewAvailable]);
+
+  useEffect(() => {
+    if (refreshToken === 0) return;
+    void getReferenceMapConfig()
+      .then(setReferenceMapConfig)
+      .catch(() => setReferenceMapConfig([]));
   }, [refreshToken]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || mapBusy || referenceMapConfig.length === 0) return;
+
+    const apply = () => {
+      void applyReferenceMapConfig(map, referenceMapConfig, isLightModeRef.current)
+        .then(() => {
+          applyAllBoundaryVisibility(map, boundaryVisibilityRef.current, referenceMapConfig);
+        })
+        .catch((err) => {
+          console.warn('[GiopMap] reference layer apply failed:', err);
+        });
+    };
+
+    if (map.isStyleLoaded()) apply();
+    else whenMapCanAddLayers(map, apply);
+  }, [referenceMapConfig, mapBusy, isLightMode]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || mapBusy) return;
+
+    const apply = () => applyAllBoundaryVisibility(map, boundaryVisibility, referenceMapConfig);
+    whenMapCanAddLayers(map, apply);
+    if (!anyBoundaryVisible) boundaryPopupRef.current?.remove();
+  }, [boundaryVisibility, referenceMapConfig, mapBusy, anyBoundaryVisible]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || mapBusy) return;
+    if (!referenceMapConfig.some((c) => c.render_mode === 'geojson_bbox')) return;
+
+    let debounceTimer: number | undefined;
+    const schedule = () => {
+      window.clearTimeout(debounceTimer);
+      debounceTimer = window.setTimeout(() => {
+        const bounds = map.getBounds();
+        void refreshReferenceBboxLayers(
+          map,
+          referenceMapConfig,
+          {
+            west: bounds.getWest(),
+            south: bounds.getSouth(),
+            east: bounds.getEast(),
+            north: bounds.getNorth(),
+          },
+          isLightModeRef.current,
+        ).catch((err) => {
+          console.warn('[GiopMap] reference bbox refresh failed:', err);
+        });
+      }, 300);
+    };
+
+    schedule();
+    map.on('moveend', schedule);
+    map.on('zoomend', schedule);
+    return () => {
+      window.clearTimeout(debounceTimer);
+      map.off('moveend', schedule);
+      map.off('zoomend', schedule);
+    };
+  }, [referenceMapConfig, mapBusy, isLightMode]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -670,12 +803,14 @@ export function GiopMapView({
   // Camera moves only on explicit focusOnMap requests — not selection/staging churn.
   useEffect(() => {
     if (territoryActive || !focusMrid) return;
+    if (gisOverviewAvailable === null || mapBusy) return;
 
     const req = focusCameraRequest;
     if (!req || req.mrid !== focusMrid) return;
     if (req.id <= handledCameraRequestIdRef.current) return;
 
-    const coords = normalizeMapCoordinates(focusCoordinates);
+    const coords =
+      normalizeMapCoordinates(req.coordinates) ?? normalizeMapCoordinates(focusCoordinates);
     if (!coords) return;
 
     const map = mapRef.current;
@@ -711,12 +846,21 @@ export function GiopMapView({
     return () => {
       map.off('load', onLoad);
     };
-  }, [focusCameraRequest, focusMrid, focusCoordinates, territoryActive, clearFocusCamera]);
+  }, [
+    focusCameraRequest,
+    focusMrid,
+    focusCoordinates,
+    territoryActive,
+    clearFocusCamera,
+    gisOverviewAvailable,
+    mapBusy,
+  ]);
 
   useEffect(() => {
     const cmd = mapViewportCommand;
     if (!cmd) return;
     if (cmd.id <= handledViewportCommandIdRef.current) return;
+    if (gisOverviewAvailable === null || mapBusy) return;
 
     const map = mapRef.current;
     if (!map) return;
@@ -740,7 +884,7 @@ export function GiopMapView({
       return;
     }
     map.once('load', perform);
-  }, [mapViewportCommand, clearMapViewportCommand]);
+  }, [mapViewportCommand, clearMapViewportCommand, gisOverviewAvailable, mapBusy]);
 
   // Work-order dispatch pins (FR-012 map overlay).
   useEffect(() => {
@@ -931,7 +1075,9 @@ export function GiopMapView({
   // Side-map identify: pulse the focused asset so stewards can spot it on the map.
   useEffect(() => {
     const map = mapRef.current;
-    if (!map) return;
+    if (!map || gisOverviewAvailable === null || mapBusy) {
+      return () => {};
+    }
 
     const sourceId = 'focus-identify';
     const rippleLayerIds = ['focus-identify-pulse', 'focus-identify-pulse-2'] as const;
@@ -1064,7 +1210,7 @@ export function GiopMapView({
       cancelPendingApply?.();
       teardown();
     };
-  }, [pulseFocus, focusMrid, focusCoordinates, focusLabel]);
+  }, [pulseFocus, focusMrid, focusCoordinates, focusLabel, gisOverviewAvailable, mapBusy]);
 
   // De-emphasise neighbouring poles while side-map identify is active.
   useEffect(() => {
@@ -1206,17 +1352,8 @@ export function GiopMapView({
   }, [showCoverage]);
 
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-
-    const applyVisibility = () => setEcgBoundaryVisibility(map, showBoundaries);
-    whenMapCanAddLayers(map, applyVisibility);
-    if (!showBoundaries) boundaryPopupRef.current?.remove();
-  }, [showBoundaries, mapBusy]);
-
-  useEffect(() => {
     if (territoryHighlight) {
-      setShowBoundaries(true);
+      setBoundaryVisibility((prev) => ({ ...prev, 'ecg-admin-boundaries': true }));
     }
   }, [territoryHighlight]);
 
@@ -1259,9 +1396,9 @@ export function GiopMapView({
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || !showBoundaries) return;
+    if (!map || !anyBoundaryVisible) return;
 
-    const boundaryHitLayers = [...ECG_BOUNDARY_HIT_LAYER_IDS];
+    const boundaryHitLayers = boundaryHitLayerIds(boundaryVisibility, referenceMapConfig);
 
     const onClick = (e: maplibregl.MapLayerMouseEvent) => {
       if (territoryActiveRef.current) return;
@@ -1303,7 +1440,7 @@ export function GiopMapView({
         map.off('mouseleave', layerId, onLeave);
       }
     };
-  }, [showBoundaries]);
+  }, [anyBoundaryVisible, boundaryVisibility, referenceMapConfig]);
 
   return (
     <GiopTerritoryProvider
@@ -1364,16 +1501,16 @@ export function GiopMapView({
               ],
             },
             {
-              label: 'Context',
+              label: 'Overlays',
               toggles: [
-                {
-                  id: 'boundaries',
-                  label: 'Boundaries',
+                ...boundaryOverlayProducts.map((product) => ({
+                  id: product.slug,
+                  label: product.display_name,
                   color: '#0ea5e9',
-                  active: showBoundaries,
-                  onToggle: () => setShowBoundaries((v) => !v),
-                  hint: 'Toggle ECG boundaries — regions when zoomed out, districts when zoomed in',
-                },
+                  active: Boolean(boundaryVisibility[product.slug]),
+                  onToggle: () => toggleBoundaryOverlay(product.slug),
+                  hint: product.hint,
+                })),
                 {
                   id: 'coverage',
                   label: 'Rebuild coverage',
@@ -1391,7 +1528,8 @@ export function GiopMapView({
           isLightMode={isLightMode}
           mapRef={mapRef}
           mapZoom={mapZoom}
-          mapReady={!mapBusy}
+          mapReady={!mapBusy && gisOverviewAvailable !== null}
+          includeGisOverview={gisOverviewAvailable === true}
         />
       </div>
     </GiopTerritoryProvider>

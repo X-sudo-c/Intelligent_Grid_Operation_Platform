@@ -15,13 +15,15 @@ class OfflineDb {
     final dbPath = await getDatabasesPath();
     _db = await openDatabase(
       join(dbPath, 'giop_field.db'),
-      version: 8,
+      version: 10,
         onCreate: (db, version) async {
         await _createV1Tables(db);
         await _createCacheTable(db);
         await _createV3Tables(db);
         await _createV5Tables(db);
         await _createV6Tables(db);
+        await _createV9Columns(db);
+        await _createV10Tables(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -45,6 +47,12 @@ class OfflineDb {
         if (oldVersion < 8) {
           await _createV8Columns(db);
         }
+        if (oldVersion < 9) {
+          await _createV9Columns(db);
+        }
+        if (oldVersion < 10) {
+          await _createV10Columns(db);
+        }
       },
     );
     return _db!;
@@ -58,6 +66,7 @@ class OfflineDb {
         name TEXT NOT NULL,
         longitude REAL NOT NULL,
         latitude REAL NOT NULL,
+        asset_kind TEXT NOT NULL DEFAULT 'pole_lv',
         validation TEXT DEFAULT 'PENDING_FIELD',
         is_dirty INTEGER NOT NULL DEFAULT 1,
         captured_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -195,6 +204,42 @@ class OfflineDb {
     }
   }
 
+  static Future<void> _createV9Columns(Database db) async {
+    try {
+      await db.execute(
+        "ALTER TABLE field_captured_assets ADD COLUMN asset_kind TEXT NOT NULL DEFAULT 'pole_lv'",
+      );
+    } catch (_) {
+      // column may already exist
+    }
+  }
+
+  static Future<void> _createV10Columns(Database db) async {
+    for (final sql in [
+      "ALTER TABLE field_captured_assets ADD COLUMN work_order_id TEXT",
+      "ALTER TABLE field_captured_assets ADD COLUMN photo_path TEXT",
+    ]) {
+      try {
+        await db.execute(sql);
+      } catch (_) {}
+    }
+  }
+
+  static Future<void> _createV10Tables(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS field_spans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_node_id TEXT NOT NULL,
+        target_node_id TEXT NOT NULL,
+        boundary_feeder_id TEXT,
+        work_order_id TEXT,
+        name TEXT,
+        is_dirty INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    ''');
+  }
+
   static Future<void> _createV6Tables(Database db) async {
     await db.execute('''
       CREATE TABLE IF NOT EXISTS cached_node_topology (
@@ -213,6 +258,9 @@ class OfflineDb {
     required double longitude,
     required double latitude,
     String? mrid,
+    String assetKind = 'pole_lv',
+    String? workOrderId,
+    String? photoPath,
   }) async {
     final db = await instance();
     final sessionAt = DateTime.now().toUtc().toIso8601String();
@@ -221,10 +269,51 @@ class OfflineDb {
       'longitude': longitude,
       'latitude': latitude,
       'mrid': mrid,
+      'asset_kind': assetKind,
+      'work_order_id': workOrderId,
+      'photo_path': photoPath,
       'is_dirty': 1,
       'offline_session_started_at': sessionAt,
       'sync_status': 'PENDING',
     });
+  }
+
+  static Future<int> queueFieldSpan({
+    required String sourceNodeId,
+    required String targetNodeId,
+    String? boundaryFeederId,
+    String? workOrderId,
+    String? name,
+  }) async {
+    final db = await instance();
+    return db.insert('field_spans', {
+      'source_node_id': sourceNodeId,
+      'target_node_id': targetNodeId,
+      'boundary_feeder_id': boundaryFeederId,
+      'work_order_id': workOrderId,
+      'name': name,
+      'is_dirty': 1,
+    });
+  }
+
+  static Future<List<Map<String, dynamic>>> pendingSpans() async {
+    final db = await instance();
+    return db.query(
+      'field_spans',
+      where: 'is_dirty = ?',
+      whereArgs: [1],
+      orderBy: 'id ASC',
+    );
+  }
+
+  static Future<void> markSpanSynced(int id) async {
+    final db = await instance();
+    await db.update(
+      'field_spans',
+      {'is_dirty': 0},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
   }
 
   static Future<List<Map<String, dynamic>>> pendingCaptures() async {

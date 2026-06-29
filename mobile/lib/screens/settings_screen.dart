@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../config/api_config.dart';
+import '../services/capture_preferences.dart';
 import '../services/giop_api.dart';
 import '../services/settings_service.dart';
 
@@ -30,10 +31,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String? _message;
   String? _testResult;
   bool _testing = false;
+  bool _enforceHex = true;
 
   @override
   void initState() {
     super.initState();
+    CapturePreferences.enforceHexAssignment().then((v) {
+      if (mounted) setState(() => _enforceHex = v);
+    });
     _syncController = TextEditingController(text: widget.config.syncBaseUrl);
     _ocrController = TextEditingController(text: widget.config.ocrBaseUrl);
     _supabaseController = TextEditingController(text: widget.config.supabaseUrl);
@@ -233,6 +238,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
           const SizedBox(height: 16),
+          SwitchListTile(
+            title: const Text('Require capture inside assigned hex'),
+            subtitle: const Text('Block saves outside your work area'),
+            value: _enforceHex,
+            onChanged: (v) async {
+              await CapturePreferences.setEnforceHexAssignment(v);
+              setState(() => _enforceHex = v);
+            },
+          ),
+          const SizedBox(height: 8),
           FilledButton(onPressed: _save, child: const Text('Save')),
           if (_message != null) ...[
             const SizedBox(height: 12),

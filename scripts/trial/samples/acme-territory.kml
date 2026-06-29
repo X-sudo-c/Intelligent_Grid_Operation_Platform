@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>territory</name>
+    <Placemark>
+      <name>Takoradi</name>
+      <ExtendedData>
+        <Data name="district"><value>Takoradi</value></Data>
+        <Data name="region"><value>Western</value></Data>
+      </ExtendedData>
+      <Polygon>
+        <outerBoundaryIs>
+          <LinearRing>
+            <coordinates>-1.78,4.88 -1.76,4.88 -1.76,4.90 -1.78,4.90 -1.78,4.88</coordinates>
+          </LinearRing>
+        </outerBoundaryIs>
+      </Polygon>
+    </Placemark>
+    <Placemark>
+      <name>Sekondi</name>
+      <ExtendedData>
+        <Data name="district"><value>Sekondi</value></Data>
+        <Data name="region"><value>Western</value></Data>
+      </ExtendedData>
+      <Polygon>
+        <outerBoundaryIs>
+          <LinearRing>
+            <coordinates>-1.74,4.92 -1.72,4.92 -1.72,4.94 -1.74,4.94 -1.74,4.92</coordinates>
+          </LinearRing>
+        </outerBoundaryIs>
+      </Polygon>
+    </Placemark>
+    <Placemark>
+      <name>Kumasi Central</name>
+      <ExtendedData>
+        <Data name="district"><value>Kumasi Central</value></Data>
+        <Data name="region"><value>Ashanti</value></Data>
+      </ExtendedData>
+      <Polygon>
+        <outerBoundaryIs>
+          <LinearRing>
+            <coordinates>-1.63,6.68 -1.61,6.68 -1.61,6.70 -1.63,6.70 -1.63,6.68</coordinates>
+          </LinearRing>
+        </outerBoundaryIs>
+      </Polygon>
+    </Placemark>
+  </Document>
+</kml>

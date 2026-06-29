@@ -1,8 +1,23 @@
 -- Revert map_connectivity_nodes to a lightweight view (Martin hangs on 924k-row joined view).
 -- Transformer map icons use gis.distribution_transformer + gis.power_transformer sources instead.
 
-DROP MATERIALIZED VIEW IF EXISTS public.map_connectivity_nodes;
-DROP VIEW IF EXISTS public.map_connectivity_nodes;
+DO $drop$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relname = 'map_connectivity_nodes' AND c.relkind = 'm'
+  ) THEN
+    EXECUTE 'DROP MATERIALIZED VIEW public.map_connectivity_nodes';
+  ELSIF EXISTS (
+    SELECT 1 FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relname = 'map_connectivity_nodes' AND c.relkind = 'v'
+  ) THEN
+    EXECUTE 'DROP VIEW public.map_connectivity_nodes';
+  END IF;
+END
+$drop$;
 
 CREATE OR REPLACE VIEW public.map_connectivity_nodes AS
 SELECT

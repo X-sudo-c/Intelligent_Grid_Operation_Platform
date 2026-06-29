@@ -374,7 +374,8 @@ def get_job(conn, job_id: str) -> dict[str, Any] | None:
                    storage_bucket, storage_path, layers,
                    clip_west, clip_south, clip_east, clip_north,
                    feature_count, error_message, requested_by,
-                   created_at, started_at, completed_at
+                   created_at, started_at, completed_at,
+                   import_config
             FROM public.gis_transfer_jobs
             WHERE id = %s::uuid
             """,
@@ -405,6 +406,7 @@ def get_job(conn, job_id: str) -> dict[str, Any] | None:
         "created_at": row[14].isoformat() if row[14] else None,
         "started_at": row[15].isoformat() if row[15] else None,
         "completed_at": row[16].isoformat() if row[16] else None,
+        "import_config": row[17] if len(row) > 17 else None,
     }
 
 

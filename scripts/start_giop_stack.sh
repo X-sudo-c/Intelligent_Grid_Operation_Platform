@@ -230,8 +230,23 @@ ensure_supabase() {
     return 1
   fi
 
-  start "Supabase (npx supabase start)"
-  (cd "$ROOT" && npx supabase start) >>"$LOG_DIR/supabase.log" 2>&1 || true
+  local supabase_cli="${SUPABASE_CLI:-$ROOT/.tools/supabase/supabase}"
+  if [[ ! -x "$supabase_cli" ]]; then
+  if [[ -x "$ROOT/scripts/ensure_supabase_cli.sh" ]]; then
+    start "Supabase CLI (ensure_supabase_cli.sh)"
+    bash "$ROOT/scripts/ensure_supabase_cli.sh" >>"$LOG_DIR/supabase.log" 2>&1 || true
+    supabase_cli="${SUPABASE_CLI:-$ROOT/.tools/supabase/supabase}"
+  fi
+  fi
+
+  if [[ ! -x "$supabase_cli" ]]; then
+    fail "Supabase CLI missing — run ./scripts/ensure_supabase_cli.sh"
+    record "Supabase" "failed" "CLI missing (npx broken on Node 24+)"
+    return 1
+  fi
+
+  start "Supabase ($supabase_cli start)"
+  (cd "$ROOT" && "$supabase_cli" start) >>"$LOG_DIR/supabase.log" 2>&1 || true
 
   local i
   for i in $(seq 1 30); do

@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import 'config/api_config.dart';
+import 'models/capture_prefill.dart';
 import 'screens/map_screen.dart';
 import 'screens/meter_screen.dart';
 import 'screens/settings_screen.dart';
@@ -113,6 +114,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   int _index = 0;
   int _mapRefreshTrigger = 0;
   int _rejectionBadge = 0;
+  CapturePrefill? _recapturePrefill;
   RejectionNotificationService? _rejectionNotifications;
   final _scaffoldKey = GlobalKey<ScaffoldMessengerState>();
 
@@ -157,11 +159,36 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       SnackBar(
         content: Text('Rejected: $label'),
         action: SnackBarAction(
-          label: 'Work',
-          onPressed: () => setState(() => _index = 1),
+          label: 'Fix',
+          onPressed: () {
+            if (notification.mrid != null) {
+              _openRecapture(TechnicianSubmission(
+                mrid: notification.mrid!,
+                name: notification.name ?? '',
+                validation: 'REJECTED',
+                latitude: notification.latitude,
+                longitude: notification.longitude,
+              ));
+            } else {
+              setState(() => _index = 1);
+            }
+          },
         ),
       ),
     );
+  }
+
+  void _openRecapture(TechnicianSubmission item) {
+    setState(() {
+      _recapturePrefill = CapturePrefill(
+        recaptureMrid: item.mrid,
+        name: item.name,
+        latitude: item.latitude,
+        longitude: item.longitude,
+      );
+      _index = 0;
+      _mapRefreshTrigger++;
+    });
   }
 
   void _clearRejectionBadge() {
@@ -188,8 +215,19 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       MapScreen(
         api: widget.api,
         refreshTrigger: _mapRefreshTrigger,
+        recapturePrefill: _recapturePrefill,
+        onRecaptureConsumed: () => setState(() => _recapturePrefill = null),
       ),
-      WorkOrdersScreen(api: widget.api),
+      WorkOrdersScreen(
+        api: widget.api,
+        onFixRejected: _openRecapture,
+        onSelectWorkOrder: (id, feederMrid) {
+          setState(() {
+            _index = 0;
+            _mapRefreshTrigger++;
+          });
+        },
+      ),
       MeterScreen(api: widget.api),
       SettingsScreen(
         config: widget.config,

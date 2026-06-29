@@ -5,16 +5,21 @@ import {
   getLogTail,
   getMemgraphBootstrapStatus,
   getObservability,
+  getSupertonicStatus,
+  getTrialStatus,
   memgraphBootstrapStreamUrl,
   observabilityStreamUrl,
   restartService,
   startService,
   startStack,
   stopService,
+  supertonicStartStreamUrl,
+  trialRunStreamUrl,
   verifyMapTiles,
   type LogTail,
   type ObservabilitySnapshot,
   type ServiceStatus,
+  type TrialRunParams,
 } from './api';
 import { ActionButton, LogFab, LogPanel, StatusToast, type LogPanelState } from './LogPanel';
 
@@ -30,6 +35,22 @@ function currentBootstrapLines(lines: string[]): string[] {
   let start = 0;
   lines.forEach((line, index) => {
     if (line.startsWith('--- bootstrap ')) start = index;
+  });
+  return lines.slice(start);
+}
+
+function currentTrialLines(lines: string[]): string[] {
+  let start = 0;
+  lines.forEach((line, index) => {
+    if (line.startsWith('--- trial ')) start = index;
+  });
+  return lines.slice(start);
+}
+
+function currentSupertonicLines(lines: string[]): string[] {
+  let start = 0;
+  lines.forEach((line, index) => {
+    if (line.startsWith('--- supertonic ')) start = index;
   });
   return lines.slice(start);
 }
@@ -80,12 +101,28 @@ export function App() {
   const [activityLines, setActivityLines] = useState<string[]>([]);
   const [bootstrapLines, setBootstrapLines] = useState<string[]>([]);
   const [bootstrapRunning, setBootstrapRunning] = useState(false);
+  const [trialLines, setTrialLines] = useState<string[]>([]);
+  const [trialRunning, setTrialRunning] = useState(false);
+  const [trialAction, setTrialAction] = useState<string | null>(null);
+  const [supertonicLines, setSupertonicLines] = useState<string[]>([]);
+  const [supertonicRunning, setSupertonicRunning] = useState(false);
+  const [simulateCount, setSimulateCount] = useState(20);
+  const [prepEmptyMaster, setPrepEmptyMaster] = useState(false);
+  const [prepFreshStaging, setPrepFreshStaging] = useState(false);
+  const [simulateValidation, setSimulateValidation] = useState(false);
   const prevOverall = useRef<string | null>(null);
   const bootstrapSource = useRef<EventSource | null>(null);
+  const trialSource = useRef<EventSource | null>(null);
+  const supertonicSource = useRef<EventSource | null>(null);
   const refreshInFlight = useRef(false);
 
   const hasActiveTask =
-    manualRefreshing || pendingAction !== null || busyService !== null || bootstrapRunning;
+    manualRefreshing ||
+    pendingAction !== null ||
+    busyService !== null ||
+    bootstrapRunning ||
+    trialRunning ||
+    supertonicRunning;
 
   const openLogPanel = useCallback((logName?: string | null) => {
     setLogPanel((p) => ({ ...p, open: true, minimized: false }));
@@ -315,6 +352,230 @@ export function App() {
     };
   }, [bootstrapRunning, refreshSnapshot, openLogPanel, pushActivity]);
 
+  useEffect(() => {
+    if (!logPanel.open || trialLines.length === 0) return;
+    setActivityLines((prev) => {
+      const stamped = trialLines.map((l) => (l.startsWith('--- trial ') ? stamp(l) : l));
+      const merged = [...prev.filter((l) => !l.includes('--- trial ')), ...stamped].slice(-200);
+      return merged;
+    });
+  }, [trialLines, logPanel.open]);
+
+  useEffect(() => {
+    void getTrialStatus()
+      .then((s) => {
+        if (!s.running) return;
+        setTrialRunning(true);
+        setTrialAction(s.action);
+        setMessage(`Trial ${s.action ?? 'job'} in progress…`);
+        return getLogTail(s.log_name, 80).then((t) =>
+          setTrialLines(currentTrialLines(t.lines)),
+        );
+      })
+      .catch(() => {});
+    return () => trialSource.current?.close();
+  }, []);
+
+  useEffect(() => {
+    if (!trialRunning) return;
+    const id = window.setInterval(() => {
+      void getTrialStatus().then((s) => {
+        if (s.running) {
+          void getLogTail(s.log_name, 80).then((t) =>
+            setTrialLines(currentTrialLines(t.lines)),
+          );
+        } else {
+          setTrialRunning(false);
+          setTrialAction(null);
+          void refreshSnapshot();
+        }
+      });
+    }, 3000);
+    return () => window.clearInterval(id);
+  }, [trialRunning, refreshSnapshot]);
+
+  const runTrialJob = useCallback(
+    (params: TrialRunParams, label: string, needsConfirm = false) => {
+      if (trialRunning) return;
+      if (needsConfirm && !window.confirm(`${label} — this cannot be undone. Continue?`)) return;
+
+      setTrialLines([]);
+      setTrialRunning(true);
+      setTrialAction(params.action);
+      setMessage(`${label}…`);
+      pushActivity(`${label} started`);
+      openLogPanel('trial-ops.log');
+      trialSource.current?.close();
+
+      const es = new EventSource(trialRunStreamUrl({ ...params, confirm: needsConfirm || params.confirm }));
+      trialSource.current = es;
+
+      es.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data) as {
+            type: string;
+            text?: string;
+            exit_code?: number;
+            action?: string;
+          };
+          if (data.type === 'line' && data.text) {
+            setTrialLines((prev) => {
+              if (data.text!.startsWith('--- trial ')) return [data.text!];
+              return [...currentTrialLines(prev).slice(-400), data.text!];
+            });
+          } else if (data.type === 'done') {
+            setTrialRunning(false);
+            setTrialAction(null);
+            es.close();
+            const doneMsg =
+              data.exit_code === 0 ? `${label} done` : `${label} failed (exit ${data.exit_code})`;
+            setMessage(doneMsg);
+            pushActivity(doneMsg);
+            void refreshSnapshot();
+          } else if (data.type === 'error') {
+            setTrialRunning(false);
+            setTrialAction(null);
+            es.close();
+            const errMsg = data.text ?? `${label} failed`;
+            setMessage(errMsg);
+            pushActivity(errMsg);
+          }
+        } catch {
+          /* ignore malformed SSE */
+        }
+      };
+
+      es.onerror = () => {
+        es.close();
+        void getTrialStatus().then((s) => {
+          if (s.running) {
+            setTrialRunning(true);
+            setTrialAction(s.action);
+            setMessage(`Trial ${s.action ?? 'job'} running — reconnect or wait`);
+            void getLogTail(s.log_name, 80).then((t) =>
+              setTrialLines(currentTrialLines(t.lines)),
+            );
+          } else {
+            setTrialRunning(false);
+            setTrialAction(null);
+            setMessage(`${label} finished`);
+            void refreshSnapshot();
+          }
+        });
+      };
+    },
+    [trialRunning, refreshSnapshot, openLogPanel, pushActivity],
+  );
+
+  useEffect(() => {
+    if (!logPanel.open || supertonicLines.length === 0) return;
+    setActivityLines((prev) => {
+      const stamped = supertonicLines.map((l) =>
+        l.startsWith('--- supertonic ') ? stamp(l) : l,
+      );
+      const merged = [...prev.filter((l) => !l.includes('--- supertonic ')), ...stamped].slice(-200);
+      return merged;
+    });
+  }, [supertonicLines, logPanel.open]);
+
+  useEffect(() => {
+    void getSupertonicStatus()
+      .then((s) => {
+        if (!s.start_job_running && s.phase === 'ready') return;
+        if (!s.start_job_running && s.phase === 'down') return;
+        setSupertonicRunning(Boolean(s.start_job_running) || s.phase === 'starting' || s.phase === 'warming');
+        if (s.start_job_running || s.phase !== 'down') {
+          setMessage(`Supertonic ${s.phase}…`);
+          return getLogTail(s.log_name, 80).then((t) =>
+            setSupertonicLines(currentSupertonicLines(t.lines)),
+          );
+        }
+      })
+      .catch(() => {});
+    return () => supertonicSource.current?.close();
+  }, []);
+
+  useEffect(() => {
+    if (!supertonicRunning) return;
+    const id = window.setInterval(() => {
+      void getSupertonicStatus().then((s) => {
+        if (s.start_job_running || s.phase === 'starting' || s.phase === 'warming') {
+          void getLogTail(s.log_name, 80).then((t) =>
+            setSupertonicLines(currentSupertonicLines(t.lines)),
+          );
+        } else {
+          setSupertonicRunning(false);
+          void refreshSnapshot();
+        }
+      });
+    }, 3000);
+    return () => window.clearInterval(id);
+  }, [supertonicRunning, refreshSnapshot]);
+
+  const runSupertonicStart = useCallback(() => {
+    if (supertonicRunning) return;
+    setSupertonicLines([]);
+    setSupertonicRunning(true);
+    setMessage('Starting Supertonic…');
+    pushActivity('Supertonic start');
+    openLogPanel('supertonic.log');
+    supertonicSource.current?.close();
+
+    const es = new EventSource(supertonicStartStreamUrl());
+    supertonicSource.current = es;
+
+    es.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data) as {
+          type: string;
+          text?: string;
+          exit_code?: number;
+          phase?: string;
+        };
+        if (data.type === 'line' && data.text) {
+          setSupertonicLines((prev) => {
+            if (data.text!.startsWith('--- supertonic ')) return [data.text!];
+            return [...currentSupertonicLines(prev).slice(-400), data.text!];
+          });
+        } else if (data.type === 'done') {
+          setSupertonicRunning(false);
+          es.close();
+          const doneMsg =
+            data.exit_code === 0 && data.phase === 'ready'
+              ? 'Supertonic ready'
+              : `Supertonic finished (exit ${data.exit_code}, phase ${data.phase ?? '?'})`;
+          setMessage(doneMsg);
+          pushActivity(doneMsg);
+          void refreshSnapshot();
+        } else if (data.type === 'error') {
+          setSupertonicRunning(false);
+          es.close();
+          const errMsg = data.text ?? 'Supertonic start failed';
+          setMessage(errMsg);
+          pushActivity(errMsg);
+        }
+      } catch {
+        /* ignore malformed SSE */
+      }
+    };
+
+    es.onerror = () => {
+      es.close();
+      void getSupertonicStatus().then((s) => {
+        if (s.start_job_running || s.phase === 'starting' || s.phase === 'warming') {
+          setSupertonicRunning(true);
+          setMessage(`Supertonic ${s.phase} — check log panel`);
+          void getLogTail(s.log_name, 80).then((t) =>
+            setSupertonicLines(currentSupertonicLines(t.lines)),
+          );
+        } else {
+          setSupertonicRunning(false);
+          void refreshSnapshot();
+        }
+      });
+    };
+  }, [supertonicRunning, refreshSnapshot, openLogPanel, pushActivity]);
+
   const requestNotifications = async () => {
     if (typeof Notification === 'undefined') return;
     await Notification.requestPermission();
@@ -385,6 +646,7 @@ export function App() {
   const voiceTtsCheck = snapshot?.voice_tts;
   const dataPlane = snapshot?.data_plane;
   const mapTiles = snapshot?.map_tiles;
+  const trialCheck = snapshot?.trial;
   const logFiles = snapshot?.logs ?? [];
   const applied = new Set(migrations?.applied.map((a) => a.version) ?? []);
 
@@ -601,7 +863,8 @@ export function App() {
                   <>
                     <p className="text-lg font-semibold text-emerald-400">TTS ready</p>
                     <p className="text-xs text-slate-500 mt-2">
-                      Port {voiceTtsCheck.port ?? 7788} · GIOP copilot spoken replies
+                      Port {voiceTtsCheck.port ?? 7788}
+                      {voiceTtsCheck.pid ? ` · pid ${voiceTtsCheck.pid}` : ''}
                     </p>
                     {voiceTtsCheck.voice_api?.stt?.available === false && (
                       <p className="text-xs text-amber-500 mt-1">
@@ -613,6 +876,23 @@ export function App() {
                         sync-service cannot reach Supertonic — check SUPERTONIC_URL in .env
                       </p>
                     )}
+                    <div className="flex flex-wrap gap-2 mt-3">
+                      <ActionButton
+                        label="View log"
+                        color="slate"
+                        onClick={() => openLogPanel('supertonic.log')}
+                        className="text-xs px-3 py-1.5"
+                      />
+                      <ActionButton
+                        label="Restart"
+                        loadingLabel="Restarting…"
+                        loading={supertonicRunning || (busyService?.id === 'supertonic' && busyService.action === 'restart')}
+                        disabled={supertonicRunning}
+                        color="amber"
+                        onClick={() => void serviceAction('supertonic', 'restart')}
+                        className="text-xs px-3 py-1.5"
+                      />
+                    </div>
                   </>
                 ) : (
                   <>
@@ -621,20 +901,40 @@ export function App() {
                         CHECK_COLORS[voiceTtsCheck?.status ?? ''] ?? 'text-slate-300'
                       }`}
                     >
-                      {voiceTtsCheck?.status ?? 'unknown'}
+                      {voiceTtsCheck?.phase && voiceTtsCheck.phase !== 'down'
+                        ? voiceTtsCheck.phase
+                        : voiceTtsCheck?.status ?? 'unknown'}
                     </p>
+                    {voiceTtsCheck?.installed === false && (
+                      <p className="text-xs text-amber-500 mt-1">
+                        Package not installed yet — first start runs pip install supertonic[serve]
+                      </p>
+                    )}
                     {voiceTtsCheck?.hint && (
                       <p className="text-xs text-amber-500 mt-1">{voiceTtsCheck.hint}</p>
                     )}
-                    <ActionButton
-                      label="Start Supertonic"
-                      loadingLabel="Starting…"
-                      loading={busyService?.id === 'supertonic' && busyService.action === 'start'}
-                      disabled={busyService?.id === 'supertonic'}
-                      color="cyan"
-                      onClick={() => void serviceAction('supertonic', 'start')}
-                      className="mt-3 text-xs px-3 py-1.5"
-                    />
+                    {voiceTtsCheck?.log_tail && voiceTtsCheck.log_tail.length > 0 && (
+                      <p className="text-xs text-slate-500 mt-2 font-mono truncate" title={voiceTtsCheck.log_tail.join('\n')}>
+                        {voiceTtsCheck.log_tail[voiceTtsCheck.log_tail.length - 1]}
+                      </p>
+                    )}
+                    <div className="flex flex-wrap gap-2 mt-3">
+                      <ActionButton
+                        label="Start Supertonic"
+                        loadingLabel="Starting…"
+                        loading={supertonicRunning}
+                        disabled={supertonicRunning}
+                        color="cyan"
+                        onClick={() => runSupertonicStart()}
+                        className="text-xs px-3 py-1.5"
+                      />
+                      <ActionButton
+                        label="View log"
+                        color="slate"
+                        onClick={() => openLogPanel('supertonic.log')}
+                        className="text-xs px-3 py-1.5"
+                      />
+                    </div>
                   </>
                 )}
               </ObsCard>
@@ -720,6 +1020,188 @@ export function App() {
           </section>
         )}
 
+        {trialCheck && (
+          <section className="rounded-xl border border-violet-900/50 bg-violet-950/20 p-5">
+            <div className="flex flex-wrap items-start justify-between gap-4 mb-4">
+              <div>
+                <h2 className="text-sm font-semibold text-violet-200 uppercase tracking-wider">
+                  Field trial ops
+                </h2>
+                <p className="text-xs text-slate-500 mt-1">
+                  Backup, empty master, simulate field captures, restore — dev/local only
+                </p>
+              </div>
+              {trialRunning && (
+                <span className="text-xs text-amber-400 animate-pulse">
+                  Running: {trialAction ?? 'trial job'}…
+                </span>
+              )}
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 mb-4">
+              <ObsCard title="Master network">
+                <p className="text-lg font-semibold text-slate-200">
+                  {trialCheck.counts?.connectivity_nodes?.toLocaleString() ?? '—'} nodes
+                </p>
+                <p className="text-xs text-slate-500 mt-1">
+                  {trialCheck.counts?.ac_line_segments?.toLocaleString() ?? '—'} lines
+                </p>
+              </ObsCard>
+              <ObsCard title="Staging">
+                <p className="text-lg font-semibold text-slate-200">
+                  {trialCheck.counts?.staging_identified_objects?.toLocaleString() ?? '—'} captures
+                </p>
+                <p className="text-xs text-slate-500 mt-1">
+                  DQ open: {trialCheck.counts?.dq_exceptions_open?.toLocaleString() ?? '—'}
+                </p>
+              </ObsCard>
+              <ObsCard title="Latest backup">
+                {trialCheck.latest_backup ? (
+                  <>
+                    <p className="text-sm font-mono text-emerald-400 truncate" title={trialCheck.latest_backup}>
+                      {trialCheck.latest_backup.split('/').pop()}
+                    </p>
+                    <p className="text-xs text-slate-500 mt-1">
+                      {trialCheck.backup_count ?? 0} dump(s) on disk
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-xs text-amber-500">No backup yet — run Backup first</p>
+                )}
+              </ObsCard>
+              <ObsCard title="Prerequisites">
+                <p className={`text-sm ${trialCheck.postgres_reachable ? 'text-emerald-400' : 'text-red-400'}`}>
+                  Postgres {trialCheck.postgres_reachable ? 'up' : 'down'}
+                </p>
+                <p className={`text-sm mt-1 ${trialCheck.sync_reachable ? 'text-emerald-400' : 'text-slate-500'}`}>
+                  sync-service {trialCheck.sync_reachable ? 'up' : 'down (needed for simulate)'}
+                </p>
+              </ObsCard>
+            </div>
+
+            <div className="flex flex-wrap gap-2 items-center">
+              <ActionButton
+                label="Backup DB"
+                loadingLabel="Backing up…"
+                loading={trialRunning && trialAction === 'backup'}
+                disabled={trialRunning || bootstrapRunning}
+                color="emerald"
+                onClick={() => runTrialJob({ action: 'backup' }, 'Trial backup')}
+                className="text-xs px-3 py-1.5"
+              />
+              <ActionButton
+                label="Prep trial"
+                loadingLabel="Preparing…"
+                loading={trialRunning && trialAction === 'prep'}
+                disabled={trialRunning || bootstrapRunning}
+                color="violet"
+                onClick={() =>
+                  runTrialJob(
+                    {
+                      action: 'prep',
+                      empty_master: prepEmptyMaster,
+                      fresh_staging: prepFreshStaging,
+                    },
+                    'Trial prep',
+                    prepEmptyMaster || prepFreshStaging,
+                  )
+                }
+                className="text-xs px-3 py-1.5"
+              />
+              <ActionButton
+                label="Restore latest"
+                loadingLabel="Restoring…"
+                loading={trialRunning && trialAction === 'restore'}
+                disabled={trialRunning || bootstrapRunning || !trialCheck.latest_backup}
+                color="amber"
+                onClick={() => runTrialJob({ action: 'restore' }, 'Restore from backup', true)}
+                className="text-xs px-3 py-1.5"
+              />
+              <ActionButton
+                label="Clear staging"
+                loadingLabel="Clearing…"
+                loading={trialRunning && trialAction === 'clear_staging'}
+                disabled={trialRunning || bootstrapRunning}
+                color="slate"
+                onClick={() => runTrialJob({ action: 'clear_staging' }, 'Clear staging', true)}
+                className="text-xs px-3 py-1.5"
+              />
+              <ActionButton
+                label="Reimport GIS"
+                loadingLabel="Reimporting…"
+                loading={trialRunning && trialAction === 'reimport_gis'}
+                disabled={trialRunning || bootstrapRunning}
+                color="cyan"
+                onClick={() => runTrialJob({ action: 'reimport_gis' }, 'Reimport master from GIS')}
+                className="text-xs px-3 py-1.5"
+              />
+              <span className="inline-flex items-center gap-2 text-xs text-slate-400 ml-2">
+                <label className="inline-flex items-center gap-1">
+                  <input
+                    type="checkbox"
+                    checked={prepEmptyMaster}
+                    onChange={(e) => setPrepEmptyMaster(e.target.checked)}
+                    disabled={trialRunning}
+                  />
+                  empty master
+                </label>
+                <label className="inline-flex items-center gap-1">
+                  <input
+                    type="checkbox"
+                    checked={prepFreshStaging}
+                    onChange={(e) => setPrepFreshStaging(e.target.checked)}
+                    disabled={trialRunning}
+                  />
+                  fresh staging
+                </label>
+              </span>
+            </div>
+
+            <div className="flex flex-wrap gap-2 items-center mt-3 pt-3 border-t border-violet-900/40">
+              <label className="text-xs text-slate-400 inline-flex items-center gap-1">
+                Simulate
+                <input
+                  type="number"
+                  min={1}
+                  max={500}
+                  value={simulateCount}
+                  onChange={(e) => setSimulateCount(Number(e.target.value) || 20)}
+                  disabled={trialRunning}
+                  className="w-14 rounded bg-slate-900 border border-slate-700 px-1.5 py-0.5 text-slate-200"
+                />
+                captures
+              </label>
+              <label className="text-xs text-slate-400 inline-flex items-center gap-1">
+                <input
+                  type="checkbox"
+                  checked={simulateValidation}
+                  onChange={(e) => setSimulateValidation(e.target.checked)}
+                  disabled={trialRunning}
+                />
+                run validation after
+              </label>
+              <ActionButton
+                label="Run simulator"
+                loadingLabel="Simulating…"
+                loading={trialRunning && trialAction === 'simulate'}
+                disabled={trialRunning || bootstrapRunning || !trialCheck.sync_reachable}
+                color="violet"
+                onClick={() =>
+                  runTrialJob(
+                    {
+                      action: 'simulate',
+                      count: simulateCount,
+                      run_validation: simulateValidation,
+                    },
+                    `Simulate ${simulateCount} field captures`,
+                  )
+                }
+                className="text-xs px-3 py-1.5"
+              />
+            </div>
+          </section>
+        )}
+
         {status && (
           <section>
             <h2 className="text-sm font-semibold text-slate-300 mb-3 uppercase tracking-wider">Services</h2>
@@ -783,6 +1265,16 @@ export function App() {
                           loadingLabel="Syncing…"
                           disabled={bootstrapRunning}
                           onClick={() => runMemgraphBootstrap()}
+                        />
+                      )}
+                      {svc.id === 'supertonic' && (
+                        <Btn
+                          label="Start"
+                          color="violet"
+                          loading={supertonicRunning}
+                          loadingLabel="Starting…"
+                          disabled={supertonicRunning}
+                          onClick={() => runSupertonicStart()}
                         />
                       )}
                     </div>
@@ -911,7 +1403,13 @@ export function App() {
         logFiles={logFiles}
         onSelectLog={selectLog}
         activityLines={activityLines}
-        statusLine={pendingAction ?? (busyService ? `${busyService.action} ${busyService.id}` : null) ?? (bootstrapRunning ? 'Memgraph bootstrap' : null)}
+        statusLine={
+          pendingAction ??
+          (busyService ? `${busyService.action} ${busyService.id}` : null) ??
+          (supertonicRunning ? 'Supertonic start' : null) ??
+          (trialRunning ? `Trial: ${trialAction ?? 'job'}` : null) ??
+          (bootstrapRunning ? 'Memgraph bootstrap' : null)
+        }
         busy={hasActiveTask}
       />
       {!logPanel.open && (

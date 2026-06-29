@@ -12,6 +12,9 @@ from pydantic import BaseModel, Field
 
 import checks
 import overseer
+import supertonic_ops
+import supabase_ops
+import trial_ops
 
 app = FastAPI(title="OVERSEEYER", version="1.0.0")
 
@@ -45,7 +48,16 @@ async def health():
         "status": "ok",
         "platform": "OVERSEEYER",
         "version": "1.1.0",
-        "features": ["observability", "logs", "sse", "memgraph-bootstrap", "map-tile-verify", "async-migrations"],
+        "features": [
+            "observability",
+            "logs",
+            "sse",
+            "memgraph-bootstrap",
+            "supertonic-start",
+            "trial-ops",
+            "map-tile-verify",
+            "async-migrations",
+        ],
     }
 
 
@@ -182,6 +194,114 @@ async def migration_apply_status():
 @app.get("/api/memgraph/bootstrap/status")
 async def memgraph_bootstrap_status():
     return overseer.bootstrap_memgraph_status()
+
+
+@app.get("/api/supabase/diagnose")
+async def supabase_diagnose():
+    return supabase_ops.diagnose()
+
+
+@app.get("/api/supertonic/status")
+async def supertonic_status():
+    return supertonic_ops.supertonic_status()
+
+
+@app.get("/api/supertonic/start/stream")
+async def supertonic_start_stream():
+    if supertonic_ops.supertonic_status().get("start_job_running"):
+        raise HTTPException(status_code=409, detail="Supertonic start already running")
+
+    async def event_generator():
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def worker() -> None:
+            try:
+                for event in supertonic_ops.iter_start_supertonic():
+                    asyncio.run_coroutine_threadsafe(queue.put(event), loop).result()
+            except Exception as exc:
+                asyncio.run_coroutine_threadsafe(
+                    queue.put({"type": "error", "text": str(exc)}),
+                    loop,
+                ).result()
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/trial/status")
+async def trial_status():
+    return trial_ops.trial_status()
+
+
+@app.get("/api/trial/backups")
+async def trial_backups():
+    return trial_ops.list_backups()
+
+
+@app.get("/api/trial/run/stream")
+async def trial_run_stream(
+    action: str,
+    confirm: bool = False,
+    empty_master: bool = False,
+    fresh_staging: bool = False,
+    dump_file: str | None = None,
+    count: int = Query(default=20, ge=1, le=500),
+    run_validation: bool = False,
+):
+    if trial_ops.trial_status()["running"]:
+        raise HTTPException(status_code=409, detail="Trial job already running")
+
+    async def event_generator():
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def worker() -> None:
+            try:
+                for event in trial_ops.iter_trial_job(
+                    action,
+                    confirm=confirm,
+                    empty_master=empty_master,
+                    fresh_staging=fresh_staging,
+                    dump_file=dump_file,
+                    count=count,
+                    run_validation=run_validation,
+                ):
+                    asyncio.run_coroutine_threadsafe(queue.put(event), loop).result()
+            except Exception as exc:
+                asyncio.run_coroutine_threadsafe(
+                    queue.put({"type": "error", "text": str(exc)}),
+                    loop,
+                ).result()
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/memgraph/bootstrap/stream")

@@ -45,8 +45,11 @@ class AssetNode {
   bool get hasWireConnections => wireDegree > 0;
 
   /// Icon/color for map display (workflow layer for staging, asset kind for master).
-  AssetKind get displayKind =>
-      layer == MapNodeLayer.onGrid ? assetKind : AssetKind.fieldCapture;
+  AssetKind get displayKind {
+    if (layer == MapNodeLayer.onGrid) return assetKind;
+    if (assetKind != AssetKind.connectivityNode) return assetKind;
+    return AssetKind.fieldCapture;
+  }
 
   bool get hasCoordinates =>
       latitude != null &&
@@ -147,6 +150,7 @@ class AssetNode {
       substationName: json['substation_name'] as String?,
       tier: 'staging',
       layer: isOwnCapture ? MapNodeLayer.ownStaging : MapNodeLayer.otherStaging,
+      assetKind: assetKindFromString(json['asset_kind'] as String?),
       h3: h3 ?? json['h3'] as String?,
     );
   }

@@ -415,6 +415,7 @@ export function GiopOperationsTab({
               </th>
               <th className="px-4 py-3">Asset MRID</th>
               <th className="px-4 py-3">Name</th>
+              <th className="px-4 py-3">Type</th>
               <th className="px-4 py-3">Voltage</th>
               <th className="px-4 py-3">Validation</th>
               <th className="px-4 py-3">Submitted by</th>
@@ -425,12 +426,12 @@ export function GiopOperationsTab({
           <tbody className={`divide-y ${isLightMode ? 'divide-slate-200' : 'divide-slate-800'}`}>
             {loading && (
               <tr>
-                <td colSpan={8} className="px-4 py-6 text-slate-500">Loading staging assets…</td>
+                <td colSpan={9} className="px-4 py-6 text-slate-500">Loading staging assets…</td>
               </tr>
             )}
             {!loading && assets.length === 0 && (
               <tr>
-                <td colSpan={8} className="px-4 py-6 text-slate-500">No pending field assets</td>
+                <td colSpan={9} className="px-4 py-6 text-slate-500">No pending field assets</td>
               </tr>
             )}
             {assets.map((row) => {
@@ -479,6 +480,9 @@ export function GiopOperationsTab({
                         if (value) void debouncedPatchName(row.mrid, value);
                       }}
                     />
+                  </td>
+                  <td className="px-4 py-3 text-xs text-slate-400">
+                    {row.asset_kind?.replaceAll('_', ' ') ?? '—'}
                   </td>
                   <td className="px-4 py-3">
                     {row.nominal_voltage ? (

@@ -1,12 +1,20 @@
 import 'package:flutter/material.dart';
 
+import '../services/capture_preferences.dart';
 import '../services/giop_api.dart';
 import '../services/offline_db.dart';
 
 class WorkOrdersScreen extends StatefulWidget {
-  const WorkOrdersScreen({super.key, required this.api});
+  const WorkOrdersScreen({
+    super.key,
+    required this.api,
+    this.onFixRejected,
+    this.onSelectWorkOrder,
+  });
 
   final GiopApi api;
+  final void Function(TechnicianSubmission item)? onFixRejected;
+  final void Function(String workOrderId, String? feederMrid)? onSelectWorkOrder;
 
   @override
   State<WorkOrdersScreen> createState() => _WorkOrdersScreenState();
@@ -16,6 +24,7 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
     with WidgetsBindingObserver {
   List<Map<String, dynamic>> _orders = [];
   List<TechnicianSubmission> _rejected = [];
+  String? _activeWorkOrderId;
   bool _loading = true;
   String? _status;
 
@@ -44,6 +53,7 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
       _loading = true;
       _status = null;
     });
+    _activeWorkOrderId = await CapturePreferences.activeWorkOrderId();
     List<TechnicianSubmission> rejected = const [];
     try {
       rejected = (await widget.api.fetchMySubmissions())
@@ -92,6 +102,24 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
     await _sync();
   }
 
+  Future<void> _setActiveWorkOrder(Map<String, dynamic> wo) async {
+    final id = wo['id'] as String;
+    await CapturePreferences.setActiveWorkOrderId(id);
+    final feeder = wo['feeder_mrid'] as String?;
+    if (feeder != null && feeder.isNotEmpty) {
+      await CapturePreferences.saveLastCapture(
+        assetKind: await CapturePreferences.lastAssetKind(),
+        feederId: feeder,
+      );
+    }
+    setState(() => _activeWorkOrderId = id);
+    widget.onSelectWorkOrder?.call(id, wo['feeder_mrid'] as String?);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Active work order: ${wo['reference'] ?? id}')),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -116,6 +144,22 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
                       padding: const EdgeInsets.only(bottom: 8),
                       child: Text(_status!, style: Theme.of(context).textTheme.bodySmall),
                     ),
+                  if (_activeWorkOrderId != null)
+                    Card(
+                      color: Theme.of(context).colorScheme.primaryContainer.withValues(alpha: 0.4),
+                      child: ListTile(
+                        leading: const Icon(Icons.assignment_turned_in),
+                        title: const Text('Active work order'),
+                        subtitle: Text(_activeWorkOrderId!),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.close),
+                          onPressed: () async {
+                            await CapturePreferences.setActiveWorkOrderId(null);
+                            setState(() => _activeWorkOrderId = null);
+                          },
+                        ),
+                      ),
+                    ),
                   if (_rejected.isNotEmpty) ...[
                     Text(
                       'Rejected captures',
@@ -133,9 +177,15 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
                           ),
                           title: Text(item.name.isNotEmpty ? item.name : item.mrid),
                           subtitle: Text(
-                            reason ?? 'Rejected by backoffice — recapture from the map.',
+                            reason ?? 'Rejected by backoffice — tap Fix to recapture.',
                           ),
                           isThreeLine: reason != null,
+                          trailing: TextButton(
+                            onPressed: widget.onFixRejected == null
+                                ? null
+                                : () => widget.onFixRejected!(item),
+                            child: const Text('Fix'),
+                          ),
                         ),
                       );
                     }),
@@ -154,7 +204,11 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
                   ..._orders.map((wo) {
                     final id = wo['id'] as String;
                     final status = wo['status'] as String? ?? 'DISPATCHED';
+                    final isActive = id == _activeWorkOrderId;
                     return Card(
+                      color: isActive
+                          ? Theme.of(context).colorScheme.secondaryContainer.withValues(alpha: 0.35)
+                          : null,
                       child: ListTile(
                         title: Text(wo['reference'] as String? ?? id),
                         subtitle: Column(
@@ -170,6 +224,7 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
                           ],
                         ),
                         isThreeLine: true,
+                        onTap: () => _setActiveWorkOrder(wo),
                         trailing: status != 'COMPLETED' && status != 'CANCELLED'
                             ? TextButton(
                                 onPressed: () => _advanceStatus(id, status),

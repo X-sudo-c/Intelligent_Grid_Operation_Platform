@@ -27,6 +27,7 @@ export interface FocusCameraRequest {
   id: number;
   mrid: string;
   boostZoom: boolean;
+  coordinates?: [number, number] | null;
 }
 
 /** Copilot-driven map pan/zoom (district fit, fly-to, viewport). */
@@ -91,14 +92,18 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
   const focusCameraRequestIdRef = useRef(0);
   const mapViewportCommandIdRef = useRef(0);
 
-  const queueFocusCamera = useCallback((mrid: string, boostZoom = true) => {
-    focusCameraRequestIdRef.current += 1;
-    setFocusCameraRequest({
-      id: focusCameraRequestIdRef.current,
-      mrid,
-      boostZoom,
-    });
-  }, []);
+  const queueFocusCamera = useCallback(
+    (mrid: string, boostZoom = true, coordinates?: [number, number] | null) => {
+      focusCameraRequestIdRef.current += 1;
+      setFocusCameraRequest({
+        id: focusCameraRequestIdRef.current,
+        mrid,
+        boostZoom,
+        coordinates: normalizeMapCoordinates(coordinates) ?? null,
+      });
+    },
+    [],
+  );
 
   // Drop the consumed camera request so a later Map-tab remount (e.g. switching
   // tabs and back) does not re-fly to a stale node. The Map tab must stay free
@@ -186,7 +191,7 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
       if (opts?.navigateTab) {
         setSideMap(CLOSED_SIDE_MAP);
         setMapIdentifyFocusMrid(mrid);
-        queueFocusCamera(mrid, true);
+        queueFocusCamera(mrid, true, coordinates);
         const tab = opts?.tab ?? 'map';
         writeGiopRouteToLocation({
           tab,
@@ -199,7 +204,7 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      queueFocusCamera(mrid, true);
+      queueFocusCamera(mrid, true, coordinates);
       setMapIdentifyFocusMrid(null);
       setSideMap({
         open: true,

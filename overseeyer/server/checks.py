@@ -556,20 +556,17 @@ def check_redis() -> dict[str, Any]:
 
 def check_voice_tts() -> dict[str, Any]:
     """Supertonic local TTS + sync-service voice copilot bridge."""
-    if not _port_open("127.0.0.1", SUPERTONIC_PORT):
+    try:
+        from supertonic_ops import supertonic_status
+
+        st = supertonic_status()
+    except Exception as exc:
         return {
             "status": "unavailable",
             "port": SUPERTONIC_PORT,
             "url": SUPERTONIC_URL,
-            "hint": "Start: ./scripts/start-supertonic.sh (GIOP copilot voice replies)",
+            "hint": str(exc),
         }
-
-    supertonic_ok = False
-    try:
-        with urlopen(f"{SUPERTONIC_URL}/docs", timeout=3) as resp:
-            supertonic_ok = resp.status == 200
-    except (URLError, OSError, TimeoutError):
-        supertonic_ok = False
 
     voice_api: dict[str, Any] | None = None
     if _port_open("127.0.0.1", 5000):
@@ -579,22 +576,53 @@ def check_voice_tts() -> dict[str, Any]:
         except (URLError, OSError, TimeoutError, json.JSONDecodeError):
             voice_api = None
 
-    if supertonic_ok:
-        return {
-            "status": "ok",
-            "port": SUPERTONIC_PORT,
-            "url": SUPERTONIC_URL,
-            "voice_api": voice_api,
-            "hint": None,
-        }
+    phase = st.get("phase", "down")
+    if phase == "ready" and st.get("docs_ok"):
+        status = "ok"
+    elif phase in ("starting", "warming") or st.get("start_job_running"):
+        status = "partial"
+    elif not st.get("installed"):
+        status = "unavailable"
+    elif phase == "failed":
+        status = "fail"
+    else:
+        status = "unavailable"
 
     return {
-        "status": "partial",
-        "port": SUPERTONIC_PORT,
-        "url": SUPERTONIC_URL,
+        "status": status,
+        "port": st.get("port", SUPERTONIC_PORT),
+        "url": st.get("url", SUPERTONIC_URL),
+        "phase": phase,
+        "installed": st.get("installed"),
+        "pid": st.get("pid"),
+        "port_open": st.get("port_open"),
+        "docs_ok": st.get("docs_ok"),
+        "start_job_running": st.get("start_job_running"),
+        "log_name": st.get("log_name"),
+        "log_tail": st.get("log_tail"),
         "voice_api": voice_api,
-        "hint": f"Port {SUPERTONIC_PORT} open but Supertonic /docs not responding — check .giop/logs/supertonic.log",
+        "hint": st.get("hint"),
     }
+
+
+def check_trial() -> dict[str, Any]:
+    try:
+        import trial_ops
+
+        status = trial_ops.trial_status()
+        backups = trial_ops.list_backups()
+        return {
+            "status": "ok" if status.get("postgres_reachable") else "unavailable",
+            "running": status.get("running"),
+            "action": status.get("action"),
+            "latest_backup": backups.get("latest"),
+            "backup_count": len(backups.get("backups") or []),
+            "counts": status.get("counts"),
+            "sync_reachable": status.get("sync_reachable"),
+            "postgres_reachable": status.get("postgres_reachable"),
+        }
+    except Exception as exc:
+        return {"status": "error", "reason": str(exc)}
 
 
 def observability_snapshot() -> dict[str, Any]:
@@ -609,6 +637,7 @@ def observability_snapshot() -> dict[str, Any]:
         "voice_tts": check_voice_tts(),
         "data_plane": check_data_plane(),
         "map_tiles": check_map_tile_views(fast=True),
+        "trial": check_trial(),
         "logs": list_log_files(),
         "migrations": overseer.list_migrations(),
     }
