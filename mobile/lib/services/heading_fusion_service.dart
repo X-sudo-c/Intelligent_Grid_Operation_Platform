@@ -7,6 +7,7 @@ import 'package:sensors_plus/sensors_plus.dart';
 class HeadingFusionService {
   double? _heading;
   double _confidence = 0;
+  bool _navigationMode = false;
   DateTime? _lastCompassAt;
   DateTime? _lastGyroAt;
 
@@ -25,6 +26,27 @@ class HeadingFusionService {
 
   bool get showHeadingWedge =>
       _heading != null && confidence >= _minWedgeConfidence;
+
+  bool get navigationMode => _navigationMode;
+
+  void setNavigationMode(bool enabled) {
+    _navigationMode = enabled;
+    if (enabled) {
+      _confidence = math.max(_confidence, 0.55);
+    }
+  }
+
+  /// Raw compass/azimuth for navigation camera (minimal filtering).
+  void updateNavigationBearing(double? compassHeading) {
+    if (compassHeading == null || !compassHeading.isFinite) return;
+    final normalized = _normalize(compassHeading);
+    // Light blend — heavy smoothing happens in NavigationCamera.
+    final alpha = _heading == null ? 1.0 : 0.22;
+    _heading = _blendAngle(_heading, normalized, alpha);
+    _lastCompassAt = DateTime.now();
+    _confidence = math.max(_confidence, 0.72);
+    _decayConfidenceIfStale();
+  }
 
   void start() {
     _gyroSub ??= gyroscopeEventStream().listen(_onGyro);
@@ -45,7 +67,8 @@ class HeadingFusionService {
   void updateCompass(double? compassHeading) {
     if (compassHeading == null || !compassHeading.isFinite) return;
     final normalized = _normalize(compassHeading);
-    _heading = _blendAngle(_heading, normalized, 0.38);
+    final alpha = _navigationMode ? 0.68 : 0.38;
+    _heading = _blendAngle(_heading, normalized, alpha);
     _lastCompassAt = DateTime.now();
     _confidence = math.max(_confidence, 0.7);
     _decayConfidenceIfStale();
@@ -56,7 +79,10 @@ class HeadingFusionService {
     required double speedMps,
     required double accuracyMeters,
   }) {
-    if (!courseDeg.isFinite || courseDeg < 0 || speedMps < 0.8) return;
+    if (!courseDeg.isFinite || courseDeg < 0) return;
+    // Stationary / slow: compass owns bearing in navigation mode.
+    if (_navigationMode && speedMps < 2.5) return;
+    if (speedMps < 0.8) return;
     final normalized = _normalize(courseDeg);
     final speedWeight = (speedMps / 4.0).clamp(0.35, 0.9);
     _heading = _blendAngle(_heading, normalized, speedWeight);
@@ -78,7 +104,8 @@ class HeadingFusionService {
   }
 
   void _onGyro(GyroscopeEvent event) {
-    if (_heading == null) return;
+    // Navigation uses Android Rotation Vector via compass; extra gyro fights it.
+    if (_navigationMode || _heading == null) return;
     final now = DateTime.now();
     final last = _lastGyroAt;
     _lastGyroAt = now;

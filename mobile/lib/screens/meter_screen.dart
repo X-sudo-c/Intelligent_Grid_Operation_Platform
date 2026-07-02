@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
+import '../services/capture_service.dart';
 import '../services/giop_api.dart';
 
 class MeterScreen extends StatefulWidget {
@@ -19,10 +20,17 @@ class _MeterScreenState extends State<MeterScreen> {
   final _kwhController = TextEditingController();
   final _mridController = TextEditingController();
   final _picker = ImagePicker();
+  late final CaptureService _captureService;
 
   File? _image;
   String? _status;
   bool _loading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _captureService = CaptureService(widget.api);
+  }
 
   @override
   void dispose() {
@@ -34,7 +42,7 @@ class _MeterScreenState extends State<MeterScreen> {
 
   Future<void> _pickImage(ImageSource source) async {
     final picked = await _picker.pickImage(source: source, imageQuality: 85);
-    if (picked == null) return;
+    if (picked == null || !mounted) return;
     setState(() {
       _image = File(picked.path);
       _status = null;
@@ -52,6 +60,7 @@ class _MeterScreenState extends State<MeterScreen> {
     });
     try {
       final data = await widget.api.runMeterOcr(_image!);
+      if (!mounted) return;
       _serialController.text = data['extracted_serial']?.toString() ?? '';
       if (data['extracted_kwh'] != null) {
         _kwhController.text = data['extracted_kwh'].toString();
@@ -65,6 +74,7 @@ class _MeterScreenState extends State<MeterScreen> {
         _loading = false;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _status = e.toString();
         _loading = false;
@@ -81,18 +91,24 @@ class _MeterScreenState extends State<MeterScreen> {
     }
     setState(() {
       _loading = true;
-      _status = 'Submitting telemetry…';
+      _status = 'Saving…';
     });
     try {
-      await widget.api.submitTelemetry(
+      final queued = await _captureService.submitMeterReading(
         meterMrid: mrid,
         activeEnergyKwh: kwh,
+        serialNumber: _serialController.text.trim().isEmpty
+            ? null
+            : _serialController.text.trim(),
+        photoPath: _image?.path,
       );
+      if (!mounted) return;
       setState(() {
-        _status = 'Telemetry ingested';
+        _status = queued ? 'Saved' : 'Could not save';
         _loading = false;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _status = e.toString();
         _loading = false;

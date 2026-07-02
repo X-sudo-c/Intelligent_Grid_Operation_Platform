@@ -9,15 +9,8 @@ from data_quality import run_asset_checks
 _TERRITORY_JOIN = """
 LEFT JOIN LATERAL (
   SELECT
-    COALESCE(
-      NULLIF(btrim(b.region::text), ''),
-      NULLIF(btrim(b.region_name::text), '')
-    ) AS region,
-    COALESCE(
-      NULLIF(btrim(b.district::text), ''),
-      NULLIF(btrim(b.district_name::text), ''),
-      NULLIF(btrim(b.name::text), '')
-    ) AS district
+    NULLIF(btrim(b.region::text), '') AS region,
+    NULLIF(btrim(b.district::text), '') AS district
   FROM gis.ecg_admin_boundaries b
   WHERE cn.geom IS NOT NULL AND ST_Within(cn.geom, b.geom)
   ORDER BY ST_Area(b.geom::geography) ASC
@@ -317,9 +310,14 @@ def review_staging_asset(conn, mrid: str) -> dict[str, Any]:
     elif open_failures:
         recommendation = "fix_dq_then_review"
         rationale_parts.append(f"{len(open_failures)} open DQ failure(s) on staging tier.")
-    elif asset["validation"] in ("PENDING_FIELD", "STAGED") and not open_failures:
+    elif asset["validation"] == "PENDING_FIELD" and not open_failures:
+        recommendation = "release_to_operations"
+        rationale_parts.append(
+            "DQ checks passed — release from Data Quality to Operations (STAGED) before promote."
+        )
+    elif asset["validation"] == "STAGED" and not open_failures:
         recommendation = "ready_for_steward_approve"
-        rationale_parts.append("DQ checks passed on staging — steward may approve promote to master.")
+        rationale_parts.append("Released from DQ — steward may approve promote to master.")
     else:
         rationale_parts.append(f"Validation state is {asset['validation']}.")
 
@@ -338,6 +336,8 @@ def review_staging_asset(conn, mrid: str) -> dict[str, Any]:
         "next_step": (
             "Steward approves in Operations tab to promote_staged_asset"
             if recommendation == "ready_for_steward_approve"
+            else "Release to Operations in Data Quality tab"
+            if recommendation == "release_to_operations"
             else "Inspect in Operations or Map tab before promote"
         ),
     }

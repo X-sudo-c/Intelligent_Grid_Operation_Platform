@@ -433,10 +433,13 @@ export async function getMapGeocode(options: {
 export async function getStagingAssets(options?: {
   includeRejected?: boolean;
   submittedBy?: string;
+  /** Operations inbox: STAGED + IN_CONFLICT. DQ inbox: PENDING_FIELD + IN_CONFLICT. */
+  queue?: 'all' | 'operations' | 'dq';
 }): Promise<GiopStagingAsset[]> {
   const query = new URLSearchParams();
   if (options?.includeRejected) query.set('include_rejected', 'true');
   if (options?.submittedBy) query.set('submitted_by', options.submittedBy);
+  if (options?.queue && options.queue !== 'all') query.set('queue', options.queue);
   const suffix = query.toString() ? `?${query}` : '';
   const data = await fetchJson<GiopStagingResponse>(`${SYNC_BASE}/assets/staging${suffix}`);
   return data.assets ?? [];
@@ -749,6 +752,31 @@ export interface GiopDqException {
   created_at?: string | null;
   resolved_at?: string | null;
   asset_name?: string | null;
+  longitude?: number | null;
+  latitude?: number | null;
+  location_key?: string | null;
+  colocated_staging_count?: number | null;
+  colocated_staging_peers?: Array<{
+    mrid: string;
+    name?: string | null;
+    validation?: string | null;
+  }> | null;
+  staging_validation?: string | null;
+  can_release_to_operations?: boolean;
+  rule_description?: string | null;
+  blocks_promotion?: boolean;
+  record_context?: {
+    tier?: string | null;
+    submitted_by?: string | null;
+    work_order_id?: string | null;
+    photo_url?: string | null;
+    record_updated_at?: string | null;
+    lifecycle_state?: string | null;
+    asset_kind?: string | null;
+    operating_utility?: string | null;
+    substation_name?: string | null;
+    boundary_feeder_id?: string | null;
+  } | null;
 }
 
 export interface GiopDqSummary {
@@ -776,6 +804,8 @@ export interface GiopTopologyDqSummary {
   /** ISO timestamp of the scan the snapshot came from (snapshot mode only). */
   scanned_at?: string | null;
   run_id?: string;
+  /** master | staging — which network tier these counts describe. */
+  tier?: 'master' | 'staging';
 }
 
 export interface GiopTopologyDqScanResult {
@@ -797,6 +827,7 @@ export async function getTopologyDqSummary(options?: {
   clip?: { west: number; south: number; east: number; north: number };
   /** 'snapshot' (default, fast) reads the last scan; 'live' forces recompute. */
   mode?: 'snapshot' | 'live';
+  tier?: 'master' | 'staging';
 }): Promise<GiopTopologyDqSummary> {
   const q = new URLSearchParams();
   const clip = options?.clip ?? GHANA_EXPORT_CLIP;
@@ -805,6 +836,7 @@ export async function getTopologyDqSummary(options?: {
   q.set('east', String(clip.east));
   q.set('north', String(clip.north));
   q.set('mode', options?.mode ?? 'snapshot');
+  q.set('tier', options?.tier ?? 'master');
   return fetchJson(`${SYNC_BASE}/dq/topology/summary?${q}`);
 }
 
@@ -843,27 +875,115 @@ export async function listTopologyDqRuns(limit = 10): Promise<GiopTopologyDqRun[
   return data.runs ?? [];
 }
 
+export interface GiopDqExceptionPage {
+  exceptions: GiopDqException[];
+  count: number;
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+export interface GiopDqQueueItem {
+  mrid: string;
+  name?: string | null;
+  validation: string;
+  submitted_by?: string | null;
+  work_order_id?: string | null;
+  photo_url?: string | null;
+  updated_at?: string | null;
+  lifecycle_state?: string | null;
+  longitude?: number | null;
+  latitude?: number | null;
+  boundary_feeder_id?: string | null;
+  asset_kind?: string | null;
+  operating_utility?: string | null;
+  substation_name?: string | null;
+  open_exception_count: number;
+  blocking_open_count: number;
+  can_release_to_operations?: boolean;
+  location_key?: string | null;
+  colocated_staging_count?: number | null;
+  colocated_staging_peers?: Array<{
+    mrid: string;
+    name?: string | null;
+    validation?: string | null;
+  }> | null;
+  exceptions: GiopDqException[];
+  record_context?: GiopDqException['record_context'];
+  tier?: 'staging';
+}
+
+export interface GiopDqQueuePage {
+  items: GiopDqQueueItem[];
+  count: number;
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+export async function listDqQueue(options?: {
+  /** ALL = every capture in DQ inbox; OPEN = has open issues; CLEAR = no open issues */
+  status?: string;
+  duplicatesOnly?: boolean;
+  severity?: string;
+  domain?: string;
+  validation?: 'PENDING_FIELD' | 'IN_CONFLICT';
+  limit?: number;
+  offset?: number;
+}): Promise<GiopDqQueuePage> {
+  const query = new URLSearchParams();
+  query.set('status', options?.status ?? 'ALL');
+  if (options?.duplicatesOnly) query.set('duplicates_only', 'true');
+  if (options?.severity) query.set('severity', options.severity);
+  if (options?.domain) query.set('domain', options.domain);
+  if (options?.validation) query.set('validation', options.validation);
+  query.set('limit', String(options?.limit ?? 50));
+  query.set('offset', String(options?.offset ?? 0));
+  return fetchJson(`${SYNC_BASE}/dq/queue?${query}`);
+}
+
 export async function listDqExceptions(options?: {
   status?: string;
   severity?: string;
   domain?: string;
   recordMrid?: string;
   limit?: number;
-}): Promise<GiopDqException[]> {
+  offset?: number;
+  /** Default dq: exceptions for assets still in the DQ queue. */
+  queue?: 'dq' | 'operations' | 'all';
+}): Promise<GiopDqExceptionPage> {
   const query = new URLSearchParams();
   query.set('status', options?.status ?? 'OPEN');
   if (options?.severity) query.set('severity', options.severity);
   if (options?.domain) query.set('domain', options.domain);
   if (options?.recordMrid) query.set('record_mrid', options.recordMrid);
-  query.set('limit', String(options?.limit ?? 100));
-  const data = await fetchJson<{ exceptions: GiopDqException[] }>(
-    `${SYNC_BASE}/dq/exceptions?${query}`,
-  );
-  return data.exceptions ?? [];
+  if (options?.queue) query.set('queue', options.queue);
+  query.set('limit', String(options?.limit ?? 50));
+  query.set('offset', String(options?.offset ?? 0));
+  return fetchJson(`${SYNC_BASE}/dq/exceptions?${query}`);
 }
 
-export async function getDqSummary(): Promise<GiopDqSummary> {
-  return fetchJson<GiopDqSummary>(`${SYNC_BASE}/dq/summary`);
+export async function releaseDqAssetToOperations(
+  mrid: string,
+  options?: { operatorId?: string; runChecks?: boolean },
+): Promise<{ mrid: string; validation: string; previous_validation?: string }> {
+  return fetchJson(`${SYNC_BASE}/dq/assets/${mrid}/release-to-operations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ...(options?.operatorId ? { operator_id: options.operatorId } : {}),
+      run_checks: options?.runChecks ?? true,
+    }),
+  });
+}
+
+export async function getDqSummary(options?: {
+  tier?: 'master' | 'staging' | 'all';
+}): Promise<GiopDqSummary> {
+  const q = new URLSearchParams();
+  if (options?.tier) q.set('tier', options.tier);
+  const suffix = q.toString() ? `?${q}` : '';
+  return fetchJson<GiopDqSummary>(`${SYNC_BASE}/dq/summary${suffix}`);
 }
 
 export async function listDqRules(): Promise<GiopDqRule[]> {
@@ -1098,6 +1218,8 @@ export interface GiopVoiceStatus {
     mode?: string;
     available?: boolean;
     model?: string;
+    beam_size?: number;
+    initial_prompt_preview?: string;
     hint?: string | null;
     browser?: boolean;
     note?: string;
@@ -1109,7 +1231,11 @@ export async function getVoiceCopilotStatus(): Promise<GiopVoiceStatus> {
   return fetchJson(`${SYNC_BASE}/portal/ai/voice/status`);
 }
 
-export async function portalAiTranscribe(blob: Blob): Promise<{ text: string }> {
+export async function portalAiTranscribe(blob: Blob): Promise<{
+  text: string;
+  raw?: string;
+  fixes?: string[];
+}> {
   const form = new FormData();
   const name = blob.type.includes('ogg') ? 'recording.ogg' : 'recording.webm';
   form.append('audio', blob, name);

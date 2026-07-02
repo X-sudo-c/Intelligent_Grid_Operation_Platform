@@ -262,6 +262,28 @@ def _tool_schemas() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "resolve_place",
+                "description": (
+                    "Resolve a Ghana locality or district name (e.g. Pokuase, Gbawe, Accra, "
+                    "Ashanti region) to ECG district, region, bbox, and centroid. "
+                    "Always call this before pan_map or asset_inventory_counts when the user "
+                    "names a place that may be a town or informal locality, not only an ECG district."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Place name spoken or typed by the user",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "resolve_territory",
                 "description": (
                     "Resolve ECG district or region name to map bbox and centroid "
@@ -320,6 +342,12 @@ def _tool_schemas() -> list[dict[str, Any]]:
                         },
                         "district": {"type": "string"},
                         "region": {"type": "string"},
+                        "place": {
+                            "type": "string",
+                            "description": (
+                                "Town or locality (e.g. Pokuase, Gbawe) — auto-resolved to ECG district"
+                            ),
+                        },
                         "lon": {"type": "number"},
                         "lat": {"type": "number"},
                         "zoom": {"type": "number"},
@@ -443,6 +471,12 @@ def _execute_tool(
         )
     if name == "review_staging_asset":
         return tools.tool_review_staging_asset(conn, arguments["mrid"])
+    if name == "resolve_place":
+        return spatial_tools.tool_resolve_place(
+            conn,
+            query=arguments["query"],
+            allow_geocode=arguments.get("allow_geocode"),
+        )
     if name == "resolve_territory":
         return spatial_tools.tool_resolve_territory(
             conn,
@@ -467,13 +501,28 @@ def _execute_tool(
         if tab not in PORTAL_TABS:
             tab = "map"
         ui: dict[str, Any] = {"type": "navigate", "tab": tab}
+
+        district = arguments.get("district")
+        region = arguments.get("region")
+        place_query = (arguments.get("place") or "").strip()
+        if place_query and not district and not region:
+            from agents.place_resolve import resolve_place
+
+            try:
+                resolved = resolve_place(conn, place_query)
+                district = resolved.get("district") or district
+                region = resolved.get("region") or region
+                arguments = {**arguments, "district": district, "region": region}
+            except ValueError:
+                pass
+
         if action == "fit_district":
             from agents import spatial
 
             terr = spatial.resolve_territory(
                 conn,
-                district=arguments.get("district"),
-                region=arguments.get("region"),
+                district=district,
+                region=region,
             )
             ui = {
                 "type": "fit_bounds",
@@ -488,15 +537,15 @@ def _execute_tool(
 
             terr = spatial.resolve_territory(
                 conn,
-                district=arguments.get("district"),
-                region=arguments.get("region"),
+                district=district,
+                region=region,
             )
             geojson = spatial.territory_geojson(
                 conn,
-                district=arguments.get("district"),
-                region=arguments.get("region"),
+                district=district,
+                region=region,
             )
-            label = terr.get("district") or terr.get("region") or "Territory"
+            label = district or region or terr.get("district") or terr.get("region") or "Territory"
             ui = {
                 "type": "highlight_territory",
                 "tab": tab,
@@ -608,9 +657,18 @@ def run_tool_loop(
             except json.JSONDecodeError:
                 args = {}
 
-            output = _execute_tool(
-                conn, tool_name, args, run_id=run_id, agent_name=agent_name
-            )
+            try:
+                output = _execute_tool(
+                    conn, tool_name, args, run_id=run_id, agent_name=agent_name
+                )
+            except Exception as exc:
+                # Broken tool call must not 500 the whole chat — feed the error
+                # back to the LLM so it can retry or ask the user.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                output = {"error": f"{type(exc).__name__}: {exc}"}
             if isinstance(output, dict) and output.get("ui_action"):
                 ui_actions.append(output["ui_action"])
             log_agent_step(

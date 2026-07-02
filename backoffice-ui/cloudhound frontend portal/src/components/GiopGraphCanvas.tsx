@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY, type SimulationLinkDatum, type SimulationNodeDatum } from 'd3-force';
 import type { CloudHoundAIChatResponse, CloudHoundPolicyDocumentResponse, CloudHoundPortalGraphResponse } from '../api/giopGraphStubs';
+import { GIOP_GRAPH_QUERY_OPTIONS, type GiopGraphQueryKey } from '../lib/giopGraphTypes';
 import { findCloudHoundPath, getCloudHoundPolicyDocument, type CloudHoundPathFindingResponse } from '../api/giopGraphStubs';
 import { voltageEdgeColor } from '../lib/giopSldTheme';
+import { computeGraphQuality, GRAPH_QUALITY, isOnScreen } from '../lib/giopGraphPerf';
 import { Lock, GitBranch, Sparkles } from 'lucide-react';
 import { AssistantRichText } from './AssistantRichText';
 
@@ -17,7 +19,17 @@ interface GiopGraphCanvasProps {
   onRequestAiAssist?: (request: { nodeId: string; nodeTitle: string; prompt: string }) => void;
   onRequestGraphAiMode?: () => void;
   aiAssist?: GraphAiAssistPanelState;
+  /** Minimal grid topology UI for the FR-010 operations desk (no IAM chrome). */
+  graphChrome?: 'full' | 'operations';
+  graphQuery?: GiopGraphQueryKey;
+  onQueryChange?: (key: GiopGraphQueryKey) => void;
+  graphQueryOptions?: typeof GIOP_GRAPH_QUERY_OPTIONS;
 }
+
+const OPS_QUERY_LABELS: Partial<Record<GiopGraphQueryKey, string>> = {
+  traced_subgraph: 'Traced',
+  network_topology: 'Full network',
+};
 
 type GraphAiProposal = NonNullable<CloudHoundAIChatResponse['remediation_proposals']>[number];
 
@@ -180,7 +192,6 @@ function vibrantEdgeColor(color: string): string {
   return `rgba(${boost(r)}, ${boost(g)}, ${boost(b)}, ${Math.min(1, Math.max(0.92, a + 0.2)).toFixed(2)})`;
 }
 
-const QUALITY = { ultra: { edgeCap: 12000, labelZoom: 1.8 }, balanced: { edgeCap: 6000, labelZoom: 1.95 }, safe: { edgeCap: 3200, labelZoom: 2.1 } } as const;
 const FORCE_PREFS_KEY = 'cloudhound.graph.forcePrefs.v1';
 const CAMERA_PREFS_KEY = 'cloudhound.graph.camera.v1';
 const CAMERA_MIN_ZOOM = 0.05;
@@ -340,7 +351,9 @@ function writeCameraPrefs(camera: Camera) {
   }
 }
 
-export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId = '', isLightMode = false, focusNodeArn = null, onFocusNodeHandled, onNodeSelect, onRequestAiAssist, onRequestGraphAiMode, aiAssist }: GiopGraphCanvasProps) {
+export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId = '', isLightMode = false, focusNodeArn = null, onFocusNodeHandled, onNodeSelect, onRequestAiAssist, onRequestGraphAiMode, aiAssist, graphChrome = 'full', graphQuery, onQueryChange, graphQueryOptions }: GiopGraphCanvasProps) {
+  const isOpsChrome = graphChrome === 'operations';
+  const opsQueryOptions = isOpsChrome ? graphQueryOptions : undefined;
   const initialForcePrefs = readForcePrefs();
   const graphShellRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -833,7 +846,8 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
     }, { all: 0, substation: 0, transformer: 0, feeder: 0, meter: 0, other: 0 });
   }, [relatedNodeGroups]);
 
-  const quality = renderGraph.nodes.length > 6500 ? 'safe' : renderGraph.nodes.length > 3000 ? 'balanced' : 'ultra';
+  const quality = computeGraphQuality(renderGraph.nodes.length, isOpsChrome);
+  const qualityConfig = GRAPH_QUALITY[quality];
   const selectedEdges = focusId ? (adjacency.nodeEdges.get(focusId)?.size || 0) : 0;
   const selectedEscalationDetails = useMemo(() => {
     if (!focusId) return [] as Array<{ id: string; type: string; explanation: string; sourceName: string; targetName: string }>;
@@ -986,8 +1000,9 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       driftSpeed: 0.12 + Math.random() * 0.12,
       driftRadius: 0.015 + Math.random() * 0.03,
     }));
+    const nodeIdSet = new Set(renderGraph.nodes.map((node) => node.id));
     const simLinks: SimLink[] = renderGraph.edges
-      .filter((edge) => simNodes.some((node) => node.id === edge.source) && simNodes.some((node) => node.id === edge.target))
+      .filter((edge) => nodeIdSet.has(edge.source) && nodeIdSet.has(edge.target))
       .map((edge) => ({ source: edge.source, target: edge.target, weight: edge.weight, label: edge.label, confidence: edge.confidence, color: edge.color, isPrivilegeEscalation: edge.isPrivilegeEscalation }));
 
     nodesRef.current = simNodes;
@@ -1029,18 +1044,18 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       const ctx2d = ctx;
       const isLight = lightModeRef.current;
       const palette = {
-        bgStart: isLight ? '#f1f5f9' : '#0b1021',
-        bgEnd: isLight ? '#e0e7f1' : '#070b17',
-        edgeLabelBg: isLight ? 'rgba(241, 245, 249, 0.94)' : 'rgba(7, 11, 23, 0.92)',
+        bgStart: isLight ? '#f1f5f9' : '#1a1a1a',
+        bgEnd: isLight ? '#e0e7f1' : '#121212',
+        edgeLabelBg: isLight ? 'rgba(241, 245, 249, 0.94)' : 'rgba(30, 30, 30, 0.94)',
         edgeLabelBgEsc: isLight ? 'rgba(254, 226, 226, 0.95)' : 'rgba(127, 29, 29, 0.94)',
-        edgeLabelText: isLight ? '#475569' : '#cbd5e1',
-        edgeLabelTextFocus: isLight ? '#1e293b' : '#e0f2fe',
+        edgeLabelText: isLight ? '#475569' : '#a3a3a3',
+        edgeLabelTextFocus: isLight ? '#1e293b' : '#d4d4d4',
         edgeLabelTextEsc: isLight ? '#7f1d1d' : '#fca5a5',
-        nodeLabelBg: isLight ? 'rgba(241, 245, 249, 0.92)' : 'rgba(7, 11, 23, 0.82)',
-        nodeLabelText: isLight ? '#1e293b' : '#e2e8f0',
-        nodeLabelHoverText: isLight ? '#0f172a' : '#f8fafc',
-        nodeStrokeDefault: isLight ? 'rgba(100,116,139,0.4)' : 'rgba(7,11,23,0.6)',
-        hoverRing: isLight ? 'rgba(30, 41, 59, 0.25)' : 'rgba(248,250,252,0.35)',
+        nodeLabelBg: isLight ? 'rgba(241, 245, 249, 0.92)' : 'rgba(30, 30, 30, 0.88)',
+        nodeLabelText: isLight ? '#1e293b' : '#bcbcbc',
+        nodeLabelHoverText: isLight ? '#0f172a' : '#d0d0d0',
+        nodeStrokeDefault: isLight ? 'rgba(100,116,139,0.4)' : 'rgba(11, 11, 11, 0.55)',
+        hoverRing: isLight ? 'rgba(30, 41, 59, 0.25)' : 'rgba(212, 212, 212, 0.28)',
       };
       ctx2d.save();
       ctx2d.setTransform(sizeRef.current.dpr, 0, 0, sizeRef.current.dpr, 0, 0);
@@ -1110,8 +1125,10 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       // After d3-force runs, edge.source/target are mutated to SimNode objects — resolve id from either form
       const edgeSourceId = (e: SimLink) => typeof e.source === 'object' && e.source !== null ? (e.source as SimNode).id : e.source as string;
       const edgeTargetId = (e: SimLink) => typeof e.target === 'object' && e.target !== null ? (e.target as SimNode).id : e.target as string;
+      const nodeBySimId = new Map<string, SimNode>();
+      nodesRef.current.forEach((node) => nodeBySimId.set(node.id, node));
       const edgeCandidates = edgesRef.current.filter((edge) => visibleNodes.has(edgeSourceId(edge)) && visibleNodes.has(edgeTargetId(edge)));
-      const cap = QUALITY[quality].edgeCap;
+      const cap = qualityConfig.edgeCap;
       const priority = new Set<string>([activeRef.current, hoverStateRef.current, ...searchHits.slice(0, 6).map((n) => n.id)].filter(Boolean) as string[]);
       const visibleEdges = edgeCandidates.length <= cap ? edgeCandidates : edgeCandidates.map((edge) => {
         const isPrivEsc = edge.isPrivilegeEscalation;
@@ -1120,11 +1137,14 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       }).sort((a, b) => b.score - a.score).slice(0, cap).map((entry) => entry.edge);
 
       visibleEdges.forEach((edge) => {
-        const source = typeof edge.source === 'object' && edge.source !== null ? edge.source as SimNode : nodesRef.current.find((node) => node.id === (edge.source as string));
-        const target = typeof edge.target === 'object' && edge.target !== null ? edge.target as SimNode : nodesRef.current.find((node) => node.id === (edge.target as string));
+        const source = typeof edge.source === 'object' && edge.source !== null ? edge.source as SimNode : nodeBySimId.get(edge.source as string);
+        const target = typeof edge.target === 'object' && edge.target !== null ? edge.target as SimNode : nodeBySimId.get(edge.target as string);
         if (!source || !target) return;
         const s = screen(source, camera, width, height);
         const t = screen(target, camera, width, height);
+        if (qualityConfig.viewportCull && !isOnScreen(s.x, s.y, width, height) && !isOnScreen(t.x, t.y, width, height)) {
+          return;
+        }
         const srcId = (source as SimNode).id;
         const tgtId = (target as SimNode).id;
         const connectedFocus = activeRef.current ? srcId === activeRef.current || tgtId === activeRef.current : false;
@@ -1185,21 +1205,23 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                 ? Math.max(0.7, baseThickness)
                 : Math.max(minRegularEdgeWidth, baseThickness * Math.max(0.85, zoom * 0.78) * lowZoomWidthBoost);
         
-        // Enhanced shadow for privilege escalation and path edges
-        if (isPathEdge) {
-          ctx2d.shadowColor = 'rgba(255, 215, 0, 0.4)';
-          ctx2d.shadowBlur = 16;
-        } else if (isAiQueryEdge) {
-          ctx2d.shadowColor = connectedHover || connectedFocus
-            ? 'rgba(125, 211, 252, 0.72)'
-            : 'rgba(56, 189, 248, 0.34)';
-          ctx2d.shadowBlur = connectedHover || connectedFocus ? 16 : 10;
-        } else if (isPrivEsc) {
-          ctx2d.shadowColor = (connectedHover || connectedFocus) ? vibrantEdgeColor(edge.color) : 'rgba(239, 68, 68, 0.35)';
-          ctx2d.shadowBlur = (connectedHover || connectedFocus) ? 16 : 12;
-        } else {
-          ctx2d.shadowColor = (connectedHover || connectedFocus) ? vibrantEdgeColor(edge.color) : 'rgba(120, 150, 200, 0.18)';
-          ctx2d.shadowBlur = (connectedHover || connectedFocus) ? 14 : 6;
+        // Enhanced shadow for privilege escalation and path edges (skipped at balanced/safe tiers)
+        if (qualityConfig.shadows) {
+          if (isPathEdge) {
+            ctx2d.shadowColor = 'rgba(255, 215, 0, 0.4)';
+            ctx2d.shadowBlur = 16;
+          } else if (isAiQueryEdge) {
+            ctx2d.shadowColor = connectedHover || connectedFocus
+              ? 'rgba(125, 211, 252, 0.72)'
+              : 'rgba(56, 189, 248, 0.34)';
+            ctx2d.shadowBlur = connectedHover || connectedFocus ? 16 : 10;
+          } else if (isPrivEsc) {
+            ctx2d.shadowColor = (connectedHover || connectedFocus) ? vibrantEdgeColor(edge.color) : 'rgba(239, 68, 68, 0.35)';
+            ctx2d.shadowBlur = (connectedHover || connectedFocus) ? 16 : 12;
+          } else {
+            ctx2d.shadowColor = (connectedHover || connectedFocus) ? vibrantEdgeColor(edge.color) : 'rgba(120, 150, 200, 0.18)';
+            ctx2d.shadowBlur = (connectedHover || connectedFocus) ? 14 : 6;
+          }
         }
         
         let lineEndX = t.x;
@@ -1283,8 +1305,12 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         const isStagingNode =
           nodeValidation === 'PENDING_FIELD' || nodeValidation === 'STAGED';
         const stagingPulseColor = nodeValidation === 'STAGED' ? '#3b82f6' : '#f59e0b';
+        const isPriorityNode = focused || hovered || searchHit || isPathNode || isAiQueryNode || isAiAssistNode || isStagingNode;
+        if (qualityConfig.viewportCull && !isPriorityNode && !isOnScreen(p.x, p.y, width, height)) {
+          return;
+        }
         const dimmed = !!activeRef.current && !focused && !hovered && !inFocusNeighborhood && !isPathNode;
-        const shouldPulse = isAiAssistNode || isStagingNode;
+        const shouldPulse = qualityConfig.pulseRipples && (isAiAssistNode || isStagingNode);
         const pulseStrength = shouldPulse ? (Math.sin(animationTimeRef.current * 4.6) + 1) * 0.5 : 0;
         const pulseScale = shouldPulse
           ? 1 + pulseStrength * (isStagingNode && !isAiAssistNode ? 0.012 : 0.018)
@@ -1294,11 +1320,11 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         const heatColor = heatMapEnabledRef.current ? node.riskColor : null;
         const nodeDisplayColor = isAiAssistNode ? node.color : focused ? '#f8fafc' : searchHit ? '#f4d06f' : heatColor ?? node.color;
         const radius = Math.max(4, node.size * nodeSizeMultRef.current * (focused ? 1.5 : hovered ? 1.25 : isPathNode ? 1.3 : 1) * pulseScale);
-        const labelVisible = hovered || searchHit || drawAll || isPathNode || isAiQueryNode;
+        const labelVisible = hovered || searchHit || isPathNode || isAiQueryNode || (drawAll && zoom >= qualityConfig.labelZoom);
         const label = labelVisible ? node.fullLabel : node.label;
         ctx2d.save();
         ctx2d.globalAlpha = dimmed ? 0.35 : 1;
-        if (focused || hovered || heatColor || node.isHvt || node.trustExternal || node.dangerousPolicy || isPathNode || isAiAssistNode || isAiQueryNode || isStagingNode) {
+        if (qualityConfig.shadows && (focused || hovered || heatColor || node.isHvt || node.trustExternal || node.dangerousPolicy || isPathNode || isAiAssistNode || isAiQueryNode || isStagingNode)) {
           ctx2d.shadowColor = isAiAssistNode
             ? node.color
             : isStagingNode
@@ -1495,9 +1521,11 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       searchFocusUntilRef.current = 0;
       filterFocusUntilRef.current = 0;
       setAnimating(true);
+      scheduleFrame();
     };
 
     const onMove = (event: PointerEvent) => {
+      scheduleFrame();
       const distance = Math.hypot(event.clientX - startRef.current.x, event.clientY - startRef.current.y);
       if (distance > 4) {
         pointerMovedRef.current = true;
@@ -1539,10 +1567,12 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       dragRef.current = null;
       writeCameraPrefs(cameraTargetRef.current);
       setAnimating(simulation.alpha() > 0.02);
+      scheduleFrame();
     };
 
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
+      scheduleFrame();
       searchFocusUntilRef.current = 0;
       filterFocusUntilRef.current = 0;
       const rect = canvas.getBoundingClientRect();
@@ -1604,7 +1634,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
     canvas.style.cursor = 'default';
 
     resizeRef.current?.disconnect();
-    resizeRef.current = new ResizeObserver(() => { resize(); draw(); });
+    resizeRef.current = new ResizeObserver(() => { resize(); draw(); scheduleFrame(); });
     resizeRef.current.observe(container);
     const restoredCamera = readCameraPrefs();
     if (restoredCamera) {
@@ -1643,7 +1673,18 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
     });
 
 
+    const hasStagingNodes = simNodes.some((node) => {
+      const v = node.properties?.validation;
+      return v === 'PENDING_FIELD' || v === 'STAGED';
+    });
+
+    const scheduleFrame = () => {
+      if (rafRef.current !== null) return;
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
     const tick = (timestamp: number) => {
+      rafRef.current = null;
       const activeQuery = searchRef.current.trim();
       if (
         !activeQuery &&
@@ -1714,31 +1755,54 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       (tick as unknown as { last?: number }).last = timestamp;
       animationTimeRef.current = timestamp * 0.001;
       const dt = Math.min(2.2, elapsed / 16.67);
-      const count = Math.max(1, Math.round((simNodes.length > 3000 ? 2 : 3) * dt));
+      const count = Math.max(1, Math.round(qualityConfig.simTicks * dt));
       for (let i = 0; i < count; i += 1) {
-        const alpha = simulation.alpha(); const time = timestamp * 0.001;
-        simNodes.forEach((node) => {
-          const currentAiAssist = aiAssistRef.current;
-          const isAiAssistNode = currentAiAssist?.isOpen && currentAiAssist.nodeId === node.id;
-          const nodeValidation =
-            typeof node.properties?.validation === 'string' ? node.properties.validation : undefined;
-          const isStagingNode =
-            nodeValidation === 'PENDING_FIELD' || nodeValidation === 'STAGED';
-          const isFocusedNode = activeRef.current === node.id;
-          const driftMultiplier = isAiAssistNode ? 0.22 : isStagingNode ? 0.45 : isFocusedNode ? 0.55 : 1;
-          const sway = node.driftRadius * (0.08 + alpha * 0.18) * dt * driftMultiplier;
-          node.vx = (node.vx || 0) + Math.cos(time * node.driftSpeed + node.drift) * sway;
-          node.vy = (node.vy || 0) + Math.sin(time * node.driftSpeed * 0.87 + node.drift * 1.1) * sway;
-        });
+        const alpha = simulation.alpha();
+        const time = timestamp * 0.001;
+        if (qualityConfig.drift) {
+          simNodes.forEach((node) => {
+            const currentAiAssist = aiAssistRef.current;
+            const isAiAssistNode = currentAiAssist?.isOpen && currentAiAssist.nodeId === node.id;
+            const nodeValidation =
+              typeof node.properties?.validation === 'string' ? node.properties.validation : undefined;
+            const isStagingNode =
+              nodeValidation === 'PENDING_FIELD' || nodeValidation === 'STAGED';
+            const isFocusedNode = activeRef.current === node.id;
+            const driftMultiplier = isAiAssistNode ? 0.22 : isStagingNode ? 0.45 : isFocusedNode ? 0.55 : 1;
+            const sway = node.driftRadius * (0.08 + alpha * 0.18) * dt * driftMultiplier;
+            node.vx = (node.vx || 0) + Math.cos(time * node.driftSpeed + node.drift) * sway;
+            node.vy = (node.vy || 0) + Math.sin(time * node.driftSpeed * 0.87 + node.drift * 1.1) * sway;
+          });
+        }
         simulation.tick();
       }
-      if (!dragRef.current) simulation.alphaTarget(simulation.alpha() < 0.03 ? 0.018 : 0.03);
+      if (!dragRef.current) {
+        if (simNodes.length > 800) {
+          simulation.alphaTarget(simulation.alpha() < 0.025 ? 0 : 0.015);
+        } else {
+          simulation.alphaTarget(simulation.alpha() < 0.03 ? 0.018 : 0.03);
+        }
+      }
       draw();
-      setAnimating(simulation.alpha() > 0.02);
+
+      const allowIdlePause = quality !== 'ultra' || simNodes.length > 400;
+      const cameraMoving =
+        Math.abs(cameraRef.current.x - cameraTargetRef.current.x) > 0.08
+        || Math.abs(cameraRef.current.y - cameraTargetRef.current.y) > 0.08
+        || Math.abs(cameraRef.current.zoom - cameraTargetRef.current.zoom) > 0.004;
+      const simActive = simulation.alpha() > 0.02;
+      const interacting = dragRef.current !== null || modeRef.current === 'pan';
+      const needsPulse = qualityConfig.pulseRipples && (hasStagingNodes || Boolean(aiAssistRef.current?.isOpen));
+      const keepAnimating = simActive || cameraMoving || interacting || needsPulse || !allowIdlePause;
+      setAnimating(keepAnimating);
+      if (!keepAnimating && allowIdlePause) {
+        simulation.alphaTarget(0);
+        return;
+      }
       rafRef.current = requestAnimationFrame(tick);
     };
 
-    rafRef.current = requestAnimationFrame(tick);
+    scheduleFrame();
 
     return () => {
       writeCameraPrefs(cameraRef.current);
@@ -1755,7 +1819,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       resizeRef.current?.disconnect();
       setAnimating(false);
     };
-  }, [adjacency.neighbors, quality, renderGraph]);
+  }, [adjacency.neighbors, isOpsChrome, quality, renderGraph]);
 
   const commitSearch = () => {
     const next = searchInput.trim();
@@ -2159,15 +2223,52 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         @keyframes chat-thinking-bounce { 0%, 80%, 100% { transform: translateY(0); opacity: 0.4; } 40% { transform: translateY(-3px); opacity: 1; } }
         .chat-thinking-dot { animation: chat-thinking-bounce 1.2s infinite ease-in-out; }
       `}</style>
-      <div className={`relative overflow-hidden flex-1 border-none ${isLightMode ? 'bg-slate-100/85' : 'bg-slate-950/70'}`}>
-        <div className={`absolute inset-x-0 top-0 z-40 flex items-center justify-between border-b px-3 py-2 text-xs ${isLightMode ? 'border-slate-300/60 bg-slate-100/80 text-slate-700' : 'border-slate-800/70 bg-slate-950/75 text-slate-200'}`}>
-          <span>IAM Knowledge Graph</span>
-          <div className="flex items-center gap-2">
-            <span className={`h-2 w-2 rounded-full ${animating ? 'animate-pulse bg-sky-400' : 'bg-emerald-400'}`} />
+      <div className={`relative overflow-hidden flex-1 border-none ${isLightMode ? 'bg-slate-100/85' : 'bg-premium-bg'}`}>
+        <div className={`absolute inset-x-0 top-0 z-40 flex items-center justify-between gap-2 border-b px-2 py-1.5 text-xs sm:px-3 sm:py-2 ${isLightMode ? 'border-slate-300/60 bg-slate-100/80 text-slate-700' : 'border-premium-border/50 bg-premium-sidebar/95 text-premium-text'}`}>
+          {isOpsChrome && opsQueryOptions && onQueryChange ? (
+            <div className={`flex shrink-0 rounded-md border p-0.5 ${isLightMode ? 'border-slate-300 bg-slate-200/60' : 'border-premium-border/55 bg-premium-surface/80'}`}>
+              {opsQueryOptions.map((option) => {
+                const active = graphQuery === option.key;
+                const label = OPS_QUERY_LABELS[option.key] ?? option.label;
+                return (
+                  <button
+                    key={option.key}
+                    type="button"
+                    onClick={() => onQueryChange(option.key)}
+                    className={`rounded px-2 py-1 text-[11px] font-medium transition ${
+                      active
+                        ? isLightMode
+                          ? 'bg-white text-slate-900 shadow-sm'
+                          : 'bg-premium-hover-strong text-premium-text'
+                        : isLightMode
+                          ? 'text-slate-600 hover:text-slate-900'
+                          : 'text-premium-muted hover:text-premium-text'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <span>{isOpsChrome ? 'Network topology' : 'IAM Knowledge Graph'}</span>
+          )}
+          <div className="flex min-w-0 items-center gap-1.5 sm:gap-2">
+            {isOpsChrome && (
+              <>
+                <button type="button" onClick={reframe} className={`inline-flex h-7 shrink-0 items-center rounded-md border px-2 text-[11px] font-medium transition ${isLightMode ? 'border-slate-300 bg-slate-100 text-slate-700 hover:border-slate-400 hover:bg-slate-200' : 'border-premium-border/55 bg-premium-card text-premium-text hover:border-premium-accent/70 hover:bg-premium-hover/90'}`}>Center</button>
+                <button type="button" onClick={resetView} className={`inline-flex h-7 shrink-0 items-center rounded-md border px-2 text-[11px] font-medium transition ${isLightMode ? 'border-slate-300 bg-slate-100 text-slate-700 hover:border-slate-400 hover:bg-slate-200' : 'border-premium-border/55 bg-premium-card text-premium-text hover:border-premium-accent/70 hover:bg-premium-hover/90'}`}>Reset</button>
+                <span className={`hidden truncate text-[11px] sm:inline ${isLightMode ? 'text-premium-muted-dim' : 'text-premium-muted'}`}>
+                  {graph.metrics?.total_nodes ?? graph.nodes.length}n · {graph.metrics?.total_edges ?? graph.edges.length}e
+                  {quality !== 'ultra' ? ` · ${modeLabel}` : ''}
+                </span>
+              </>
+            )}
+            <span className={`h-2 w-2 shrink-0 rounded-full ${animating ? 'animate-pulse bg-sky-400' : 'bg-emerald-400'}`} />
           </div>
         </div>
 
-        <div ref={containerRef} className="relative h-full min-h-[760px] w-full" aria-label="IAM topology graph canvas">
+        <div ref={containerRef} className={`relative h-full w-full ${isOpsChrome ? 'min-h-0' : 'min-h-[760px]'}`} aria-label={isOpsChrome ? 'Grid network topology graph' : 'IAM topology graph canvas'}>
           <canvas ref={canvasRef} className="h-full w-full touch-none" />
         </div>
 
@@ -2194,17 +2295,17 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
 
         {isNodeAiAssistOpen && nodeAiAssist && (
           <div className="pointer-events-none absolute right-4 top-14 bottom-4 z-40 w-[clamp(300px,32vw,360px)] max-w-[calc(100%-2rem)]">
-            <div className="pointer-events-auto flex h-full flex-col rounded-2xl border border-sky-500/25 bg-slate-950/92 p-4 shadow-[0_24px_80px_rgba(15,23,42,0.5)] backdrop-blur-xl">
-              <div className="flex items-start justify-between gap-3 border-b border-slate-800/90 pb-3">
+            <div className="pointer-events-auto flex h-full flex-col rounded-2xl border border-sky-500/25 bg-premium-card/95 p-4 shadow-[0_24px_80px_rgba(15,23,42,0.5)] backdrop-blur-xl">
+              <div className="flex items-start justify-between gap-3 border-b border-premium-border/50/90 pb-3">
                 <div>
                   <p className="text-[11px] uppercase tracking-[0.24em] text-sky-300/80">AI Assist</p>
-                  <h3 className="mt-1 text-sm font-semibold text-slate-100">{nodeAiAssist.nodeTitle || 'Selected node'}</h3>
-                  <p className="mt-1 text-xs text-slate-400">Ask about risk, permissions, graph exposure, or safe remediation for this node.</p>
+                  <h3 className="mt-1 text-sm font-semibold text-premium-text">{nodeAiAssist.nodeTitle || 'Selected node'}</h3>
+                  <p className="mt-1 text-xs text-premium-muted">Ask about risk, permissions, graph exposure, or safe remediation for this node.</p>
                 </div>
                 <button
                   type="button"
                   onClick={nodeAiAssist.onClose}
-                  className="rounded-full border border-slate-700 bg-slate-900/80 px-2 py-1 text-xs text-slate-300 transition hover:border-slate-500 hover:text-white"
+                  className="rounded-full border border-premium-border/70 bg-premium-card/95 px-2 py-1 text-xs text-premium-text-secondary transition hover:border-premium-border hover:text-premium-text"
                 >
                   Close
                 </button>
@@ -2215,28 +2316,28 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                 style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
               >
                 {nodeAiAssist.messages.length === 0 && !nodeAiAssist.loading ? (
-                  <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-3 text-sm text-slate-400">
+                  <div className="rounded-xl border border-premium-border/50 bg-premium-surface/90 p-3 text-sm text-premium-muted">
                     Start the conversation for this node.
                   </div>
                 ) : (
                   nodeAiAssist.messages.map((msg, index) => (
                     <div
                       key={`${msg.role}-${index}`}
-                      className={`rounded-xl border px-3 py-2 ${msg.role === 'user' ? 'ml-8 border-slate-700 bg-slate-900/90' : 'mr-8 border-sky-500/20 bg-sky-950/10'}`}
+                      className={`rounded-xl border px-3 py-2 ${msg.role === 'user' ? 'ml-8 border-premium-border/70 bg-premium-card' : 'mr-8 border-sky-500/20 bg-sky-950/10'}`}
                     >
-                      <p className={`text-[11px] uppercase tracking-widest ${msg.role === 'user' ? 'text-slate-500' : 'text-sky-300/75'}`}>
+                      <p className={`text-[11px] uppercase tracking-widest ${msg.role === 'user' ? 'text-premium-muted-dim' : 'text-sky-300/75'}`}>
                         {msg.role === 'user' ? 'You' : 'AI'}
                       </p>
                       {msg.role === 'assistant' ? (
-                        <div className="mt-1 text-slate-100">
+                        <div className="mt-1 text-premium-text">
                           <AssistantRichText
                             content={msg.content}
-                            className="text-sm text-slate-100"
-                            mutedClassName="text-slate-200"
+                            className="text-sm text-premium-text"
+                            mutedClassName="text-premium-text-secondary"
                           />
                         </div>
                       ) : (
-                        <p className="mt-1 whitespace-pre-wrap break-words text-sm text-slate-100">{msg.content}</p>
+                        <p className="mt-1 whitespace-pre-wrap break-words text-sm text-premium-text">{msg.content}</p>
                       )}
 
                       {msg.remediationProposals && msg.remediationProposals.length > 0 && (
@@ -2245,18 +2346,18 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                             const isApplied = nodeAiAssist.appliedProposalIds.has(proposal.proposal_id);
                             const isApplying = nodeAiAssist.applyingProposalId === proposal.proposal_id;
                             return (
-                              <div key={proposal.proposal_id} className="rounded-lg border border-slate-700 bg-slate-900/80 px-3 py-3">
+                              <div key={proposal.proposal_id} className="rounded-lg border border-premium-border/70 bg-premium-card/95 px-3 py-3">
                                 <div className="flex items-start justify-between gap-3">
                                   <div>
-                                    <p className="text-sm text-slate-100">{proposal.title}</p>
-                                    <p className="mt-1 text-xs leading-5 text-slate-300">{proposal.description}</p>
+                                    <p className="text-sm text-premium-text">{proposal.title}</p>
+                                    <p className="mt-1 text-xs leading-5 text-premium-text-secondary">{proposal.description}</p>
                                   </div>
-                                  <span className="rounded-full border border-slate-700 bg-slate-950 px-2 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-300">
+                                  <span className="rounded-full border border-premium-border/55 bg-premium-surface px-2 py-1 text-[10px] uppercase tracking-[0.18em] text-premium-text-secondary">
                                     {proposal.action.replace(/_/g, ' ')}
                                   </span>
                                 </div>
                                 <div className="mt-3 flex items-center justify-between gap-3">
-                                  <p className="text-[11px] text-slate-400">
+                                  <p className="text-[11px] text-premium-muted">
                                     {proposal.policy_name
                                       ? `${proposal.entity_type} ${proposal.entity_name} <- ${proposal.policy_name}`
                                       : `${proposal.entity_type} ${proposal.entity_name}`}
@@ -2265,7 +2366,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                                     type="button"
                                     disabled={!nodeAiAssist.canApplyProposals || isApplied || isApplying}
                                     onClick={() => nodeAiAssist.onApplyProposal(proposal)}
-                                    className={`rounded px-3 py-1.5 text-xs font-medium text-white transition ${isApplied ? 'bg-emerald-600' : 'bg-orange-500 hover:bg-orange-400 disabled:bg-slate-700'} disabled:cursor-not-allowed`}
+                                    className={`rounded px-3 py-1.5 text-xs font-medium text-white transition ${isApplied ? 'bg-emerald-600' : 'bg-orange-500 hover:bg-orange-400 disabled:bg-premium-hover-strong'} disabled:cursor-not-allowed`}
                                   >
                                     {isApplied ? 'Applied' : isApplying ? 'Applying...' : nodeAiAssist.canApplyProposals ? (proposal.requires_confirmation ? 'Review' : 'Apply') : 'Admin only'}
                                   </button>
@@ -2278,8 +2379,8 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
 
                       {msg.findings && msg.findings.length > 0 && (
                         <div className="mt-2">
-                          <p className="text-[11px] uppercase tracking-widest text-slate-500">Key Findings</p>
-                          <ul className="ml-5 mt-1 list-disc space-y-1 text-xs text-slate-300">
+                          <p className="text-[11px] uppercase tracking-widest text-premium-muted-dim">Key Findings</p>
+                          <ul className="ml-5 mt-1 list-disc space-y-1 text-xs text-premium-text-secondary">
                             {msg.findings.slice(0, 4).map((item, idx) => (
                               <li key={`graph-findings-${idx}`}>{item}</li>
                             ))}
@@ -2289,8 +2390,8 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
 
                       {msg.actions && msg.actions.length > 0 && (
                         <div className="mt-2">
-                          <p className="text-[11px] uppercase tracking-widest text-slate-500">Recommended Actions</p>
-                          <ul className="ml-5 mt-1 list-disc space-y-1 text-xs text-slate-300">
+                          <p className="text-[11px] uppercase tracking-widest text-premium-muted-dim">Recommended Actions</p>
+                          <ul className="ml-5 mt-1 list-disc space-y-1 text-xs text-premium-text-secondary">
                             {msg.actions.slice(0, 4).map((item, idx) => (
                               <li key={`graph-actions-${idx}`}>{item}</li>
                             ))}
@@ -2299,7 +2400,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                       )}
 
                       {msg.role === 'assistant' && msg.agent && (msg.agent.model || (msg.agent.toolsUsed && msg.agent.toolsUsed.length > 0)) && (
-                        <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-slate-800/80 pt-2">
+                        <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-premium-border/50/80 pt-2">
                           {msg.agent.auto && (
                             <span
                               className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-300"
@@ -2329,7 +2430,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                           {(msg.agent.toolsUsed || []).map((tool) => (
                             <span
                               key={tool}
-                              className="rounded-full bg-slate-800/80 px-2 py-0.5 text-[10px] text-slate-300"
+                              className="rounded-full bg-premium-hover/80 px-2 py-0.5 text-[10px] text-premium-text-secondary"
                               title="Tool the AI called to ground this answer"
                             >
                               {tool}
@@ -2348,7 +2449,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                     aria-live="polite"
                   >
                     <p className="text-[11px] uppercase tracking-widest text-sky-300/75">AI</p>
-                    <div className="mt-1 flex items-center gap-2 text-sm text-slate-200">
+                    <div className="mt-1 flex items-center gap-2 text-sm text-premium-text-secondary">
                       <span>Thinking</span>
                       <span className="inline-flex items-end gap-1" aria-hidden="true">
                         <span className="chat-thinking-dot inline-block h-1.5 w-1.5 rounded-full bg-sky-300/80" style={{ animationDelay: '0s' }} />
@@ -2365,7 +2466,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                   event.preventDefault();
                   void nodeAiAssist.onSubmit();
                 }}
-                className="mt-4 flex items-center gap-2 border-t border-slate-800/90 pt-3"
+                className="mt-4 flex items-center gap-2 border-t border-premium-border/50/90 pt-3"
               >
                 <input
                   type="text"
@@ -2373,12 +2474,12 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                   onChange={(event) => nodeAiAssist.onDraftChange(event.target.value)}
                   disabled={nodeAiAssist.loading}
                   placeholder="Ask about this node..."
-                  className="flex-1 rounded-lg border border-slate-700 bg-slate-900/90 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-sky-500/60"
+                  className="flex-1 rounded-lg border border-premium-border/70 bg-premium-card px-3 py-2 text-sm text-premium-text outline-none transition focus:border-premium-accent/60"
                 />
                 <button
                   type="submit"
                   disabled={nodeAiAssist.loading || !nodeAiAssist.draft.trim()}
-                  className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-400 disabled:cursor-not-allowed disabled:bg-slate-700"
+                  className="rounded-lg bg-premium-accent px-4 py-2 text-sm font-medium text-white transition hover:bg-premium-accent-hover disabled:cursor-not-allowed disabled:bg-premium-hover-strong"
                 >
                   {nodeAiAssist.loading ? 'Thinking...' : 'Send'}
                 </button>
@@ -2389,12 +2490,12 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
 
         {isGraphAiAssistOpen && graphAiAssist && (
           <div className="pointer-events-none absolute inset-x-0 top-14 z-40 flex justify-center px-4">
-            <div className="pointer-events-auto w-full max-w-3xl rounded-2xl border border-sky-500/25 bg-slate-950/94 px-4 py-4 shadow-[0_24px_80px_rgba(15,23,42,0.52)] backdrop-blur-xl">
-              <div className="flex items-start justify-between gap-4 border-b border-slate-800/90 pb-3">
+            <div className="pointer-events-auto w-full max-w-3xl rounded-2xl border border-sky-500/25 bg-premium-card/98 px-4 py-4 shadow-[0_24px_80px_rgba(15,23,42,0.52)] backdrop-blur-xl">
+              <div className="flex items-start justify-between gap-4 border-b border-premium-border/50/90 pb-3">
                 <div>
                   <p className="text-[11px] uppercase tracking-[0.24em] text-sky-300/80">Graph AI Mode</p>
-                  <h3 className="mt-1 text-sm font-semibold text-slate-100">{graphAiAssist.nodeTitle || 'Current graph view'}</h3>
-                  <p className="mt-1 text-xs text-slate-400">
+                  <h3 className="mt-1 text-sm font-semibold text-premium-text">{graphAiAssist.nodeTitle || 'Current graph view'}</h3>
+                  <p className="mt-1 text-xs text-premium-muted">
                     {isGraphConversationMode
                       ? 'Ask questions about the current graph and get contextual responses with follow-ups.'
                       : 'Give an instruction for this graph. The AI will update the graph view instead of holding a conversation.'}
@@ -2405,7 +2506,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                     type="button"
                     onClick={() => graphAiAssist.onSwitchMode?.('graph')}
                     disabled={graphAiAssist.loading || graphAiAssist.mode === 'graph'}
-                    className="rounded-full border border-slate-700 bg-slate-900/80 px-2 py-1 text-xs text-slate-300 transition hover:border-slate-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    className="rounded-full border border-premium-border/70 bg-premium-card/95 px-2 py-1 text-xs text-premium-text-secondary transition hover:border-premium-border hover:text-premium-text disabled:cursor-not-allowed disabled:opacity-60"
                   >
                     Instruction
                   </button>
@@ -2413,14 +2514,14 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                     type="button"
                     onClick={() => graphAiAssist.onSwitchMode?.('graph_chat')}
                     disabled={graphAiAssist.loading || graphAiAssist.mode === 'graph_chat'}
-                    className="rounded-full border border-slate-700 bg-slate-900/80 px-2 py-1 text-xs text-slate-300 transition hover:border-slate-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
+                    className="rounded-full border border-premium-border/70 bg-premium-card/95 px-2 py-1 text-xs text-premium-text-secondary transition hover:border-premium-border hover:text-premium-text disabled:cursor-not-allowed disabled:opacity-60"
                   >
                     Conversation
                   </button>
                   <button
                     type="button"
                     onClick={graphAiAssist.onClose}
-                    className="rounded-full border border-slate-700 bg-slate-900/80 px-2 py-1 text-xs text-slate-300 transition hover:border-slate-500 hover:text-white"
+                    className="rounded-full border border-premium-border/70 bg-premium-card/95 px-2 py-1 text-xs text-premium-text-secondary transition hover:border-premium-border hover:text-premium-text"
                   >
                     Close
                   </button>
@@ -2428,23 +2529,23 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
               </div>
 
               <div className="mt-3 grid gap-3 lg:grid-cols-[1fr_0.9fr]">
-                <div className="min-h-[150px] rounded-xl border border-slate-800 bg-slate-900/70 p-3">
-                  <p className="text-[11px] uppercase tracking-widest text-slate-500">
+                <div className="min-h-[150px] rounded-xl border border-premium-border/50 bg-premium-surface/90 p-3">
+                  <p className="text-[11px] uppercase tracking-widest text-premium-muted-dim">
                     {isGraphConversationMode ? 'Conversation' : 'Last instruction'}
                   </p>
                   {isGraphConversationMode ? (
                     <div className="mt-2 max-h-[180px] space-y-2 overflow-y-auto pr-1 text-xs" style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}>
                       {graphAiAssist.messages.length ? graphAiAssist.messages.map((msg, idx) => (
-                        <div key={`graph-mode-message-${idx}`} className={`rounded border px-2 py-1.5 ${msg.role === 'user' ? 'border-slate-700 bg-slate-900/90 text-slate-200' : 'border-sky-500/20 bg-sky-950/15 text-slate-100'}`}>
-                          <p className="text-[10px] uppercase tracking-wider text-slate-400">{msg.role === 'user' ? 'You' : 'AI'}</p>
+                        <div key={`graph-mode-message-${idx}`} className={`rounded border px-2 py-1.5 ${msg.role === 'user' ? 'border-premium-border/70 bg-premium-card text-premium-text-secondary' : 'border-sky-500/20 bg-sky-950/15 text-premium-text'}`}>
+                          <p className="text-[10px] uppercase tracking-wider text-premium-muted">{msg.role === 'user' ? 'You' : 'AI'}</p>
                           <p className="mt-1 line-clamp-3 whitespace-pre-wrap">{msg.content}</p>
                         </div>
                       )) : (
-                        <p className="text-sm text-slate-400">No conversation yet. Ask a question about the graph.</p>
+                        <p className="text-sm text-premium-muted">No conversation yet. Ask a question about the graph.</p>
                       )}
                     </div>
                   ) : (
-                    <p className="mt-2 line-clamp-5 text-sm text-slate-100">
+                    <p className="mt-2 line-clamp-5 text-sm text-premium-text">
                       {graphAiAssist.lastInstruction || 'No instruction sent yet. Try “show me the most dangerous trust paths” or “focus on roles connected to dangerous policies”.'}
                     </p>
                   )}
@@ -2454,12 +2555,12 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                     {isGraphConversationMode ? 'AI Response' : 'Graph status'}
                   </p>
                   {latestGraphAiMessage ? (
-                    <div className="mt-2 text-slate-100">
-                      <p className="text-sm text-slate-100">{latestGraphAiMessage.content}</p>
+                    <div className="mt-2 text-premium-text">
+                      <p className="text-sm text-premium-text">{latestGraphAiMessage.content}</p>
                       {latestGraphAiMessage.findings && latestGraphAiMessage.findings!.length > 0 && (
                         <div className="mt-3">
-                          <p className="text-[11px] uppercase tracking-widest text-slate-500">Key Findings</p>
-                          <ul className="ml-5 mt-1 list-disc space-y-1 text-xs text-slate-300">
+                          <p className="text-[11px] uppercase tracking-widest text-premium-muted-dim">Key Findings</p>
+                          <ul className="ml-5 mt-1 list-disc space-y-1 text-xs text-premium-text-secondary">
                             {latestGraphAiMessage.findings!.slice(0, 4).map((item, idx) => (
                               <li key={`graph-mode-findings-${idx}`}>{item}</li>
                             ))}
@@ -2468,7 +2569,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                       )}
                       {latestGraphAiMessage.suggestionPrompts && latestGraphAiMessage.suggestionPrompts!.length > 0 && (
                         <div className="mt-3">
-                          <p className="text-[11px] uppercase tracking-widest text-slate-500">Did You Mean</p>
+                          <p className="text-[11px] uppercase tracking-widest text-premium-muted-dim">Did You Mean</p>
                           <div className="mt-2 flex flex-wrap gap-2">
                             {latestGraphAiMessage.suggestionPrompts!.slice(0, 6).map((prompt, idx) => (
                               <button
@@ -2487,7 +2588,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                       )}
                       {latestGraphAiMessage.modeSuggestions && latestGraphAiMessage.modeSuggestions!.length > 0 && (
                         <div className="mt-3">
-                          <p className="text-[11px] uppercase tracking-widest text-slate-500">Mode Suggestion</p>
+                          <p className="text-[11px] uppercase tracking-widest text-premium-muted-dim">Mode Suggestion</p>
                           <div className="mt-2 flex flex-wrap gap-2">
                             {latestGraphAiMessage.modeSuggestions!.map((suggestion) => (
                               <button
@@ -2505,7 +2606,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                       )}
                     </div>
                   ) : (
-                    <p className="mt-2 text-sm text-slate-400">
+                    <p className="mt-2 text-sm text-premium-muted">
                       {isGraphConversationMode
                         ? 'Ask a graph question to start a conversation.'
                         : 'The graph will update directly after each instruction.'}
@@ -2521,7 +2622,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                   aria-live="polite"
                 >
                   <p className="text-[11px] uppercase tracking-widest text-sky-300/75">AI</p>
-                  <div className="mt-1 flex items-center gap-2 text-sm text-slate-200">
+                  <div className="mt-1 flex items-center gap-2 text-sm text-premium-text-secondary">
                     <span>Thinking</span>
                     <span className="inline-flex items-end gap-1" aria-hidden="true">
                       <span className="chat-thinking-dot inline-block h-1.5 w-1.5 rounded-full bg-sky-300/80" style={{ animationDelay: '0s' }} />
@@ -2545,12 +2646,12 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                   onChange={(event) => graphAiAssist.onDraftChange(event.target.value)}
                   disabled={graphAiAssist.loading}
                   placeholder={isGraphConversationMode ? 'Ask a question about this graph...' : 'Give an instruction for this graph...'}
-                  className="flex-1 rounded-lg border border-slate-700 bg-slate-900/90 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-sky-500/60"
+                  className="flex-1 rounded-lg border border-premium-border/70 bg-premium-card px-3 py-2 text-sm text-premium-text outline-none transition focus:border-premium-accent/60"
                 />
                 <button
                   type="submit"
                   disabled={graphAiAssist.loading || !graphAiAssist.draft.trim()}
-                  className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-400 disabled:cursor-not-allowed disabled:bg-slate-700"
+                  className="rounded-lg bg-premium-accent px-4 py-2 text-sm font-medium text-white transition hover:bg-premium-accent-hover disabled:cursor-not-allowed disabled:bg-premium-hover-strong"
                 >
                   {graphAiAssist.loading ? 'Thinking...' : 'Send'}
                 </button>
@@ -2559,21 +2660,21 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
           </div>
         )}
 
-        {emptySpaceMenu.visible && (
+        {emptySpaceMenu.visible && !isOpsChrome && (
           <div
-            className={`absolute z-50 w-[220px] rounded-xl border shadow-2xl ${isLightMode ? 'border-slate-300 bg-white/95' : 'border-slate-700/80 bg-slate-950/95'}`}
+            className={`absolute z-50 w-[220px] rounded-xl border shadow-2xl ${isLightMode ? 'border-slate-300 bg-white/95' : 'border-premium-border/55 bg-premium-card/98'}`}
             style={{ left: emptySpaceMenu.x, top: emptySpaceMenu.y }}
             onPointerDown={(event) => event.stopPropagation()}
             onClick={(event) => event.stopPropagation()}
           >
             <div className="px-3 py-2">
-              <p className={`text-[11px] uppercase tracking-[0.2em] ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>Graph Actions</p>
+              <p className={`text-[11px] uppercase tracking-[0.2em] ${isLightMode ? 'text-premium-muted-dim' : 'text-premium-muted'}`}>Graph Actions</p>
             </div>
-            <div className={`border-t ${isLightMode ? 'border-slate-200' : 'border-slate-800'}`} />
+            <div className={`border-t ${isLightMode ? 'border-slate-200' : 'border-premium-border/80'}`} />
             <button
               type="button"
               onClick={() => void openGraphFullscreen()}
-              className={`block w-full px-3 py-2 text-left text-sm transition ${isLightMode ? 'text-slate-900 hover:bg-slate-100' : 'text-slate-100 hover:bg-slate-900/80'}`}
+              className={`block w-full px-3 py-2 text-left text-sm transition ${isLightMode ? 'text-slate-900 hover:bg-slate-100' : 'text-premium-text hover:bg-premium-surface'}`}
             >
               Full screen
             </button>
@@ -2587,9 +2688,9 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
           </div>
         )}
 
-        {!hideGraphChrome && (
+        {!hideGraphChrome && !isOpsChrome && (
           <div className="pointer-events-none absolute inset-0 z-30 p-3 pt-12 sm:p-4 sm:pt-12">
-            <div className={`pointer-events-auto rounded-xl border p-2.5 backdrop-blur-lg ${isFullscreen ? 'max-w-[min(760px,max(240px,calc(100%-clamp(300px,32vw,360px)-284px)))]' : 'max-w-[min(760px,max(240px,calc(100%-268px)))] lg:max-w-[min(760px,max(240px,calc(100%-clamp(300px,32vw,360px)-284px)))]'} ${isLightMode ? 'border-slate-300/60 bg-slate-100/80' : 'border-slate-700/70 bg-slate-950/68'}`}>
+            <div className={`pointer-events-auto rounded-xl border p-2.5 backdrop-blur-lg ${isFullscreen ? 'max-w-[min(760px,max(240px,calc(100%-clamp(300px,32vw,360px)-284px)))]' : 'max-w-[min(760px,max(240px,calc(100%-268px)))] lg:max-w-[min(760px,max(240px,calc(100%-clamp(300px,32vw,360px)-284px)))]'} ${isLightMode ? 'border-slate-300/60 bg-slate-100/80' : 'border-premium-border/50 bg-premium-card/92'}`}>
             <div className="flex flex-wrap items-center gap-2">
               <input
                 value={searchInput}
@@ -2601,17 +2702,17 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                   }
                 }}
                 placeholder="Search identities, roles, policies, ARNs (press Enter)"
-                className={`min-w-[220px] flex-1 rounded-md border px-3 py-1.5 text-sm outline-none focus:border-sky-500/60 ${isLightMode ? 'border-slate-300 bg-slate-50 text-slate-900 placeholder:text-slate-500' : 'border-slate-700/80 bg-slate-900/80 text-slate-100 placeholder:text-slate-500'}`}
+                className={`min-w-[220px] flex-1 rounded-md border px-3 py-1.5 text-sm outline-none focus:border-premium-accent/60 ${isLightMode ? 'border-slate-300 bg-slate-50 text-slate-900 placeholder:text-premium-muted-dim' : 'border-premium-border/55 bg-premium-surface text-premium-text placeholder:text-premium-muted-dim'}`}
               />
-              <button type="button" onClick={reframe} className={`inline-flex h-8 items-center rounded-lg border px-3 text-xs font-medium transition ${isLightMode ? 'border-slate-300 bg-slate-100 text-slate-700 hover:border-slate-400 hover:bg-slate-200' : 'border-slate-600/80 bg-slate-900/90 text-slate-100 hover:border-sky-400/70 hover:bg-slate-800/90'}`}>Center</button>
-              <button type="button" onClick={resetView} className={`inline-flex h-8 items-center rounded-lg border px-3 text-xs font-medium transition ${isLightMode ? 'border-slate-300 bg-slate-100 text-slate-700 hover:border-slate-400 hover:bg-slate-200' : 'border-slate-600/80 bg-slate-900/90 text-slate-100 hover:border-sky-400/70 hover:bg-slate-800/90'}`}>Reset</button>
+              <button type="button" onClick={reframe} className={`inline-flex h-8 items-center rounded-lg border px-3 text-xs font-medium transition ${isLightMode ? 'border-slate-300 bg-slate-100 text-slate-700 hover:border-slate-400 hover:bg-slate-200' : 'border-premium-border/55 bg-premium-card text-premium-text hover:border-premium-accent/70 hover:bg-premium-hover/90'}`}>Center</button>
+              <button type="button" onClick={resetView} className={`inline-flex h-8 items-center rounded-lg border px-3 text-xs font-medium transition ${isLightMode ? 'border-slate-300 bg-slate-100 text-slate-700 hover:border-slate-400 hover:bg-slate-200' : 'border-premium-border/55 bg-premium-card text-premium-text hover:border-premium-accent/70 hover:bg-premium-hover/90'}`}>Reset</button>
               <button 
                 type="button" 
                 onClick={() => {
                   setPathFindingEnabled(!pathFindingEnabled);
                   clearPathFinding();
                 }} 
-                className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-3 text-xs font-medium transition ${pathFindingEnabled ? (isLightMode ? 'border-emerald-300 bg-emerald-50 text-emerald-700' : 'border-emerald-500/70 bg-emerald-500/18 text-emerald-100 hover:border-emerald-400/70') : (isLightMode ? 'border-slate-300 bg-slate-100 text-slate-700 hover:border-slate-400 hover:bg-slate-200' : 'border-slate-600/80 bg-slate-900/90 text-slate-100 hover:border-sky-400/70 hover:bg-slate-800/90')}`}
+                className={`inline-flex h-8 items-center gap-1.5 rounded-lg border px-3 text-xs font-medium transition ${pathFindingEnabled ? (isLightMode ? 'border-emerald-300 bg-emerald-50 text-emerald-700' : 'border-emerald-500/70 bg-emerald-500/18 text-emerald-100 hover:border-emerald-400/70') : (isLightMode ? 'border-slate-300 bg-slate-100 text-slate-700 hover:border-slate-400 hover:bg-slate-200' : 'border-premium-border/55 bg-premium-card text-premium-text hover:border-premium-accent/70 hover:bg-premium-hover/90')}`}
               >
                 <GitBranch className="w-3.5 h-3.5" />
                 Path
@@ -2658,12 +2759,12 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
               {([
                 ['all', 'All', typeCounts.all], ['substation', 'Substations', typeCounts.substation], ['transformer', 'Transformers', typeCounts.transformer], ['feeder', 'Feeders', typeCounts.feeder], ['meter', 'Meters', typeCounts.meter], ['other', 'Other', typeCounts.other],
               ] as Array<[Filter, string, number]>).map(([key, label, count]) => (
-                <button key={key} type="button" onClick={() => toggleFilter(key)} className={`inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-xs font-medium transition ${isFilterActive(key) ? 'border-sky-500/70 bg-sky-500/18 text-sky-100' : 'border-slate-700/80 bg-slate-900/70 text-slate-300 hover:border-slate-500 hover:bg-slate-800/80 hover:text-slate-100'}`}>
+                <button key={key} type="button" onClick={() => toggleFilter(key)} className={`inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-xs font-medium transition ${isFilterActive(key) ? 'border-premium-accent/70 bg-premium-accent/18 text-premium-text' : 'border-premium-border/55 bg-premium-surface/90 text-premium-text-secondary hover:border-premium-border hover:bg-premium-hover/80 hover:text-premium-text'}`}>
                   <span>{label}</span>
-                  <span className={`inline-flex min-w-[20px] items-center justify-center rounded-full px-1.5 text-[10px] ${isFilterActive(key) ? 'bg-sky-400/25 text-sky-100' : 'bg-slate-700/70 text-slate-300'}`}>{count}</span>
+                  <span className={`inline-flex min-w-[20px] items-center justify-center rounded-full px-1.5 text-[10px] ${isFilterActive(key) ? 'bg-premium-accent/25 text-premium-text' : 'bg-premium-hover-strong/70 text-premium-text-secondary'}`}>{count}</span>
                 </button>
               ))}
-              <div className="ml-auto hidden items-center gap-3 text-[11px] text-slate-400 sm:flex">
+              <div className="ml-auto hidden items-center gap-3 text-[11px] text-premium-muted sm:flex">
                 <span>N {graph.metrics?.total_nodes ?? graph.nodes.length}</span>
                 <span>E {graph.metrics?.total_edges ?? graph.edges.length}</span>
                 <span>Risk {graph.metrics?.high_risk_entities ?? 0}</span>
@@ -2685,18 +2786,18 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
           </div>
         )}
 
-        {!hideGraphChrome && (
+        {!hideGraphChrome && !isOpsChrome && (
           <div className={`pointer-events-none absolute top-14 z-50 ${showInspectorPanel ? 'right-[calc(clamp(300px,32vw,360px)+32px)]' : 'right-4 lg:right-[calc(clamp(300px,32vw,360px)+32px)]'}`}>
-            <div className={`pointer-events-auto w-[228px] overflow-hidden rounded-xl border bg-slate-950/96 p-3 text-sm backdrop-blur-xl transition-colors duration-300 ${controlsPanelOpen ? 'border-sky-500/30 shadow-[0_20px_60px_rgba(56,189,248,0.22)]' : 'border-slate-600/80 shadow-lg'}`}>
+            <div className={`pointer-events-auto w-[228px] overflow-hidden rounded-xl border bg-premium-card/98 p-3 text-sm backdrop-blur-xl transition-colors duration-300 ${controlsPanelOpen ? 'border-premium-accent/30 shadow-[0_20px_60px_rgba(212,212,212,0.08)]' : 'border-premium-border/55 shadow-lg'}`}>
             <button
               type="button"
               onClick={() => setControlsPanelOpen((open) => !open)}
-              className="flex w-full items-center justify-between rounded-lg border border-slate-700/70 bg-slate-900/45 px-2.5 py-2 text-left transition-colors duration-300 hover:border-slate-500/80 hover:bg-slate-900/70"
+              className="flex w-full items-center justify-between rounded-lg border border-premium-border/50 bg-premium-surface/70 px-2.5 py-2 text-left transition-colors duration-300 hover:border-premium-border/80 hover:bg-premium-surface/90"
               aria-label={controlsPanelOpen ? 'Collapse graph controls' : 'Expand graph controls'}
             >
-              <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-300">Graph controls</p>
+              <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-premium-text-secondary">Graph controls</p>
               <span
-                className={`inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-600/80 bg-slate-900/70 text-slate-300 transition-transform duration-300 ease-out ${controlsPanelOpen ? 'rotate-180' : 'rotate-0'}`}
+                className={`inline-flex h-6 w-6 items-center justify-center rounded-full border border-premium-border/55 bg-premium-surface/90 text-premium-text-secondary transition-transform duration-300 ease-out ${controlsPanelOpen ? 'rotate-180' : 'rotate-0'}`}
                 aria-hidden="true"
               >
                 ▾
@@ -2704,75 +2805,75 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
             </button>
             <div className={`origin-top overflow-hidden pr-1 transition-[max-height,opacity,margin] duration-300 ease-out ${controlsPanelOpen ? 'mt-2 max-h-[70vh] opacity-100' : 'pointer-events-none mt-0 max-h-0 opacity-0'}`}>
               {/* Display section */}
-              <button type="button" onClick={() => setDisplaySectionOpen((o) => !o)} className="mb-2 flex w-full items-center justify-between text-xs font-semibold uppercase tracking-wide text-slate-300">
-                <span>Display</span><span className="text-slate-500">{displaySectionOpen ? '▾' : '▸'}</span>
+              <button type="button" onClick={() => setDisplaySectionOpen((o) => !o)} className="mb-2 flex w-full items-center justify-between text-xs font-semibold uppercase tracking-wide text-premium-text-secondary">
+                <span>Display</span><span className="text-premium-muted-dim">{displaySectionOpen ? '▾' : '▸'}</span>
               </button>
               {displaySectionOpen && (
                 <div className="space-y-3 mb-4">
                   <div className="flex items-center justify-between">
-                    <span className="text-slate-300">Arrows</span>
+                    <span className="text-premium-text-secondary">Arrows</span>
                     <button
                       type="button"
                       onClick={() => setShowArrows((v) => !v)}
                       aria-pressed={showArrows}
-                      className={`relative h-5 w-10 rounded-full border transition-colors duration-200 ${showArrows ? 'border-sky-400/80 bg-sky-500' : 'border-slate-600/90 bg-slate-700'}`}
+                      className={`relative h-5 w-10 rounded-full border transition-colors duration-200 ${showArrows ? 'border-sky-400/80 bg-sky-500' : 'border-slate-600/90 bg-premium-hover-strong'}`}
                     >
                       <span className={`absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform duration-200 ease-out ${showArrows ? 'translate-x-5' : 'translate-x-0'}`} />
                     </button>
                   </div>
                   <div className="flex items-center justify-between">
                     <div>
-                      <span className="text-slate-300">Heat map</span>
-                      <p className="text-[10px] text-slate-500">Color nodes by canonical risk</p>
+                      <span className="text-premium-text-secondary">Heat map</span>
+                      <p className="text-[10px] text-premium-muted-dim">Color nodes by canonical risk</p>
                     </div>
                     <button
                       type="button"
                       onClick={() => setHeatMapEnabled((v) => !v)}
                       aria-pressed={heatMapEnabled}
-                      className={`relative h-5 w-10 rounded-full border transition-colors duration-200 ${heatMapEnabled ? 'border-orange-400/80 bg-orange-500' : 'border-slate-600/90 bg-slate-700'}`}
+                      className={`relative h-5 w-10 rounded-full border transition-colors duration-200 ${heatMapEnabled ? 'border-orange-400/80 bg-orange-500' : 'border-slate-600/90 bg-premium-hover-strong'}`}
                     >
                       <span className={`absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform duration-200 ease-out ${heatMapEnabled ? 'translate-x-5' : 'translate-x-0'}`} />
                     </button>
                   </div>
                   <div>
-                    <div className="flex justify-between text-xs text-slate-400 mb-1"><span>Text fade threshold</span><span>{textFadeZoom.toFixed(1)}×</span></div>
+                    <div className="flex justify-between text-xs text-premium-muted mb-1"><span>Text fade threshold</span><span>{textFadeZoom.toFixed(1)}×</span></div>
                     <input type="range" min={0.2} max={4} step={0.1} value={textFadeZoom} onChange={(e) => setTextFadeZoom(Number(e.target.value))} className="w-full accent-sky-500" />
                   </div>
                   <div>
-                    <div className="flex justify-between text-xs text-slate-400 mb-1"><span>Node size</span><span>{nodeSizeMult.toFixed(1)}×</span></div>
+                    <div className="flex justify-between text-xs text-premium-muted mb-1"><span>Node size</span><span>{nodeSizeMult.toFixed(1)}×</span></div>
                     <input type="range" min={0.4} max={3} step={0.1} value={nodeSizeMult} onChange={(e) => setNodeSizeMult(Number(e.target.value))} className="w-full accent-sky-500" />
                   </div>
                   <div>
-                    <div className="flex justify-between text-xs text-slate-400 mb-1"><span>Link thickness</span><span>{linkThickness.toFixed(2)}×</span></div>
+                    <div className="flex justify-between text-xs text-premium-muted mb-1"><span>Link thickness</span><span>{linkThickness.toFixed(2)}×</span></div>
                     <input type="range" min={0.05} max={4} step={0.05} value={linkThickness} onChange={(e) => setLinkThickness(Number(e.target.value))} className="w-full accent-sky-500" />
                   </div>
                   <div>
-                    <div className="flex justify-between text-xs text-slate-400 mb-1"><span>Link text visibility</span><span>{edgeVisibility.toFixed(2)}x</span></div>
+                    <div className="flex justify-between text-xs text-premium-muted mb-1"><span>Link text visibility</span><span>{edgeVisibility.toFixed(2)}x</span></div>
                     <input type="range" min={0.5} max={2} step={0.05} value={edgeVisibility} onChange={(e) => setEdgeVisibility(Number(e.target.value))} className="w-full accent-sky-500" />
                   </div>
                   <button type="button" onClick={() => { simRef.current?.alphaTarget(0.22).restart(); setAnimating(true); }} className="w-full rounded-md bg-sky-600 py-2 font-semibold text-white hover:bg-sky-500 transition">Animate</button>
                 </div>
               )}
               {/* Forces section */}
-              <button type="button" onClick={() => setForcesSectionOpen((o) => !o)} className="mb-2 flex w-full items-center justify-between text-xs font-semibold uppercase tracking-wide text-slate-300">
-                <span>Forces</span><span className="text-slate-500">{forcesSectionOpen ? '▾' : '▸'}</span>
+              <button type="button" onClick={() => setForcesSectionOpen((o) => !o)} className="mb-2 flex w-full items-center justify-between text-xs font-semibold uppercase tracking-wide text-premium-text-secondary">
+                <span>Forces</span><span className="text-premium-muted-dim">{forcesSectionOpen ? '▾' : '▸'}</span>
               </button>
               {forcesSectionOpen && (
                 <div className="space-y-3">
                   <div>
-                    <div className="flex justify-between text-xs text-slate-400 mb-1"><span>Center force</span><span>{centerForce.toFixed(2)}</span></div>
+                    <div className="flex justify-between text-xs text-premium-muted mb-1"><span>Center force</span><span>{centerForce.toFixed(2)}</span></div>
                     <input type="range" min={0} max={1.25} step={0.01} value={centerForce} onChange={(e) => setCenterForce(Number(e.target.value))} className="w-full accent-sky-500" />
                   </div>
                   <div>
-                    <div className="flex justify-between text-xs text-slate-400 mb-1"><span>Repel force</span><span>{repelForce.toFixed(2)}</span></div>
+                    <div className="flex justify-between text-xs text-premium-muted mb-1"><span>Repel force</span><span>{repelForce.toFixed(2)}</span></div>
                     <input type="range" min={0} max={1.5} step={0.01} value={repelForce} onChange={(e) => setRepelForce(Number(e.target.value))} className="w-full accent-sky-500" />
                   </div>
                   <div>
-                    <div className="flex justify-between text-xs text-slate-400 mb-1"><span>Link force</span><span>{linkStrength.toFixed(2)}</span></div>
+                    <div className="flex justify-between text-xs text-premium-muted mb-1"><span>Link force</span><span>{linkStrength.toFixed(2)}</span></div>
                     <input type="range" min={0} max={1} step={0.01} value={linkStrength} onChange={(e) => setLinkStrength(Number(e.target.value))} className="w-full accent-sky-500" />
                   </div>
                   <div>
-                    <div className="flex justify-between text-xs text-slate-400 mb-1"><span>Link distance</span><span>{linkDist}</span></div>
+                    <div className="flex justify-between text-xs text-premium-muted mb-1"><span>Link distance</span><span>{linkDist}</span></div>
                     <input type="range" min={10} max={300} step={5} value={linkDist} onChange={(e) => setLinkDist(Number(e.target.value))} className="w-full accent-sky-500" />
                   </div>
                 </div>
@@ -2797,17 +2898,17 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
             animation: chat-thinking-bounce 1.2s infinite ease-in-out;
           }
         `}</style>
-        {!isNodeAiAssistOpen && !hideGraphChrome && (
+        {!isNodeAiAssistOpen && !hideGraphChrome && !isOpsChrome && (
           <div className={`pointer-events-none absolute right-4 top-14 bottom-4 z-30 ${isFullscreen ? 'block w-[clamp(300px,32vw,360px)] max-w-[calc(100%-2rem)]' : 'hidden w-[clamp(300px,32vw,360px)] lg:block'}`}>
             <div className="pointer-events-auto h-full">
-              <div className="flex h-full flex-col rounded-2xl border border-slate-700/80 bg-slate-950/75 p-4 backdrop-blur-xl">
+              <div className="flex h-full flex-col rounded-2xl border border-premium-border/55 bg-premium-card/95 p-4 shadow-premium backdrop-blur-xl">
                 <div className="inspector-scroll min-h-0 space-y-4 overflow-y-auto" style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}>
               <div>
-                <p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">Inspector</p>
+                <p className="text-[11px] uppercase tracking-[0.24em] text-premium-muted-dim">Inspector</p>
                 <div className="mt-3 space-y-3">
                   {selectedNode ? (
                     <>
-                      <div><h3 className="text-lg font-semibold text-slate-100">{selectedNode.fullLabel}</h3><p className="text-sm text-slate-400">{selectedNode.nodeType || selectedNode.category}</p></div>
+                      <div><h3 className="text-lg font-semibold text-premium-text">{selectedNode.fullLabel}</h3><p className="text-sm text-premium-muted">{selectedNode.nodeType || selectedNode.category}</p></div>
                       <div className={`rounded-lg border px-3 py-2 text-sm ${
                         selectedNode.riskBand === 'critical'
                           ? 'text-red-300 border-red-800/70 bg-red-950/30'
@@ -2815,13 +2916,13 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                             ? 'text-orange-300 border-orange-800/70 bg-orange-950/30'
                             : selectedNode.riskBand === 'medium'
                               ? 'text-amber-300 border-amber-800/70 bg-amber-950/30'
-                              : 'text-slate-300 border-slate-700/70 bg-slate-900/70'
+                              : 'text-premium-text-secondary border-premium-border/50 bg-premium-surface/90'
                       }`}>Risk level: {selectedNode.riskLevel.toFixed(1)} ({selectedNode.riskBand})</div>
                       {onRequestAiAssist && (
                         <button
                           type="button"
                           onClick={() => requestAiAssist(selectedNode)}
-                          className="rounded-lg bg-sky-500 px-3 py-2 text-sm font-medium text-white transition hover:bg-sky-400"
+                          className="rounded-lg bg-premium-accent px-3 py-2 text-sm font-medium text-white transition hover:bg-premium-accent-hover"
                         >
                           Ask AI About This Node
                         </button>
@@ -2833,44 +2934,44 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                         {selectedPolicySummary?.has_wildcard_actions && <div className="rounded-lg border border-sky-700/70 bg-sky-950/25 px-3 py-2 text-xs text-sky-200">Wildcard actions</div>}
                         {selectedPolicySummary?.has_wildcard_resources && <div className="rounded-lg border border-sky-700/70 bg-sky-950/25 px-3 py-2 text-xs text-sky-200">Wildcard resources</div>}
                       </div>
-                      <div className="rounded-lg border border-slate-800 bg-slate-900/70 p-3 text-xs text-slate-300"><p className="font-medium text-slate-100">Focus depth</p><p className="mt-1 text-slate-400">Current expansion radius is {depth} hop{depth === 1 ? '' : 's'}</p></div>
-                      {selectedNode.arn && <div className="break-all rounded-lg border border-slate-800 bg-slate-900/70 p-3 text-xs text-slate-400">{selectedNode.arn}</div>}
+                      <div className="rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary"><p className="font-medium text-premium-text">Focus depth</p><p className="mt-1 text-premium-muted">Current expansion radius is {depth} hop{depth === 1 ? '' : 's'}</p></div>
+                      {selectedNode.arn && <div className="break-all rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-muted">{selectedNode.arn}</div>}
                       {(selectedPolicySummary || selectedPolicyActions.length > 0 || selectedPolicyResources.length > 0) && (
-                        <div className="rounded-lg border border-slate-800 bg-slate-900/70 p-3 text-xs text-slate-300">
-                          <p className="font-medium text-slate-100">Policy summary</p>
+                        <div className="rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary">
+                          <p className="font-medium text-premium-text">Policy summary</p>
                           <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
-                            <div className="rounded border border-slate-800 bg-slate-950/70 px-2 py-2 text-slate-300">
-                              <span className="text-slate-500">Statements</span>
-                              <p className="mt-1 text-sm text-slate-100">{selectedPolicySummary?.statement_count ?? 0}</p>
+                            <div className="rounded border border-premium-border/50 bg-premium-surface/85 px-2 py-2 text-premium-text-secondary">
+                              <span className="text-premium-muted-dim">Statements</span>
+                              <p className="mt-1 text-sm text-premium-text">{selectedPolicySummary?.statement_count ?? 0}</p>
                             </div>
-                            <div className="rounded border border-slate-800 bg-slate-950/70 px-2 py-2 text-slate-300">
-                              <span className="text-slate-500">Allowed actions</span>
-                              <p className="mt-1 text-sm text-slate-100">{selectedPolicyActions.length}</p>
+                            <div className="rounded border border-premium-border/50 bg-premium-surface/85 px-2 py-2 text-premium-text-secondary">
+                              <span className="text-premium-muted-dim">Allowed actions</span>
+                              <p className="mt-1 text-sm text-premium-text">{selectedPolicyActions.length}</p>
                             </div>
                           </div>
                           {selectedPolicyActions.length > 0 && (
                             <div className="mt-3">
-                              <p className="text-[10px] uppercase tracking-wider text-slate-500">Allowed actions</p>
+                              <p className="text-[10px] uppercase tracking-wider text-premium-muted-dim">Allowed actions</p>
                               <div className="mt-2 flex flex-wrap gap-1.5">
                                 {selectedPolicyActions.slice(0, 8).map((action) => (
-                                  <span key={action} className="rounded-full border border-slate-700 bg-slate-950 px-2 py-1 text-[10px] text-slate-200">{action}</span>
+                                  <span key={action} className="rounded-full border border-premium-border/55 bg-premium-surface px-2 py-1 text-[10px] text-premium-text-secondary">{action}</span>
                                 ))}
                               </div>
                             </div>
                           )}
                           {selectedPolicyResources.length > 0 && (
                             <div className="mt-3">
-                              <p className="text-[10px] uppercase tracking-wider text-slate-500">Allowed resources</p>
+                              <p className="text-[10px] uppercase tracking-wider text-premium-muted-dim">Allowed resources</p>
                               <div className="mt-2 space-y-1">
                                 {selectedPolicyResources.slice(0, 5).map((resource) => (
-                                  <div key={resource} className="break-all rounded bg-slate-950/70 px-2 py-1 text-[11px] text-slate-300">{resource}</div>
+                                  <div key={resource} className="break-all rounded bg-premium-surface/85 px-2 py-1 text-[11px] text-premium-text-secondary">{resource}</div>
                                 ))}
                               </div>
                             </div>
                           )}
                           {selectedDeniedActions.length > 0 && (
                             <div className="mt-3">
-                              <p className="text-[10px] uppercase tracking-wider text-slate-500">Denied actions</p>
+                              <p className="text-[10px] uppercase tracking-wider text-premium-muted-dim">Denied actions</p>
                               <div className="mt-2 flex flex-wrap gap-1.5">
                                 {selectedDeniedActions.slice(0, 6).map((action) => (
                                   <span key={action} className="rounded-full border border-red-800/70 bg-red-950/20 px-2 py-1 text-[10px] text-red-200">{action}</span>
@@ -2880,7 +2981,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                           )}
                           {selectedDeniedResources.length > 0 && (
                             <div className="mt-3">
-                              <p className="text-[10px] uppercase tracking-wider text-slate-500">Denied resources</p>
+                              <p className="text-[10px] uppercase tracking-wider text-premium-muted-dim">Denied resources</p>
                               <div className="mt-2 space-y-1">
                                 {selectedDeniedResources.slice(0, 4).map((resource) => (
                                   <div key={resource} className="break-all rounded bg-red-950/15 px-2 py-1 text-[11px] text-red-200">{resource}</div>
@@ -2891,9 +2992,9 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                         </div>
                       )}
                       {selectedNode && (
-                        <div className="rounded-lg border border-slate-800 bg-slate-900/70 p-3 text-xs text-slate-300">
-                          <p className="font-medium text-slate-100">Asset detail</p>
-                          <p className="mt-2 font-mono text-[11px] text-slate-400">{selectedNode.id}</p>
+                        <div className="rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary">
+                          <p className="font-medium text-premium-text">Asset detail</p>
+                          <p className="mt-2 font-mono text-[11px] text-premium-muted">{selectedNode.id}</p>
                           <p className="mt-1">Validation: {String(selectedNode.properties.validation ?? 'APPROVED')}</p>
                           <p className="mt-1">Connected: {selectedNode.properties.connected === false ? 'no' : 'yes'}</p>
                           <p className="mt-1">On trace path: {selectedNode.properties.traced ? 'yes' : 'no'}</p>
@@ -2901,37 +3002,37 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                         </div>
                       )}
                       {selectedNode && (
-                        <div className="rounded-lg border border-slate-800 bg-slate-900/70 p-3 text-xs text-slate-300">
-                          <p className="font-medium text-slate-100">Registry record (placeholder)</p>
+                        <div className="rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary">
+                          <p className="font-medium text-premium-text">Registry record (placeholder)</p>
                           {policyDocumentLoading && (
-                            <p className="mt-2 text-[11px] text-slate-400">Loading policy JSON from AWS IAM...</p>
+                            <p className="mt-2 text-[11px] text-premium-muted">Loading policy JSON from AWS IAM...</p>
                           )}
                           {policyDocumentError && !policyDocumentLoading && (
                             <p className="mt-2 text-[11px] text-rose-300">{policyDocumentError}</p>
                           )}
                           {policyDocument?.document && !policyDocumentLoading && (
                             <>
-                              <p className="mt-2 text-[10px] uppercase tracking-wider text-slate-500">
+                              <p className="mt-2 text-[10px] uppercase tracking-wider text-premium-muted-dim">
                                 Version {policyDocument.default_version_id}
                               </p>
-                              <pre className="mt-2 max-h-56 overflow-auto rounded border border-slate-800 bg-slate-950/80 p-2 text-[10px] leading-relaxed text-slate-300">
+                              <pre className="mt-2 max-h-56 overflow-auto rounded border border-premium-border/50 bg-premium-surface/90 p-2 text-[10px] leading-relaxed text-premium-text-secondary">
                                 {JSON.stringify(policyDocument.document, null, 2)}
                               </pre>
                             </>
                           )}
                         </div>
                       )}
-                      <div className="rounded-lg border border-slate-800 bg-slate-900/70 p-3 text-xs text-slate-300">
-                        <p className="font-medium text-slate-100">Connected entity mix</p>
+                      <div className="rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary">
+                        <p className="font-medium text-premium-text">Connected entity mix</p>
                         <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
-                          <div className="rounded border border-slate-800 bg-slate-950/70 px-2 py-2"><span className="text-slate-500">Substations</span><p className="mt-1 text-sm text-slate-100">{selectedRelationshipCounts.substation}</p></div>
-                          <div className="rounded border border-slate-800 bg-slate-950/70 px-2 py-2"><span className="text-slate-500">Transformers</span><p className="mt-1 text-sm text-slate-100">{selectedRelationshipCounts.transformer}</p></div>
-                          <div className="rounded border border-slate-800 bg-slate-950/70 px-2 py-2"><span className="text-slate-500">Feeders</span><p className="mt-1 text-sm text-slate-100">{selectedRelationshipCounts.feeder}</p></div>
-                          <div className="rounded border border-slate-800 bg-slate-950/70 px-2 py-2"><span className="text-slate-500">Meters</span><p className="mt-1 text-sm text-slate-100">{selectedRelationshipCounts.meter}</p></div>
+                          <div className="rounded border border-premium-border/50 bg-premium-surface/85 px-2 py-2"><span className="text-premium-muted-dim">Substations</span><p className="mt-1 text-sm text-premium-text">{selectedRelationshipCounts.substation}</p></div>
+                          <div className="rounded border border-premium-border/50 bg-premium-surface/85 px-2 py-2"><span className="text-premium-muted-dim">Transformers</span><p className="mt-1 text-sm text-premium-text">{selectedRelationshipCounts.transformer}</p></div>
+                          <div className="rounded border border-premium-border/50 bg-premium-surface/85 px-2 py-2"><span className="text-premium-muted-dim">Feeders</span><p className="mt-1 text-sm text-premium-text">{selectedRelationshipCounts.feeder}</p></div>
+                          <div className="rounded border border-premium-border/50 bg-premium-surface/85 px-2 py-2"><span className="text-premium-muted-dim">Meters</span><p className="mt-1 text-sm text-premium-text">{selectedRelationshipCounts.meter}</p></div>
                         </div>
                       </div>
-                      <div className="rounded-lg border border-slate-800 bg-slate-900/70 p-3 text-xs text-slate-300"><p className="font-medium text-slate-100">Connected entities</p><div className="mt-2 space-y-2">{relatedNodeGroups.length ? relatedNodeGroups.map((group) => <div key={group.category}><p className="mb-1 text-[10px] uppercase tracking-wider text-slate-500">{group.label} ({group.nodes.length})</p><div className="space-y-1">{group.nodes.slice(0, 5).map((node) => <button key={node.id} type="button" onClick={() => { setActiveId(node.id); const match = nodesRef.current.find((item) => item.id === node.id); if (match) cameraTargetRef.current = { x: match.x || 0, y: match.y || 0, zoom: 1.8 }; }} className="block w-full truncate rounded bg-slate-950/70 px-2 py-1 text-left text-slate-300 transition hover:bg-slate-800 hover:text-white">{node.fullLabel}</button>)}</div></div>) : <p className="text-slate-500">No connected entities</p>}</div></div>
-                      <div className="rounded-lg border border-slate-800 bg-slate-900/70 p-3 text-xs text-slate-300"><p className="font-medium text-slate-100">Relationship count</p><p className="mt-1 text-slate-400">{selectedEdges} nearby relationship{selectedEdges === 1 ? '' : 's'}</p></div>
+                      <div className="rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary"><p className="font-medium text-premium-text">Connected entities</p><div className="mt-2 space-y-2">{relatedNodeGroups.length ? relatedNodeGroups.map((group) => <div key={group.category}><p className="mb-1 text-[10px] uppercase tracking-wider text-premium-muted-dim">{group.label} ({group.nodes.length})</p><div className="space-y-1">{group.nodes.slice(0, 5).map((node) => <button key={node.id} type="button" onClick={() => { setActiveId(node.id); const match = nodesRef.current.find((item) => item.id === node.id); if (match) cameraTargetRef.current = { x: match.x || 0, y: match.y || 0, zoom: 1.8 }; }} className="block w-full truncate rounded bg-premium-surface/85 px-2 py-1 text-left text-premium-text-secondary transition hover:bg-premium-hover hover:text-premium-text">{node.fullLabel}</button>)}</div></div>) : <p className="text-premium-muted-dim">No connected entities</p>}</div></div>
+                      <div className="rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary"><p className="font-medium text-premium-text">Relationship count</p><p className="mt-1 text-premium-muted">{selectedEdges} nearby relationship{selectedEdges === 1 ? '' : 's'}</p></div>
                       {!!selectedEscalationDetails.length && (
                         <div className="rounded-lg border border-red-800/70 bg-red-950/20 p-3 text-xs text-red-100">
                           <p className="font-medium text-red-200">Escalation chain explanation</p>
@@ -2947,31 +3048,44 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                         </div>
                       )}
                     </>
-                  ) : <div className="rounded-lg border border-slate-800 bg-slate-900/70 p-3 text-sm text-slate-400">Select a node to inspect its neighborhood.</div>}
+                  ) : <div className="rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-sm text-premium-muted">Select a node to inspect its neighborhood.</div>}
                 </div>
               </div>
-              <div><p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">Focus controls</p><div className="mt-3 space-y-3 rounded-lg border border-slate-800 bg-slate-900/70 p-3"><div><div className="mb-1 flex items-center justify-between text-xs text-slate-400"><span>Depth</span><span>{depth} hops</span></div><input type="range" min={1} max={4} value={depth} onChange={(e) => setDepth(Number(e.target.value))} className="w-full accent-sky-400" /></div><div className="flex items-center justify-between text-xs text-slate-400"><span>Focused node</span><span className="truncate pl-2 text-slate-200">{focusId ? (selectedNode?.label || selectedNode?.fullLabel || focusId) : 'None'}</span></div></div></div>
-              <div><p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">Legend</p><div className="mt-3 space-y-1 text-sm text-slate-300"><p className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">Node types</p><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#9ec5ff]" /><span>User</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#c9a9ff]" /><span>Role</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#7fd6c9]" /><span>Policy</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#ffd08a]" /><span>Group</span></div><p className="text-[10px] uppercase tracking-widest text-slate-500 mt-2 mb-1">Security signals</p><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-4 h-4 rounded-full border-2 border-[#f4d06f]" /><span>High-value target</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-4 h-4 rounded-full border-2 border-[#ff915a]" /><span>External trust role</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-4 h-4 rounded-full border-2 border-[#ef4444] bg-[#ef4444]/20" /><span>Dangerous policy</span></div><p className="text-[10px] uppercase tracking-widest text-slate-500 mt-2 mb-1">Edge relationships</p><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#ef4444'}} /><span>Privilege escalation path</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#7fd6c9'}} /><span>Attached / Has Policy</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#ff915a'}} /><span>Assumes / Trusts Role</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#ffd08a'}} /><span>Member of Group</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#a881ff'}} /><span>Granted / Grants</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#9aa4b3'}} /><span>Other</span></div></div></div>
-              <div><p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">Selection</p><div className="mt-3 rounded-lg border border-slate-800 bg-slate-900/70 p-3 text-xs text-slate-300">{hoverNode ? <div className="space-y-1"><p className="font-semibold text-slate-100">{hoverNode.fullLabel || hoverNode.label}</p><p className="text-[10px] uppercase tracking-wide text-slate-500">{hoverNode.nodeType}</p><p className="font-mono text-[10px] text-slate-400">{hoverNode.id}</p>{hoverNode.properties?.validation ? <p className="text-slate-400">Status: {String(hoverNode.properties.validation)}</p> : null}</div> : 'Hover nodes to preview, click to lock focus.'}</div></div>
+              <div><p className="text-[11px] uppercase tracking-[0.24em] text-premium-muted-dim">Focus controls</p><div className="mt-3 space-y-3 rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3"><div><div className="mb-1 flex items-center justify-between text-xs text-premium-muted"><span>Depth</span><span>{depth} hops</span></div><input type="range" min={1} max={4} value={depth} onChange={(e) => setDepth(Number(e.target.value))} className="w-full accent-sky-400" /></div><div className="flex items-center justify-between text-xs text-premium-muted"><span>Focused node</span><span className="truncate pl-2 text-premium-text-secondary">{focusId ? (selectedNode?.label || selectedNode?.fullLabel || focusId) : 'None'}</span></div></div></div>
+              <div><p className="text-[11px] uppercase tracking-[0.24em] text-premium-muted-dim">Legend</p><div className="mt-3 space-y-1 text-sm text-premium-text-secondary"><p className="text-[10px] uppercase tracking-widest text-premium-muted-dim mb-1">Node types</p><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#9ec5ff]" /><span>User</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#c9a9ff]" /><span>Role</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#7fd6c9]" /><span>Policy</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#ffd08a]" /><span>Group</span></div><p className="text-[10px] uppercase tracking-widest text-premium-muted-dim mt-2 mb-1">Security signals</p><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-4 h-4 rounded-full border-2 border-[#f4d06f]" /><span>High-value target</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-4 h-4 rounded-full border-2 border-[#ff915a]" /><span>External trust role</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-4 h-4 rounded-full border-2 border-[#ef4444] bg-[#ef4444]/20" /><span>Dangerous policy</span></div><p className="text-[10px] uppercase tracking-widest text-premium-muted-dim mt-2 mb-1">Edge relationships</p><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#ef4444'}} /><span>Privilege escalation path</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#7fd6c9'}} /><span>Attached / Has Policy</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#ff915a'}} /><span>Assumes / Trusts Role</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#ffd08a'}} /><span>Member of Group</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#a881ff'}} /><span>Granted / Grants</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#9aa4b3'}} /><span>Other</span></div></div></div>
+              <div><p className="text-[11px] uppercase tracking-[0.24em] text-premium-muted-dim">Selection</p><div className="mt-3 rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary">{hoverNode ? <div className="space-y-1"><p className="font-semibold text-premium-text">{hoverNode.fullLabel || hoverNode.label}</p><p className="text-[10px] uppercase tracking-wide text-premium-muted-dim">{hoverNode.nodeType}</p><p className="font-mono text-[10px] text-premium-muted">{hoverNode.id}</p>{hoverNode.properties?.validation ? <p className="text-premium-muted">Status: {String(hoverNode.properties.validation)}</p> : null}</div> : 'Hover nodes to preview, click to lock focus.'}</div></div>
                 </div>
               </div>
             </div>
           </div>
         )}
 
+        {isOpsChrome && selectedNode && (
+          <div className="pointer-events-none absolute bottom-3 left-3 z-30 max-w-[min(280px,calc(100%-1.5rem))]">
+            <div className={`pointer-events-auto rounded-lg border p-3 text-xs backdrop-blur-xl ${isLightMode ? 'border-slate-300/60 bg-slate-100/90 text-slate-700' : 'border-premium-border/55 bg-premium-card/95 text-premium-text-secondary'}`}>
+              <p className={`text-sm font-semibold ${isLightMode ? 'text-slate-900' : 'text-premium-text'}`}>{selectedNode.fullLabel}</p>
+              <p className={`mt-0.5 text-[11px] capitalize ${isLightMode ? 'text-premium-muted-dim' : 'text-premium-muted'}`}>{selectedNode.nodeType || selectedNode.category}</p>
+              <p className={`mt-2 font-mono text-[10px] break-all ${isLightMode ? 'text-premium-muted-dim' : 'text-premium-muted'}`}>{selectedNode.id}</p>
+              <p className="mt-1.5">Validation: {String(selectedNode.properties.validation ?? 'APPROVED')}</p>
+              <p className="mt-1">Connected: {selectedNode.properties.connected === false ? 'no' : 'yes'}</p>
+              <p className="mt-1">On trace: {selectedNode.properties.traced ? 'yes' : 'no'}</p>
+            </div>
+          </div>
+        )}
+
         {/* Context menu for admin IAM actions */}
-        {contextMenu.visible && contextMenu.node && isAdmin && (
+        {contextMenu.visible && contextMenu.node && isAdmin && !isOpsChrome && (
           <div
-            className="absolute z-50 rounded-lg border border-slate-700/80 bg-slate-950/95 shadow-2xl"
+            className="absolute z-50 rounded-lg border border-premium-border/55 bg-premium-card/98 shadow-2xl"
             style={{ left: contextMenu.x, top: contextMenu.y }}
             onPointerDown={(e) => e.stopPropagation()}
             onClick={() => setContextMenu({ visible: false, x: 0, y: 0, node: null })}
           >
             <div className="py-1 min-w-[200px]">
-              <div className="px-3 py-1.5 text-xs font-semibold text-slate-400 uppercase tracking-wide">
+              <div className="px-3 py-1.5 text-xs font-semibold text-premium-muted uppercase tracking-wide">
                 Admin Actions
               </div>
-              <div className="border-t border-slate-800" />
+              <div className="border-t border-premium-border/50" />
               {onRequestAiAssist && (
                 <button
                   type="button"
@@ -2987,7 +3101,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                 </button>
               )}
               {contextMenu.node && (
-                <div className="px-3 py-2 text-xs text-slate-500 flex items-center gap-2">
+                <div className="px-3 py-2 text-xs text-premium-muted-dim flex items-center gap-2">
                   <Lock className="w-3 h-3" />
                   Grid remediation actions coming soon
                 </div>

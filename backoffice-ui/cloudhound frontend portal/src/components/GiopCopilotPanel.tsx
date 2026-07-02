@@ -158,10 +158,10 @@ export function GiopCopilotPanel({
 
   const shell = isLightMode
     ? 'border-slate-200 bg-white text-slate-900 shadow-xl'
-    : 'border-[#283246] bg-[#0f141d] text-[#e8edf6] shadow-2xl';
-  const muted = isLightMode ? 'text-slate-500' : 'text-[#93a0b8]';
+    : 'border-[#283246] bg-premium-sidebar text-premium-text shadow-2xl';
+  const muted = isLightMode ? 'text-slate-500' : 'text-premium-muted';
   const userBubble = isLightMode ? 'bg-cyan-700 text-white' : 'bg-cyan-800 text-white';
-  const assistantBubble = isLightMode ? 'bg-slate-100 text-slate-900' : 'bg-[#1a2230] text-[#e8edf6]';
+  const assistantBubble = isLightMode ? 'bg-slate-100 text-slate-900' : 'bg-premium-hover text-premium-text';
 
   return (
     <>
@@ -198,7 +198,7 @@ export function GiopCopilotPanel({
             <button
               type="button"
               onClick={() => setOpen(false)}
-              className={`p-1 rounded ${isLightMode ? 'hover:bg-slate-100' : 'hover:bg-[#1a2230]'}`}
+              className={`p-1 rounded ${isLightMode ? 'hover:bg-slate-100' : 'hover:bg-premium-hover'}`}
               aria-label="Close copilot"
             >
               <X className="h-4 w-4" />
@@ -249,7 +249,7 @@ export function GiopCopilotPanel({
                 className={`text-[11px] px-2 py-0.5 rounded-full border disabled:opacity-50 ${
                   isLightMode
                     ? 'border-slate-200 text-slate-600 hover:bg-slate-50'
-                    : 'border-[#283246] text-[#93a0b8] hover:bg-[#1a2230]'
+                    : 'border-[#283246] text-premium-muted hover:bg-premium-hover'
                 }`}
               >
                 {s}
@@ -276,7 +276,7 @@ export function GiopCopilotPanel({
                     ? 'bg-amber-600 text-white'
                     : isLightMode
                       ? 'border border-slate-300 text-slate-700 hover:bg-slate-50'
-                      : 'border border-[#283246] text-[#e8edf6] hover:bg-[#1a2230]'
+                      : 'border border-[#283246] text-premium-text hover:bg-premium-hover'
               }`}
               aria-label={voice.recording ? 'Stop recording and send' : 'Start voice recording'}
             >
@@ -294,7 +294,7 @@ export function GiopCopilotPanel({
               className={`flex-1 rounded-lg border px-3 py-2 text-sm disabled:opacity-50 ${
                 isLightMode
                   ? 'bg-white border-slate-300 text-slate-900'
-                  : 'bg-[#0a0f18] border-[#283246] text-[#e8edf6]'
+                  : 'bg-premium-bg border-[#283246] text-premium-text'
               }`}
             />
             <button

@@ -14,8 +14,6 @@ const LAYER_KIND: Record<string, GiopMapHoverKind> = {
   'nodes-transformers-dt': 'transformer-dt',
   'nodes-transformers-pt': 'transformer-pt',
   'staging-points': 'staging',
-  'staging-points-pulse': 'staging',
-  'staging-points-pulse-2': 'staging',
   'graph-chunk-nodes-layer': 'chunk',
   'graph-chunk-traced-layer': 'chunk',
   'field-technician-points': 'technician',
@@ -165,6 +163,11 @@ export function attachGiopMapHover(
   };
 
   const onMove = (e: MapMouseEvent) => {
+    // Skip expensive hit-tests while the user is panning/zooming — avoids jank and stuck drags.
+    if (map.isMoving()) {
+      hide();
+      return;
+    }
     const hit = pickHoverFeature(map, e.point);
     if (!hit) {
       hide();

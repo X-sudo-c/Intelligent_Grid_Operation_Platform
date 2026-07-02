@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Mic, MicOff, Send, Sparkles, X, Bot, User } from 'lucide-react';
-import { portalAiChat } from '../api/giop-api';
+import { portalAiVoiceTurn } from '../api/giop-api';
 import { useGiopVoiceSession } from '../hooks/useGiopVoiceSession';
-import { playCopilotSpeech } from '../lib/giopVoicePlayback';
+import { playCopilotSpeech, stopCopilotSpeech } from '../lib/giopVoicePlayback';
 import {
   COPILOT_SUGGESTIONS,
+  describeCopilotUiAction,
   type GiopCopilotMessage,
   type GiopCopilotPortalContext,
   type GiopCopilotUiAction,
@@ -71,6 +72,12 @@ export function EnhancedCopilotPanel({
       if (resp.agent?.session_id) {
         voiceSessionIdRef.current = String(resp.agent.session_id);
       }
+      // Surface what the assistant actually did (map moves, tab switches) so
+      // UI actions never happen silently.
+      const actionLines = [
+        ...(resp.actions ?? []),
+        ...uiActions.map(describeCopilotUiAction),
+      ];
       setMessages((prev) =>
         prev
           .filter((m) => m.id !== pendingId)
@@ -79,21 +86,19 @@ export function EnhancedCopilotPanel({
             role: 'assistant',
             content: resp.content,
             findings: resp.findings,
-            actions: resp.actions,
+            actions: actionLines,
             uiActions,
           }),
       );
       for (const action of uiActions) {
         onUiAction(action);
       }
-      const speak = resp.agent?.speak ?? resp.content;
-      await playCopilotSpeech(speak);
     },
     [onUiAction],
   );
 
   const runTextTurn = useCallback(
-    async (text: string, _opts?: { voice?: boolean }) => {
+    async (text: string, opts?: { voice?: boolean }) => {
       const trimmed = text.trim();
       if (!trimmed || busy) return;
       setInput('');
@@ -111,12 +116,20 @@ export function EnhancedCopilotPanel({
         },
       ]);
       try {
-        const resp = await portalAiChat({
-          message: trimmed,
+        // All turns use voice-turn: transcript normalization, fast-path map
+        // commands (highlight/pan/count), then steward chat fallback — no LLM
+        // required for simple commands even when typed.
+        const resp = await portalAiVoiceTurn({
+          text: trimmed,
+          sessionId: voiceSessionIdRef.current,
           mrid: portalContext.focus_mrid ?? undefined,
           context: { ...portalContext } as Record<string, unknown>,
         });
         await applyResponse(resp, pendingId);
+        if (opts?.voice) {
+          const speak = resp.agent?.speak ?? resp.content;
+          await playCopilotSpeech(speak);
+        }
       } catch (e) {
         const err = e instanceof Error ? e.message : 'Failed to get response';
         setMessages((prev) =>
@@ -135,17 +148,29 @@ export function EnhancedCopilotPanel({
     [busy, portalContext, applyResponse],
   );
 
-  const { recording, start, stop } = useGiopVoiceSession({
+  const voice = useGiopVoiceSession({
     onUtterance: (text) => runTextTurn(text, { voice: true }),
-    enabled: !busy,
+    enabled: open && !busy,
   });
+  const { recording, transcribing, error: voiceError, toggle: toggleVoice } = voice;
+
+  // Closing the panel must silence the assistant: stop any in-progress
+  // recording and cut TTS playback.
+  const voiceStopRef = useRef(voice.stop);
+  voiceStopRef.current = voice.stop;
+  useEffect(() => {
+    if (!open) {
+      voiceStopRef.current();
+      stopCopilotSpeech();
+    }
+  }, [open]);
 
   const suggestions = COPILOT_SUGGESTIONS;
   const handleSuggestion = (q: string) => runTextTurn(q);
 
   const bubbleBase = `max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed`;
   const userBubble = `${bubbleBase} ${isLightMode ? 'bg-indigo-600 text-white' : 'bg-indigo-500 text-white'}`;
-  const aiBubble = `${bubbleBase} ${isLightMode ? 'bg-slate-100 border border-slate-200 text-slate-800' : 'bg-[#1a2230] border border-[#364258] text-[#e8edf6]'}`;
+  const aiBubble = `${bubbleBase} ${isLightMode ? 'bg-slate-100 border border-slate-200 text-slate-800' : 'bg-premium-hover border border-[#364258] text-premium-text'}`;
 
   return (
     <>
@@ -186,11 +211,11 @@ export function EnhancedCopilotPanel({
             className={`fixed bottom-24 right-6 z-40 w-96 max-w-[calc(100vw-3rem)] rounded-2xl border shadow-2xl overflow-hidden ${
               isLightMode
                 ? 'bg-white border-slate-200 shadow-slate-900/10'
-                : 'bg-[#0f141d] border-[#283246] shadow-black/40'
+                : 'bg-premium-sidebar border-[#283246] shadow-black/40'
             }`}
           >
             {/* Header with gradient */}
-            <div className={`px-4 py-3 border-b ${isLightMode ? 'border-slate-200 bg-gradient-to-r from-indigo-50 to-white' : 'border-[#283246] bg-gradient-to-r from-indigo-950/30 to-[#0f141d]'}`}>
+            <div className={`px-4 py-3 border-b ${isLightMode ? 'border-slate-200 bg-gradient-to-r from-indigo-50 to-white' : 'border-premium-border bg-gradient-to-r from-premium-accent-muted/40 to-premium-sidebar'}`}>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <motion.div
@@ -199,21 +224,47 @@ export function EnhancedCopilotPanel({
                   >
                     <Bot className={`h-5 w-5 ${isLightMode ? 'text-indigo-600' : 'text-indigo-400'}`} />
                   </motion.div>
-                  <span className={`font-medium ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>Grid Copilot</span>
+                  <div>
+                    <span className={`font-medium ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>Grid Copilot</span>
+                    <p className={`text-[11px] ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>
+                      {transcribing
+                        ? 'Transcribing…'
+                        : recording
+                          ? 'Recording… tap mic to send (max 12s)'
+                          : busy
+                            ? 'Thinking…'
+                            : 'Tap mic · speak · tap again to send'}
+                    </p>
+                  </div>
                 </div>
                 <motion.button
                   whileHover={{ scale: 1.1 }}
                   whileTap={{ scale: 0.9 }}
                   onClick={() => setOpen(false)}
-                  className={`p-1.5 rounded-full ${isLightMode ? 'hover:bg-slate-100' : 'hover:bg-slate-800'}`}
+                  className={`p-1.5 rounded-full ${isLightMode ? 'hover:bg-slate-100' : 'hover:bg-premium-hover'}`}
                 >
                   <X className="h-4 w-4" />
                 </motion.button>
               </div>
             </div>
 
+            {voiceError && (
+              <p
+                className={`px-4 py-2 text-xs ${
+                  isLightMode ? 'text-amber-700 bg-amber-50' : 'text-amber-200 bg-amber-950/40'
+                }`}
+              >
+                {voiceError}
+              </p>
+            )}
+
             {/* Messages */}
-            <div ref={scrollRef} className="h-80 overflow-y-auto p-4 space-y-4">
+            <div
+              ref={scrollRef}
+              className="h-80 overflow-y-auto p-4 space-y-4"
+              aria-live="polite"
+              aria-relevant="additions"
+            >
               <AnimatePresence initial={false}>
                 {messages.map((m, i) => (
                   <motion.div
@@ -277,6 +328,21 @@ export function EnhancedCopilotPanel({
                                 ))}
                               </motion.ul>
                             )}
+                            {m.actions && m.actions.length > 0 && (
+                              <motion.ul
+                                initial="hidden"
+                                animate="visible"
+                                variants={staggerContainer}
+                                className={`text-xs space-y-1 mt-2 ${isLightMode ? 'text-indigo-600' : 'text-indigo-300'}`}
+                              >
+                                {m.actions.map((a, ai) => (
+                                  <motion.li key={ai} variants={fadeUpItem} className="flex items-start gap-1">
+                                    <span>→</span>
+                                    <span>{a}</span>
+                                  </motion.li>
+                                ))}
+                              </motion.ul>
+                            )}
                           </div>
                         )}
                       </div>
@@ -323,17 +389,20 @@ export function EnhancedCopilotPanel({
               <div className="flex items-center gap-2">
                 <motion.button
                   type="button"
-                  onClick={recording ? stop : start}
+                  onClick={toggleVoice}
                   whileHover={{ scale: 1.05 }}
                   whileTap={{ scale: 0.95 }}
-                  disabled={busy}
+                  disabled={busy || transcribing}
+                  aria-label={recording ? 'Stop recording and send' : 'Start voice recording'}
                   className={`relative p-2.5 rounded-full transition ${
                     recording
                       ? 'bg-rose-500 text-white'
-                      : isLightMode
-                        ? 'bg-slate-200 hover:bg-slate-300 text-slate-700'
-                        : 'bg-slate-800 hover:bg-slate-700 text-slate-300'
-                  } ${busy ? 'opacity-50 cursor-not-allowed' : ''}`}
+                      : transcribing
+                        ? 'bg-amber-500 text-white'
+                        : isLightMode
+                          ? 'bg-slate-200 hover:bg-slate-300 text-slate-700'
+                          : 'bg-slate-800 hover:bg-slate-700 text-slate-300'
+                  } ${busy || transcribing ? 'opacity-50 cursor-not-allowed' : ''}`}
                 >
                   {recording ? (
                     <>
@@ -362,7 +431,7 @@ export function EnhancedCopilotPanel({
                   className={`flex-1 px-3 py-2 rounded-lg text-sm outline-none transition ${
                     isLightMode
                       ? 'bg-white border border-slate-200 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100'
-                      : 'bg-[#1a2230] border border-[#364258] focus:border-indigo-500 focus:ring-2 focus:ring-indigo-900/30'
+                      : 'bg-premium-hover border border-[#364258] focus:border-indigo-500 focus:ring-2 focus:ring-indigo-900/30'
                   }`}
                 />
                 <motion.button

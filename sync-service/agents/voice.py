@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from agents import voice_session, voice_tts
+from agents import voice_session, voice_stt, voice_tts
 from agents.llm.chat import run_steward_chat
-from agents.models import AgentChatRequest, AgentChatResponse
-from agents.voice_router import execute_fast_path, parse_intent
+from agents.models import AgentChatResponse
+from agents.voice_normalize import normalize_transcript
+from agents.voice_router import try_copilot_fast_path
 
 
 def _shorten_for_speech(text: str, max_len: int = 280) -> str:
@@ -31,10 +32,12 @@ def run_voice_turn(
     sid = session_id or voice_session.new_session_id()
     state = voice_session.load(sid)
 
-    intent = parse_intent(text, session=state, context=ctx)
-    fast: dict[str, Any] | None = None
-    if intent:
-        fast = execute_fast_path(conn, intent, context=ctx)
+    voice_stt.warm_boundary_prompt(conn)
+    text, _norm = normalize_transcript(text)
+
+    intent, fast = try_copilot_fast_path(
+        conn, text, context=ctx, session=state, normalize=False
+    )
 
     if fast:
         voice_session.merge(sid, fast.get("session_patch") or {})

@@ -1,4 +1,4 @@
-import 'dart:io';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
@@ -48,7 +48,6 @@ class _FieldCaptureSheetState extends State<FieldCaptureSheet> {
   String? _message;
   String? _duplicateWarning;
   String? _photoPath;
-  String? _uploadedPhotoUrl;
   List<String> _feeders = const [];
   List<String> _substations = const [];
   bool _lookupsLoaded = false;
@@ -169,23 +168,8 @@ class _FieldCaptureSheetState extends State<FieldCaptureSheet> {
       maxWidth: 1920,
       imageQuality: 85,
     );
-    if (file == null) return;
-    setState(() {
-      _photoPath = file.path;
-      _uploadedPhotoUrl = null;
-    });
-  }
-
-  Future<String?> _uploadPhotoIfNeeded() async {
-    if (_uploadedPhotoUrl != null) return _uploadedPhotoUrl;
-    if (_photoPath == null) return null;
-    try {
-      final url = await widget.api.uploadFieldPhoto(File(_photoPath!));
-      _uploadedPhotoUrl = url;
-      return url;
-    } catch (_) {
-      return null;
-    }
+    if (file == null || !mounted) return;
+    setState(() => _photoPath = file.path);
   }
 
   Future<void> _submit() async {
@@ -203,6 +187,7 @@ class _FieldCaptureSheetState extends State<FieldCaptureSheet> {
     }
 
     final enforceHex = await CapturePreferences.enforceHexAssignment();
+    if (!mounted) return;
     if (enforceHex && !_hexAllowed()) {
       setState(() => _message = 'Location is outside your assigned work area');
       return;
@@ -213,13 +198,14 @@ class _FieldCaptureSheetState extends State<FieldCaptureSheet> {
       _message = null;
     });
 
-    final photoUrl = await _uploadPhotoIfNeeded();
     String? h3Index;
     try {
-      h3Index = await widget.api.fetchH3CellAt(
-        latitude: widget.latitude,
-        longitude: widget.longitude,
-      );
+      h3Index = await widget.api
+          .fetchH3CellAt(
+            latitude: widget.latitude,
+            longitude: widget.longitude,
+          )
+          .timeout(const Duration(seconds: 2));
     } catch (_) {}
 
     final workOrderId =
@@ -238,7 +224,7 @@ class _FieldCaptureSheetState extends State<FieldCaptureSheet> {
           ? null
           : _feederController.text.trim(),
       workOrderId: workOrderId,
-      photoUrl: photoUrl,
+      photoUrl: _photoPath,
       h3Index: h3Index,
       enforceHexAssignment: enforceHex,
       recaptureMrid: widget.prefill?.recaptureMrid,
@@ -252,17 +238,7 @@ class _FieldCaptureSheetState extends State<FieldCaptureSheet> {
     );
 
     if (!mounted) return;
-    if (result.synced) {
-      Navigator.pop(context, result);
-      return;
-    }
-
-    setState(() {
-      _loading = false;
-      _message = result.message ?? 'Offline — queued for sync when online';
-    });
-    await Future<void>.delayed(const Duration(seconds: 1));
-    if (mounted) Navigator.pop(context, result);
+    Navigator.pop(context, result);
   }
 
   @override
@@ -456,7 +432,7 @@ class _FieldCaptureSheetState extends State<FieldCaptureSheet> {
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
                   : const Icon(Icons.save),
-              label: Text(_loading ? 'Saving…' : 'Save to staging'),
+              label: Text(_loading ? 'Saving…' : 'Save'),
             ),
           ],
         ),

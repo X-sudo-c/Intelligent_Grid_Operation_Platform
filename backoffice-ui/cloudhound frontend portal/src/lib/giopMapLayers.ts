@@ -20,10 +20,17 @@ import {
   voltageEdgeColor,
 } from './giopSldTheme';
 
+/** demotiles.maplibre.org glyph stacks (see buildGiopMapStyle glyphs URL). */
+export const GIOP_MAP_LABEL_FONT_BOLD = ['Noto Sans Bold'];
+export const GIOP_MAP_LABEL_FONT_REGULAR = ['Noto Sans Regular'];
+
 export const NODE_DETAIL_ZOOM = 12;
 
 /** Street-level zoom when focusing a node from the map or sidebar (buildings + labels visible). */
 export const NODE_FOCUS_ZOOM = 17;
+
+/** Close-up zoom for duplicate spider/fan pins (~12–20 m separation visible). */
+export const DUPLICATE_CLUSTER_ZOOM = 19;
 
 export function nodeFocusZoom(currentZoom: number): number {
   return Math.max(currentZoom, NODE_FOCUS_ZOOM);
@@ -32,6 +39,8 @@ export function nodeFocusZoom(currentZoom: number): number {
 export type NodeFocusFlyOpts = {
   /** When true (default), zoom to at least NODE_FOCUS_ZOOM. When false, pan only. */
   boostZoom?: boolean;
+  /** Override zoom level (e.g. DUPLICATE_CLUSTER_ZOOM for duplicate fan view). */
+  targetZoom?: number;
 };
 
 export function flyToNodeFocus(
@@ -42,11 +51,17 @@ export function flyToNodeFocus(
 ): void {
   const boostZoom = opts?.boostZoom !== false;
   if (boostZoom) {
+    const zoom =
+      opts?.targetZoom != null
+        ? Math.max(map.getZoom(), opts.targetZoom)
+        : nodeFocusZoom(map.getZoom());
     map.flyTo({
       center,
-      zoom: nodeFocusZoom(map.getZoom()),
+      zoom,
       duration,
     });
+  } else if (opts?.targetZoom != null && map.getZoom() < opts.targetZoom) {
+    map.flyTo({ center, zoom: opts.targetZoom, duration });
   } else {
     map.easeTo({ center, duration });
   }
@@ -531,6 +546,126 @@ export function focusIdentifyCirclePaint(): CirclePaint {
   };
 }
 
+type SymbolPaint = NonNullable<SymbolLayerSpecification['paint']>;
+
+/** Carto basemap tile URLs — keep in sync with buildGiopMapStyle. */
+export const GIOP_BASEMAP_TILES = {
+  light: ['https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png'],
+  dark: ['https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png'],
+} as const;
+
+/** Side-map / duplicate fan asset name labels — amber ink, no halo stroke. */
+export const GIOP_MAP_FOCUS_LABEL_COLOR = '#b45309';
+
+export const GIOP_BASEMAP_LAYER_LIGHT = 'basemap-light';
+export const GIOP_BASEMAP_LAYER_DARK = 'basemap-dark';
+
+type MapStyleInternals = MaplibreMap & {
+  style?: {
+    sourceCaches?: Record<string, { clearTiles(): void; reload(): void }>;
+  };
+};
+
+/** Instant, reliable basemap theme — toggle preloaded light/dark raster layers. */
+export function setBasemapThemeVisibility(map: MaplibreMap, isLightMode: boolean): void {
+  if (map.getLayer(GIOP_BASEMAP_LAYER_LIGHT) && map.getLayer(GIOP_BASEMAP_LAYER_DARK)) {
+    map.setLayoutProperty(GIOP_BASEMAP_LAYER_LIGHT, 'visibility', isLightMode ? 'visible' : 'none');
+    map.setLayoutProperty(GIOP_BASEMAP_LAYER_DARK, 'visibility', isLightMode ? 'none' : 'visible');
+    map.triggerRepaint();
+    return;
+  }
+
+  // Legacy single-source styles (before dual basemap).
+  const basemap = map.getSource('basemap') as RasterTileSource | undefined;
+  if (!basemap || typeof basemap.setTiles !== 'function') return;
+  const tiles = isLightMode ? GIOP_BASEMAP_TILES.light : GIOP_BASEMAP_TILES.dark;
+  basemap.setTiles([...tiles]);
+  const cache = (map as MapStyleInternals).style?.sourceCaches?.basemap;
+  cache?.clearTiles();
+  cache?.reload();
+  map.triggerRepaint();
+}
+
+/** Map symbol labels — original amber ink for focus, no white halo stroke. */
+export function mapSymbolLabelPaint(
+  isLightMode: boolean,
+  emphasis: 'default' | 'focus' | 'muted' = 'default',
+): SymbolPaint {
+  if (emphasis === 'focus') {
+    return {
+      'text-color': GIOP_MAP_FOCUS_LABEL_COLOR,
+      'text-halo-color': isLightMode ? '#f8fafc' : '#121212',
+      'text-halo-width': 0,
+    };
+  }
+  if (isLightMode) {
+    const colors = {
+      default: '#1e293b',
+      muted: '#475569',
+    } as const;
+    return {
+      'text-color': colors[emphasis === 'muted' ? 'muted' : 'default'],
+      'text-halo-color': '#f8fafc',
+      'text-halo-width': 0,
+    };
+  }
+  const colors = {
+    default: '#BCBCBC',
+    muted: '#9A9A9A',
+  } as const;
+  return {
+    'text-color': colors[emphasis === 'muted' ? 'muted' : 'default'],
+    'text-halo-color': '#121212',
+    'text-halo-width': 0,
+  };
+}
+
+/** Apply basemap + vector paint after light/dark toggle (safe while style is loaded). */
+export function syncGiopMapTheme(map: MaplibreMap, isLightMode: boolean): void {
+  setBasemapThemeVisibility(map, isLightMode);
+  const applyLinePaint = (layerId: string, dash?: number[]) => {
+    if (!map.getLayer(layerId)) return;
+    const linePaint = tileLinePaint(isLightMode);
+    map.setPaintProperty(layerId, 'line-color', linePaint['line-color']);
+    map.setPaintProperty(layerId, 'line-width', linePaint['line-width']);
+    map.setPaintProperty(layerId, 'line-opacity', linePaint['line-opacity']);
+    if (dash) {
+      map.setPaintProperty(layerId, 'line-dasharray', dash);
+    } else if (map.getPaintProperty(layerId, 'line-dasharray') != null) {
+      map.setPaintProperty(layerId, 'line-dasharray', [1, 0]);
+    }
+  };
+  for (const layerId of ['lines-overhead-mv', 'lines-overhead-lv'] as const) {
+    applyLinePaint(layerId);
+  }
+  for (const layerId of ['lines-underground-mv', 'lines-underground-lv'] as const) {
+    applyLinePaint(layerId, UG_LINE_DASH);
+  }
+  if (map.getLayer('nodes')) {
+    const nodePaint = tileNodeCirclePaint(isLightMode);
+    map.setPaintProperty('nodes', 'circle-radius', nodePaint['circle-radius']);
+    map.setPaintProperty('nodes', 'circle-color', nodePaint['circle-color']);
+    map.setPaintProperty('nodes', 'circle-opacity', nodePaint['circle-opacity']);
+    map.setPaintProperty('nodes', 'circle-stroke-width', nodePaint['circle-stroke-width']);
+    map.setPaintProperty('nodes', 'circle-stroke-color', nodePaint['circle-stroke-color']);
+    map.setPaintProperty('nodes', 'circle-stroke-opacity', nodePaint['circle-stroke-opacity']);
+  }
+  if (map.getLayer('graph-chunk-nodes-layer')) {
+    const chunkPaint = chunkNodeCirclePaint(isLightMode);
+    for (const key of Object.keys(chunkPaint) as Array<keyof typeof chunkPaint>) {
+      map.setPaintProperty('graph-chunk-nodes-layer', key, chunkPaint[key]);
+    }
+  }
+  if (map.getLayer('focus-identify-label')) {
+    map.setPaintProperty('focus-identify-label', 'text-color', GIOP_MAP_FOCUS_LABEL_COLOR);
+    map.setPaintProperty('focus-identify-label', 'text-halo-width', 0);
+  }
+  if (map.getLayer('duplicate-cluster-labels')) {
+    map.setPaintProperty('duplicate-cluster-labels', 'text-color', GIOP_MAP_FOCUS_LABEL_COLOR);
+    map.setPaintProperty('duplicate-cluster-labels', 'text-halo-width', 0);
+  }
+}
+
 export function applyStagingMapLayersPaint(map: MaplibreMap) {
   if (!map.getLayer('staging-points')) return;
   const paint: CirclePaint = stagingPointCirclePaint();
@@ -600,14 +735,7 @@ export const WORK_ORDER_PULSE_FILTER: FilterSpecification = [
 ];
 
 export function applyTileLayerTheme(map: MaplibreMap, isLightMode: boolean) {
-  const basemap = map.getSource('basemap') as RasterTileSource | undefined;
-  if (basemap && typeof basemap.setTiles === 'function') {
-    basemap.setTiles(
-      isLightMode
-        ? ['https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png']
-        : ['https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png'],
-    );
-  }
+  setBasemapThemeVisibility(map, isLightMode);
   const applyLinePaint = (layerId: string, dash?: number[]) => {
     if (!map.getLayer(layerId)) return;
     const linePaint = tileLinePaint(isLightMode);
@@ -649,9 +777,6 @@ export function buildGiopMapStyle(
   options: GiopMapStyleOptions = {},
 ): StyleSpecification {
   const includeGisOverview = options.includeGisOverview === true;
-  const basemapTiles = light
-    ? ['https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png']
-    : ['https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png'];
 
   const vector = (layer: string) => `${martinUrl}/${layer}/{z}/{x}/{y}`;
 
@@ -764,9 +889,16 @@ export function buildGiopMapStyle(
     version: 8,
     glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
     sources: {
-      basemap: {
+      'basemap-light': {
         type: 'raster',
-        tiles: basemapTiles,
+        tiles: [...GIOP_BASEMAP_TILES.light],
+        tileSize: 256,
+        attribution:
+          '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+      },
+      'basemap-dark': {
+        type: 'raster',
+        tiles: [...GIOP_BASEMAP_TILES.dark],
         tileSize: 256,
         attribution:
           '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
@@ -798,7 +930,18 @@ export function buildGiopMapStyle(
       },
     },
     layers: [
-      { id: 'basemap', type: 'raster', source: 'basemap' },
+      {
+        id: GIOP_BASEMAP_LAYER_LIGHT,
+        type: 'raster',
+        source: 'basemap-light',
+        layout: { visibility: light ? 'visible' : 'none' },
+      },
+      {
+        id: GIOP_BASEMAP_LAYER_DARK,
+        type: 'raster',
+        source: 'basemap-dark',
+        layout: { visibility: light ? 'none' : 'visible' },
+      },
       ...gisOverviewLayers,
       {
         id: 'lines-overhead-mv',
@@ -886,7 +1029,7 @@ export function buildGiopMapStyle(
           visibility: 'none',
           'text-field': ['get', 'region'],
           'text-size': ['interpolate', ['linear'], ['zoom'], 5, 10, 7, 13, 9, 15],
-          'text-font': ['Noto Sans Bold'],
+          'text-font': GIOP_MAP_LABEL_FONT_BOLD,
           'text-anchor': 'center',
           'text-allow-overlap': false,
           'text-ignore-placement': false,
@@ -937,7 +1080,7 @@ export function buildGiopMapStyle(
           visibility: 'none',
           'text-field': ['get', 'district'],
           'text-size': ['interpolate', ['linear'], ['zoom'], 10, 11, 12, 13, 14, 15],
-          'text-font': ['Noto Sans Regular'],
+          'text-font': GIOP_MAP_LABEL_FONT_REGULAR,
           'text-anchor': 'center',
           'text-allow-overlap': false,
           'text-ignore-placement': false,
@@ -974,8 +1117,6 @@ export const GIOP_LAYER_ZOOM_RANGE: Record<string, { min?: number; max?: number 
   'nodes-transformers-pt': { min: TRANSFORMER_ICON_MIN_ZOOM },
   'graph-chunk-nodes-layer': { min: CHUNK_NODE_MIN_ZOOM, max: NODE_DETAIL_ZOOM },
   'graph-chunk-traced-layer': { min: CHUNK_NODE_MIN_ZOOM, max: NODE_DETAIL_ZOOM },
-  'staging-points-pulse': { min: 0 },
-  'staging-points-pulse-2': { min: 0 },
   'staging-points': { min: 0 },
   'field-technician-halo': { min: 0 },
   'field-technician-points': { min: 0 },
@@ -1065,7 +1206,7 @@ export function buildGiopLegendGroups(
       label: 'Staging / pending',
       color: '#f59e0b',
       dot: true,
-      layerIds: ['staging-points-pulse', 'staging-points-pulse-2', 'staging-points'],
+      layerIds: ['staging-points'],
     },
     {
       id: 'field-tech',
@@ -1197,7 +1338,7 @@ export function applyGiopLegendVisibility(
   const exclusiveByGroup: [string, string[]][] = [
     ['transformers', ['overview-transformers', 'nodes-transformers-dt', 'nodes-transformers-pt']],
     ['poles', ['nodes', 'graph-chunk-nodes-layer']],
-    ['staging-pending', ['staging-points-pulse', 'staging-points-pulse-2', 'staging-points']],
+    ['staging-pending', ['staging-points']],
     ['field-tech', ['field-technician-halo', 'field-technician-points']],
     ['conflict', ['graph-chunk-traced-layer']],
   ];

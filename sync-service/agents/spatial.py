@@ -44,27 +44,24 @@ def _territory_filter_sql(
             EXISTS (
               SELECT 1 FROM gis.ecg_admin_boundaries b
               WHERE ST_Within({geom_alias}, b.geom)
-                AND (
-                  b.district ILIKE %s OR b.district_name ILIKE %s
-                  OR b.name ILIKE %s
-                )
+                AND b.district ILIKE %s
             )
             """
         )
         pattern = f"%{district.strip()}%"
-        params.extend([pattern, pattern, pattern])
+        params.append(pattern)
     if region:
         clauses.append(
             f"""
             EXISTS (
               SELECT 1 FROM gis.ecg_admin_boundaries b
               WHERE ST_Within({geom_alias}, b.geom)
-                AND (b.region ILIKE %s OR b.region_name ILIKE %s)
+                AND b.region ILIKE %s
             )
             """
         )
         pattern = f"%{region.strip()}%"
-        params.extend([pattern, pattern])
+        params.append(pattern)
     if bbox:
         clauses.append(
             f"{geom_alias} && ST_MakeEnvelope(%s, %s, %s, %s, 4326)"
@@ -87,12 +84,12 @@ def _territory_where_clause(
     params: list[Any] = []
     if district:
         pattern = f"%{district.strip()}%"
-        filters.append("(district ILIKE %s OR district_name ILIKE %s OR name ILIKE %s)")
-        params.extend([pattern, pattern, pattern])
+        filters.append("district ILIKE %s")
+        params.append(pattern)
     if region:
         pattern = f"%{region.strip()}%"
-        filters.append("(region ILIKE %s OR region_name ILIKE %s)")
-        params.extend([pattern, pattern])
+        filters.append("region ILIKE %s")
+        params.append(pattern)
     return " AND ".join(filters), params
 
 
@@ -109,7 +106,7 @@ def resolve_territory(
         cur.execute(
             f"""
             SELECT
-              COALESCE(MAX(district), MAX(district_name), MAX(name)) AS district_label,
+              MAX(district) AS district_label,
               MAX(region) AS region_label,
               COUNT(*)::int AS polygon_count,
               ST_X(ST_Centroid(ST_Union(geom))) AS center_lon,
@@ -160,7 +157,7 @@ def territory_geojson(
                 json_build_object(
                   'type', 'Feature',
                   'properties', json_build_object(
-                    'district', COALESCE(district, district_name, name),
+                    'district', district,
                     'region', region
                   ),
                   'geometry', ST_AsGeoJSON(geom)::json
@@ -262,6 +259,23 @@ def asset_inventory_counts(
             territory_params + kind_params,
         )
         total = int(cur.fetchone()[0])
+        distinct_locations: int | None = None
+        if tier == "staging":
+            cur.execute(
+                f"""
+                SELECT COUNT(DISTINCT cn.geom)::int
+                FROM {schema_cn} cn
+                JOIN {schema_io} io ON io.mrid = cn.mrid
+                WHERE {validation_filter}
+                  AND cn.geom IS NOT NULL
+                  {territory_sql}
+                  {kind_filter}
+                """,
+                territory_params + kind_params,
+            )
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                distinct_locations = int(row[0])
 
     by_kind = {r[0]: r[1] for r in rows}
     result: dict[str, Any] = {
@@ -273,6 +287,8 @@ def asset_inventory_counts(
         "region": region,
         "bbox": bbox,
     }
+    if distinct_locations is not None:
+        result["distinct_locations"] = distinct_locations
     if kind_note:
         result["note"] = kind_note
     if kinds and tier == "master" and asset_kind in ("pole", "poles"):

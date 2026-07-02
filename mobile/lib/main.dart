@@ -7,7 +7,10 @@ import 'models/capture_prefill.dart';
 import 'screens/map_screen.dart';
 import 'screens/meter_screen.dart';
 import 'screens/settings_screen.dart';
+import 'screens/sync_queue_screen.dart';
 import 'screens/work_orders_screen.dart';
+import 'services/connectivity_service.dart';
+import 'services/field_sync_service.dart';
 import 'services/field_map_refresh_bus.dart';
 import 'services/giop_api.dart';
 import 'services/rejection_notification_service.dart';
@@ -56,6 +59,7 @@ class _GiopFieldAppState extends State<GiopFieldApp> {
       _config = config;
       _api = GiopApi(config);
     });
+    ConnectivityService.instance.configureSyncProbe(config.syncBaseUrl);
   }
 
   void _updateConfig(ApiConfig config) {
@@ -63,6 +67,7 @@ class _GiopFieldAppState extends State<GiopFieldApp> {
       _config = config;
       _api = GiopApi(config);
     });
+    ConnectivityService.instance.configureSyncProbe(config.syncBaseUrl);
   }
 
   @override
@@ -116,12 +121,14 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   int _rejectionBadge = 0;
   CapturePrefill? _recapturePrefill;
   RejectionNotificationService? _rejectionNotifications;
+  FieldSyncService? _fieldSync;
   final _scaffoldKey = GlobalKey<ScaffoldMessengerState>();
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _fieldSync = FieldSyncService(widget.api)..start();
     _rejectionNotifications = RejectionNotificationService(widget.api)
       ..onRejection = _onAssetRejected
       ..start();
@@ -131,6 +138,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _rejectionNotifications?.stop();
+    _fieldSync?.dispose();
     super.dispose();
   }
 
@@ -138,6 +146,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _rejectionNotifications?.poll();
+      unawaited(_fieldSync?.syncAll());
       if (_index == 0) {
         _mapRefreshTrigger++;
       }
@@ -228,6 +237,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
           });
         },
       ),
+      SyncQueueScreen(api: widget.api, fieldSync: _fieldSync!),
       MeterScreen(api: widget.api),
       SettingsScreen(
         config: widget.config,
@@ -254,6 +264,10 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                 child: const Icon(Icons.assignment),
               ),
               label: 'Work',
+            ),
+            const NavigationDestination(
+              icon: Icon(Icons.cloud_sync),
+              label: 'Sync',
             ),
             const NavigationDestination(
               icon: Icon(Icons.speed),

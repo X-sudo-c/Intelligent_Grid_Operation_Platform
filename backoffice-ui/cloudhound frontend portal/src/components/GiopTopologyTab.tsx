@@ -26,6 +26,7 @@ interface GiopTopologyTabProps {
   onNodeSelect?: (mrid: string, label?: string) => void;
   compact?: boolean;
   graphQueryOptions?: typeof GIOP_GRAPH_QUERY_OPTIONS;
+  graphChrome?: 'full' | 'operations';
 }
 
 export function GiopTopologyTab({
@@ -41,7 +42,9 @@ export function GiopTopologyTab({
   onNodeSelect,
   compact = false,
   graphQueryOptions = GIOP_GRAPH_QUERY_OPTIONS,
+  graphChrome = 'full',
 }: GiopTopologyTabProps) {
+  const isOpsChrome = graphChrome === 'operations';
   const [graphAiOpen, setGraphAiOpen] = useState(false);
   const [graphAiNodeId, setGraphAiNodeId] = useState<string | null>(null);
   const [graphAiNodeTitle, setGraphAiNodeTitle] = useState('');
@@ -113,31 +116,35 @@ export function GiopTopologyTab({
   }, [graphAiOpen]);
 
   return (
-    <div className={`flex flex-col h-full min-h-0 ${compact ? '' : 'p-4'}`}>
-      <div className={`shrink-0 mb-3 flex flex-wrap items-center justify-center gap-2 ${compact ? 'px-2 pt-2' : ''}`}>
-        {graphQueryOptions.map((option) => (
-          <button
-            key={option.key}
-            type="button"
-            onClick={() => onQueryChange(option.key)}
-            className={`inline-flex h-8 items-center rounded-full border px-3 text-xs font-medium transition-all ${
-              graphQuery === option.key
-                ? 'border-sky-500/70 bg-sky-500/22 text-sky-100'
-                : 'border-slate-700/80 bg-slate-900/80 text-slate-300 hover:border-slate-500 hover:bg-slate-800/85'
-            }`}
-          >
-            {option.label}
-          </button>
-        ))}
-      </div>
+    <div className={`flex flex-col h-full min-h-0 ${compact && !isOpsChrome ? '' : compact ? '' : 'p-4'}`}>
+      {!isOpsChrome && (
+        <div className={`shrink-0 mb-3 flex flex-wrap items-center justify-center gap-2 ${compact ? 'px-2 pt-2' : ''}`}>
+          {graphQueryOptions.map((option) => (
+            <button
+              key={option.key}
+              type="button"
+              onClick={() => onQueryChange(option.key)}
+              className={`inline-flex h-8 items-center rounded-full border px-3 text-xs font-medium transition ${
+                graphQuery === option.key
+                  ? 'border-premium-accent/70 bg-premium-accent/20 text-premium-text'
+                  : isLightMode
+                    ? 'border-slate-300 bg-white text-slate-600 hover:bg-slate-50'
+                    : 'border-premium-border/60 bg-premium-card/90 text-premium-muted hover:border-premium-border hover:bg-premium-hover hover:text-premium-text'
+              }`}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      )}
 
-      {error && (
+      {!isOpsChrome && error && (
         <div className="mb-4 mx-4 rounded-lg border border-red-500/40 bg-red-950/40 px-4 py-3 text-sm text-red-200">
           {error}
         </div>
       )}
 
-      {graph?.metrics?.note && !loading && (
+      {!isOpsChrome && graph?.metrics?.note && !loading && (
         <div
           className={`mb-3 mx-4 rounded-lg border px-4 py-2 text-xs ${
             isLightMode
@@ -149,46 +156,90 @@ export function GiopTopologyTab({
         </div>
       )}
 
-      {revalidating && graph && !loading && (
-        <p className={`mb-2 mx-4 text-center text-[10px] ${isLightMode ? 'text-slate-400' : 'text-slate-500'}`}>
+      {!isOpsChrome && revalidating && graph && !loading && (
+        <p className={`mb-2 mx-4 text-center text-[10px] ${isLightMode ? 'text-slate-400' : 'text-premium-muted-dim'}`}>
           Updating topology…
         </p>
       )}
 
       {loading && (
         <div className="flex-1 flex flex-col items-center justify-center py-20">
-          <Clock className="mb-4 h-12 w-12 animate-spin text-[#7e8fae]" />
-          <p className="text-slate-400">Loading network topology...</p>
+          <Clock className="mb-4 h-12 w-12 animate-spin text-premium-muted" />
+          <p className="text-premium-muted">Loading network topology...</p>
+        </div>
+      )}
+
+      {isOpsChrome && error && !graph && !loading && (
+        <div className="flex flex-1 items-center justify-center p-4">
+          <div className="rounded-lg border border-red-500/40 bg-red-950/40 px-4 py-3 text-sm text-red-200">
+            {error}
+          </div>
         </div>
       )}
 
       {graph && !loading && (
-        <div className="flex-1 min-h-0 flex flex-col">
+        <div className="relative flex-1 min-h-0 flex flex-col">
+          {isOpsChrome && error && (
+            <div className="pointer-events-none absolute inset-x-2 top-11 z-50">
+              <div className="pointer-events-auto rounded-lg border border-red-500/40 bg-red-950/90 px-3 py-2 text-xs text-red-200 backdrop-blur">
+                {error}
+              </div>
+            </div>
+          )}
+          {isOpsChrome && graph.metrics?.note && (
+            <div
+              className={`pointer-events-none absolute inset-x-2 top-11 z-50 ${error ? 'top-24' : ''}`}
+            >
+              <div
+                className={`pointer-events-auto rounded-lg border px-3 py-1.5 text-[11px] backdrop-blur ${
+                  isLightMode
+                    ? 'border-amber-300 bg-amber-50/95 text-amber-900'
+                    : 'border-amber-500/40 bg-amber-950/90 text-amber-100'
+                }`}
+              >
+                {graph.metrics.note}
+              </div>
+            </div>
+          )}
+          {isOpsChrome && revalidating && (
+            <p className={`pointer-events-none absolute right-3 top-11 z-50 text-[10px] ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>
+              Updating…
+            </p>
+          )}
           <div className="flex-1 min-h-0">
             <GiopGraphCanvas
             graph={graph}
-            isAdmin
+            isAdmin={!isOpsChrome}
             isLightMode={isLightMode}
+            graphChrome={graphChrome}
             focusNodeArn={focusMrid || undefined}
             onFocusNodeHandled={onFocusHandled}
             onNodeSelect={onNodeSelect}
-            onRequestAiAssist={handleGraphAiAssist}
-            onRequestGraphAiMode={() => setGraphAiOpen(true)}
-            aiAssist={{
-              isOpen: graphAiOpen,
-              mode: graphAiNodeId ? 'node' : 'graph',
-              nodeId: graphAiNodeId,
-              nodeTitle: graphAiNodeTitle,
-              draft: graphAiDraft,
-              loading: graphAiLoading,
-              messages: graphAiMessages,
-              appliedProposalIds,
-              canApplyProposals: false,
-              onDraftChange: setGraphAiDraft,
-              onSubmit: submitGraphAiPrompt,
-              onClose: () => setGraphAiOpen(false),
-              onApplyProposal: () => {},
-            }}
+            {...(isOpsChrome
+              ? {
+                  graphQuery,
+                  onQueryChange,
+                  graphQueryOptions,
+                }
+              : {
+                  onRequestAiAssist: handleGraphAiAssist,
+                  onRequestGraphAiMode: () => setGraphAiOpen(true),
+                  aiAssist: {
+                    isOpen: graphAiOpen,
+                    mode: graphAiNodeId ? 'node' : 'graph',
+                    nodeId: graphAiNodeId,
+                    nodeTitle: graphAiNodeTitle,
+                    draft: graphAiDraft,
+                    loading: graphAiLoading,
+                    messages: graphAiMessages,
+                    appliedProposalIds,
+                    canApplyProposals: false,
+                    onDraftChange: setGraphAiDraft,
+                    onSubmit: submitGraphAiPrompt,
+                    onClose: () => setGraphAiOpen(false),
+                    onApplyProposal: () => {},
+                  },
+                })}
           />
           </div>
           {!compact && focusMrid && (

@@ -40,7 +40,7 @@ function statusTone(status: string, isLightMode: boolean): string {
   if (status === 'running' || status === 'processing') {
     return isLightMode ? 'text-amber-700' : 'text-amber-400';
   }
-  return isLightMode ? 'text-slate-500' : 'text-slate-400';
+  return isLightMode ? 'text-slate-500' : 'text-premium-muted';
 }
 
 export function GiopGisReferenceTab({ isLightMode, onMapRefresh }: GiopGisReferenceTabProps) {
@@ -53,8 +53,8 @@ export function GiopGisReferenceTab({ isLightMode, onMapRefresh }: GiopGisRefere
   const [selectedSlug, setSelectedSlug] = useState('ecg-admin-boundaries');
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const card = isLightMode ? 'border-slate-200 bg-white' : 'border-slate-700 bg-slate-900/40';
-  const muted = isLightMode ? 'text-slate-500' : 'text-slate-400';
+  const card = isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/70 bg-premium-card';
+  const muted = isLightMode ? 'text-slate-500' : 'text-premium-muted';
   const btn = 'rounded bg-cyan-700 hover:bg-cyan-600 disabled:opacity-50 text-white text-sm py-1.5 px-3';
   const btnSecondary =
     'rounded border border-cyan-700/50 hover:bg-cyan-900/20 disabled:opacity-50 text-cyan-700 dark:text-cyan-300 text-sm py-1.5 px-3';

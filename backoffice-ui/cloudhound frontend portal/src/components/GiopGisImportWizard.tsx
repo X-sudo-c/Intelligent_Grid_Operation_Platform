@@ -66,8 +66,8 @@ export function GiopGisImportWizard({
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
 
-  const card = isLightMode ? 'border-slate-200 bg-slate-50' : 'border-slate-700 bg-slate-900/30';
-  const muted = isLightMode ? 'text-slate-500' : 'text-slate-400';
+  const card = isLightMode ? 'border-slate-200 bg-slate-50' : 'border-premium-border/70 bg-premium-card/80';
+  const muted = isLightMode ? 'text-slate-500' : 'text-premium-muted';
   const input = `rounded border px-2 py-1.5 text-sm w-full ${
     isLightMode ? 'border-slate-300 bg-white' : 'border-slate-600 bg-slate-900'
   }`;

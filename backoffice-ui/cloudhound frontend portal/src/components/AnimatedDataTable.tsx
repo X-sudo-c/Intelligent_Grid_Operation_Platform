@@ -71,12 +71,12 @@ export function AnimatedDataTable<T>({
     return 0;
   });
 
-  const headerClass = `text-left text-xs font-medium uppercase tracking-wider ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`;
-  const rowBaseClass = `transition-colors duration-200 ${isLightMode ? 'hover:bg-slate-50' : 'hover:bg-slate-800/30'}`;
+  const headerClass = `text-left text-xs font-medium uppercase tracking-wider ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`;
+  const rowBaseClass = `transition-colors duration-200 ${isLightMode ? 'hover:bg-slate-50' : 'hover:bg-premium-hover/30'}`;
 
   if (isLoading) {
     return (
-      <div className={`rounded-xl border overflow-hidden ${isLightMode ? 'border-slate-200 bg-white' : 'border-slate-700 bg-slate-900/40'} ${className}`}>
+      <div className={`rounded-xl border overflow-hidden ${isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/70 bg-premium-card'} ${className}`}>
         <div className="p-8 space-y-4">
           {Array.from({ length: 5 }).map((_, i) => (
             <motion.div
@@ -101,7 +101,7 @@ export function AnimatedDataTable<T>({
       <motion.div
         initial={{ opacity: 0, scale: 0.95 }}
         animate={{ opacity: 1, scale: 1 }}
-        className={`flex flex-col items-center justify-center py-16 rounded-xl border ${isLightMode ? 'border-slate-200 bg-white' : 'border-slate-700 bg-slate-900/40'} ${className}`}
+        className={`flex flex-col items-center justify-center py-16 rounded-xl border ${isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/70 bg-premium-card'} ${className}`}
       >
         <motion.div
           animate={{ y: [0, -8, 0] }}
@@ -110,13 +110,13 @@ export function AnimatedDataTable<T>({
         >
           <span className={`text-2xl ${isLightMode ? 'text-slate-400' : 'text-slate-500'}`}>📊</span>
         </motion.div>
-        <p className={`text-sm ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>{emptyMessage}</p>
+        <p className={`text-sm ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>{emptyMessage}</p>
       </motion.div>
     );
   }
 
   return (
-    <div className={`rounded-xl border overflow-hidden ${isLightMode ? 'border-slate-200 bg-white' : 'border-slate-700 bg-slate-900/40'} ${className}`}>
+    <div className={`rounded-xl border overflow-hidden ${isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/70 bg-premium-card'} ${className}`}>
       <div className="overflow-x-auto">
         <table className="w-full">
           <thead className={`border-b ${isLightMode ? 'border-slate-200 bg-slate-50/80' : 'border-slate-700 bg-slate-800/50'}`}>
@@ -235,7 +235,7 @@ export function AnimatedActionButton({
       : 'bg-rose-500 text-white hover:bg-rose-400',
     ghost: isLightMode
       ? 'text-slate-600 hover:bg-slate-100'
-      : 'text-slate-400 hover:bg-slate-800/50',
+      : 'text-slate-400 hover:bg-premium-hover/50',
   };
 
   return (

@@ -11,7 +11,7 @@ import { Layers, MapPin, Search, UserRound, Wrench } from 'lucide-react';
 import { getMapGeocode, type GiopMapSearchKind, type GiopMapSearchResult } from '../api/giop-api';
 import {
   mergeGeocodePlaces,
-  searchLocalMapCatalog,
+  searchMapCatalog,
   type GiopMapSearchFilter,
 } from '../lib/giopMapLocalSearch';
 
@@ -19,7 +19,8 @@ export type { GiopMapSearchFilter };
 
 interface GiopMapSearchBarProps {
   isLightMode: boolean;
-  catalog: GiopMapSearchResult[];
+  placeCatalog: GiopMapSearchResult[];
+  opsCatalog: GiopMapSearchResult[];
   placesReady?: boolean;
   onSelect: (result: GiopMapSearchResult) => void;
   /** Live camera preview while typing (best match). */
@@ -57,9 +58,14 @@ function kindLabel(result: GiopMapSearchResult): string {
   }
 }
 
+function resultKey(result: GiopMapSearchResult): string {
+  return `${result.kind}:${result.id}`;
+}
+
 export function GiopMapSearchBar({
   isLightMode,
-  catalog,
+  placeCatalog,
+  opsCatalog,
   placesReady = true,
   onSelect,
   onPreview,
@@ -68,10 +74,14 @@ export function GiopMapSearchBar({
   const inputRef = useRef<HTMLInputElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const lastPreviewKeyRef = useRef<string | null>(null);
+  /** After confirm, hold preview until query or filter changes. */
+  const confirmedRef = useRef<{ query: string; filter: GiopMapSearchFilter; key: string } | null>(
+    null,
+  );
   const geocodeSeqRef = useRef(0);
 
   const [query, setQuery] = useState('');
-  const [filter, setFilter] = useState<GiopMapSearchFilter>('place');
+  const [filter, setFilter] = useState<GiopMapSearchFilter>('all');
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
   const [geocodeHits, setGeocodeHits] = useState<GiopMapSearchResult[]>([]);
@@ -108,35 +118,66 @@ export function GiopMapSearchBar({
     return () => window.clearTimeout(timer);
   }, [query, wantsGeocode]);
 
-  const searchCatalog = useMemo(
-    () => mergeGeocodePlaces(catalog, geocodeHits),
-    [catalog, geocodeHits],
+  const placePool = useMemo(
+    () => mergeGeocodePlaces(placeCatalog, geocodeHits),
+    [placeCatalog, geocodeHits],
   );
 
   const results = useMemo(
-    () => searchLocalMapCatalog(searchCatalog, query, filter, 12),
-    [searchCatalog, query, filter],
+    () =>
+      searchMapCatalog({
+        filter,
+        placeCatalog: placePool,
+        opsCatalog,
+        query,
+        limit: 12,
+      }),
+    [filter, placePool, opsCatalog, query],
   );
 
   useEffect(() => {
     const trimmed = query.trim();
     if (trimmed.length < 1) {
+      confirmedRef.current = null;
       lastPreviewKeyRef.current = null;
       onPreview(null);
       return;
     }
 
-    const best = searchLocalMapCatalog(searchCatalog, query, filter, 1)[0];
+    if (
+      confirmedRef.current &&
+      confirmedRef.current.query === trimmed &&
+      confirmedRef.current.filter === filter
+    ) {
+      return;
+    }
+
+    const best = searchMapCatalog({
+      filter,
+      placeCatalog: placePool,
+      opsCatalog,
+      query,
+      limit: 1,
+    })[0];
+
     if (!best) {
       lastPreviewKeyRef.current = null;
       return;
     }
 
-    const key = `${best.kind}:${best.id}`;
+    const key = resultKey(best);
     if (key === lastPreviewKeyRef.current) return;
     lastPreviewKeyRef.current = key;
     onPreview(best);
-  }, [query, filter, searchCatalog, onPreview]);
+  }, [query, filter, placePool, opsCatalog, onPreview]);
+
+  const setSearchFilter = useCallback((next: GiopMapSearchFilter) => {
+    if (next === filter) return;
+    confirmedRef.current = null;
+    lastPreviewKeyRef.current = null;
+    setFilter(next);
+    setOpen(true);
+  }, [filter]);
 
   useEffect(() => {
     setActiveIndex(results.length > 0 ? 0 : -1);
@@ -154,24 +195,29 @@ export function GiopMapSearchBar({
 
   const pickResult = useCallback(
     (result: GiopMapSearchResult) => {
+      const trimmed = query.trim();
+      const key = resultKey(result);
+      confirmedRef.current = { query: trimmed, filter, key };
+      lastPreviewKeyRef.current = key;
       onSelect(result);
       setOpen(false);
-      setQuery(result.title);
       inputRef.current?.blur();
     },
-    [onSelect],
+    [filter, onSelect, query],
   );
 
   const onKeyDown = useCallback(
     (event: KeyboardEvent<HTMLInputElement>) => {
       if (event.key === 'ArrowDown') {
         event.preventDefault();
+        confirmedRef.current = null;
         if (!open) setOpen(true);
         setActiveIndex((i) => Math.min(i + 1, results.length - 1));
         return;
       }
       if (event.key === 'ArrowUp') {
         event.preventDefault();
+        confirmedRef.current = null;
         setActiveIndex((i) => Math.max(i - 1, 0));
         return;
       }
@@ -187,6 +233,7 @@ export function GiopMapSearchBar({
       if (event.key === 'Escape') {
         setOpen(false);
         setQuery('');
+        confirmedRef.current = null;
         lastPreviewKeyRef.current = null;
         onPreview(null);
         inputRef.current?.blur();
@@ -214,10 +261,15 @@ export function GiopMapSearchBar({
           enterKeyHint="search"
           value={query}
           onChange={(e) => {
+            confirmedRef.current = null;
+            lastPreviewKeyRef.current = null;
             setQuery(e.target.value);
             setOpen(true);
           }}
-          onFocus={() => setOpen(true)}
+          onFocus={() => {
+            setOpen(true);
+            inputRef.current?.select();
+          }}
           onKeyDown={onKeyDown}
           placeholder="Search map"
           className="giop-map-spotlight__input"
@@ -241,7 +293,7 @@ export function GiopMapSearchBar({
               title={title}
               aria-label={title}
               aria-pressed={active}
-              onClick={() => setFilter(id)}
+              onClick={() => setSearchFilter(id)}
               className={`giop-map-spotlight__filter-btn${active ? ' giop-map-spotlight__filter-btn--active' : ''}`}
             >
               <Icon className="h-4 w-4" aria-hidden />
@@ -260,7 +312,7 @@ export function GiopMapSearchBar({
           )}
           {results.map((result, index) => (
             <button
-              key={`${result.kind}:${result.id}`}
+              key={resultKey(result)}
               type="button"
               role="option"
               aria-selected={index === activeIndex}
@@ -268,7 +320,10 @@ export function GiopMapSearchBar({
                 index === activeIndex ? ' giop-map-spotlight__result--active' : ''
               }`}
               onMouseEnter={() => {
+                confirmedRef.current = null;
                 setActiveIndex(index);
+                const key = resultKey(result);
+                lastPreviewKeyRef.current = key;
                 onPreview(result);
               }}
               onClick={() => pickResult(result)}

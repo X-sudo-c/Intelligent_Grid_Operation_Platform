@@ -370,6 +370,23 @@ def _build_ctx(conn, mrid: str, tier: str) -> dict[str, Any] | None:
     return ctx
 
 
+def _exception_details_snapshot(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Attach field-capture context to exception details for steward review."""
+    snap: dict[str, Any] = {}
+    if ctx.get("name"):
+        snap["asset_name"] = ctx["name"]
+    if ctx.get("lon") is not None and ctx.get("lat") is not None:
+        snap["longitude"] = ctx["lon"]
+        snap["latitude"] = ctx["lat"]
+    if ctx.get("feeder"):
+        snap["boundary_feeder_id"] = ctx["feeder"]
+    if ctx.get("in_ecg_region") is not None:
+        snap["in_ecg_region"] = ctx["in_ecg_region"]
+    if ctx.get("duplicate"):
+        snap.update(ctx["duplicate"])
+    return snap
+
+
 def run_asset_checks(conn, mrid: str, tier: str) -> dict[str, Any]:
     """Run enabled rules for one asset; upsert/auto-clear exceptions."""
     ctx = _build_ctx(conn, mrid, tier)
@@ -389,6 +406,7 @@ def run_asset_checks(conn, mrid: str, tier: str) -> dict[str, Any]:
                 continue
             checked += 1
             if status == "FAIL":
+                merged_details = {**_exception_details_snapshot(ctx), **(details or {})}
                 cur.execute(
                     """
                     INSERT INTO public.data_quality_exceptions
@@ -402,7 +420,7 @@ def run_asset_checks(conn, mrid: str, tier: str) -> dict[str, Any]:
                         rule_code,
                         meta["severity"],
                         message,
-                        json.dumps(details) if details is not None else None,
+                        json.dumps(merged_details) if merged_details else None,
                     ),
                 )
                 failures.append(
@@ -798,15 +816,20 @@ def count_blocking_open(conn, mrid: str) -> list[dict[str, Any]]:
     return [{"rule_code": r[0], "severity": r[1], "message": r[2]} for r in rows]
 
 
-def list_exceptions(
-    conn,
+# Staging assets still in the Data Quality queue (not yet released to Operations).
+DQ_STAGING_QUEUE = ("PENDING_FIELD", "IN_CONFLICT")
+# Staging assets ready for Operations steward review / promotion.
+OPS_STAGING_QUEUE = ("STAGED", "IN_CONFLICT")
+
+
+def _exception_filters(
     *,
     status: str | None = "OPEN",
     severity: str | None = None,
     domain: str | None = None,
     record_mrid: str | None = None,
-    limit: int = 100,
-) -> list[dict[str, Any]]:
+    queue: str | None = "dq",
+) -> tuple[list[str], list[Any]]:
     filters: list[str] = []
     params: list[Any] = []
     if status:
@@ -821,8 +844,67 @@ def list_exceptions(
     if record_mrid:
         filters.append("e.record_mrid = %s::uuid")
         params.append(record_mrid)
+    if queue == "dq":
+        filters.append("(sio.mrid IS NULL OR sio.validation::text = ANY(%s))")
+        params.append(list(DQ_STAGING_QUEUE))
+    elif queue == "operations":
+        filters.append("sio.validation::text = ANY(%s)")
+        params.append(list(OPS_STAGING_QUEUE))
+    return filters, params
+
+
+def count_exceptions(
+    conn,
+    *,
+    status: str | None = "OPEN",
+    severity: str | None = None,
+    domain: str | None = None,
+    record_mrid: str | None = None,
+    queue: str | None = "dq",
+) -> int:
+    filters, params = _exception_filters(
+        status=status,
+        severity=severity,
+        domain=domain,
+        record_mrid=record_mrid,
+        queue=queue,
+    )
     where = f"WHERE {' AND '.join(filters)}" if filters else ""
-    params.append(limit)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM public.data_quality_exceptions e
+            JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
+            LEFT JOIN staging.identified_objects sio ON sio.mrid = e.record_mrid
+            {where}
+            """,
+            params,
+        )
+        row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def list_exceptions(
+    conn,
+    *,
+    status: str | None = "OPEN",
+    severity: str | None = None,
+    domain: str | None = None,
+    record_mrid: str | None = None,
+    queue: str | None = "dq",
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    filters, params = _exception_filters(
+        status=status,
+        severity=severity,
+        domain=domain,
+        record_mrid=record_mrid,
+        queue=queue,
+    )
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    params.extend([limit, offset])
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -830,20 +912,104 @@ def list_exceptions(
                    r.domain, e.severity::text, e.status::text, e.error_message,
                    e.details, e.owner, e.resolution_note, e.resolved_by,
                    e.created_at, e.resolved_at,
-                   COALESCE(sio.name, pio.name) AS asset_name
+                   COALESCE(sio.name, pio.name) AS asset_name,
+                   COALESCE(ST_X(scn.geom), ST_X(pcn.geom)) AS longitude,
+                   COALESCE(ST_Y(scn.geom), ST_Y(pcn.geom)) AS latitude,
+                   CASE
+                     WHEN scn.geom IS NOT NULL THEN ST_AsText(scn.geom)
+                     WHEN pcn.geom IS NOT NULL THEN ST_AsText(pcn.geom)
+                     ELSE NULL
+                   END AS location_key,
+                   (
+                     SELECT COUNT(*)::int
+                     FROM staging.connectivity_nodes cn2
+                     JOIN staging.identified_objects io2 ON io2.mrid = cn2.mrid
+                     WHERE scn.geom IS NOT NULL
+                       AND cn2.geom = scn.geom
+                       AND io2.validation <> 'REJECTED'
+                   ) AS colocated_staging_count,
+                   (
+                     SELECT COALESCE(
+                       json_agg(
+                         json_build_object(
+                           'mrid', io2.mrid::text,
+                           'name', io2.name,
+                           'validation', io2.validation::text
+                         )
+                         ORDER BY io2.name, io2.mrid
+                       ),
+                       '[]'::json
+                     )
+                     FROM staging.connectivity_nodes cn2
+                     JOIN staging.identified_objects io2 ON io2.mrid = cn2.mrid
+                     WHERE scn.geom IS NOT NULL
+                       AND cn2.geom = scn.geom
+                       AND io2.validation <> 'REJECTED'
+                   ) AS colocated_staging_peers,
+                   sio.validation::text AS staging_validation,
+                   (
+                     SELECT COUNT(*)::int
+                     FROM public.data_quality_exceptions e2
+                     JOIN public.data_quality_rules r2 ON r2.rule_code = e2.rule_code
+                     WHERE e2.record_mrid = e.record_mrid
+                       AND e2.status = 'OPEN'
+                       AND r2.blocks_promotion = TRUE
+                   ) AS blocking_open_count,
+                   r.description AS rule_description,
+                   r.blocks_promotion,
+                   sio.submitted_by,
+                   sio.work_order_id,
+                   sio.photo_url,
+                   COALESCE(sio.updated_at, pio.updated_at) AS record_updated_at,
+                   COALESCE(sio.lifecycle_state, pio.lifecycle_state)::text AS lifecycle_state,
+                   COALESCE(sga.asset_kind, public.asset_kind_for_mrid(e.record_mrid)) AS asset_kind,
+                   COALESCE(sga.operating_utility, pga.operating_utility)::text AS operating_utility,
+                   COALESCE(sga.substation_name, pga.substation_name) AS substation_name,
+                   COALESCE(scn.boundary_feeder_id, pcn.boundary_feeder_id) AS boundary_feeder_id,
+                   CASE
+                     WHEN sio.mrid IS NOT NULL THEN 'staging'
+                     WHEN pio.mrid IS NOT NULL THEN 'master'
+                     ELSE NULL
+                   END AS record_tier
             FROM public.data_quality_exceptions e
             JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
             LEFT JOIN staging.identified_objects sio ON sio.mrid = e.record_mrid
             LEFT JOIN public.identified_objects pio ON pio.mrid = e.record_mrid
+            LEFT JOIN staging.connectivity_nodes scn ON scn.mrid = e.record_mrid
+            LEFT JOIN public.connectivity_nodes pcn ON pcn.mrid = e.record_mrid
+            LEFT JOIN staging.ghana_grid_assets sga ON sga.mrid = e.record_mrid
+            LEFT JOIN public.ghana_grid_assets pga ON pga.mrid = e.record_mrid
             {where}
             ORDER BY e.created_at DESC
-            LIMIT %s
+            LIMIT %s OFFSET %s
             """,
             params,
         )
         rows = cur.fetchall()
-    return [
-        {
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        peers = r[19]
+        if isinstance(peers, str):
+            peers = json.loads(peers)
+        colocated = int(r[18] or 0)
+        record_updated = r[27]
+        record_context = {
+            k: v
+            for k, v in {
+                "tier": r[33],
+                "submitted_by": r[24],
+                "work_order_id": r[25],
+                "photo_url": r[26],
+                "record_updated_at": record_updated.isoformat() if record_updated else None,
+                "lifecycle_state": r[28],
+                "asset_kind": r[29],
+                "operating_utility": r[30],
+                "substation_name": r[31],
+                "boundary_feeder_id": r[32],
+            }.items()
+            if v is not None and v != ""
+        }
+        item: dict[str, Any] = {
             "id": r[0],
             "record_type": r[1],
             "record_mrid": r[2],
@@ -859,9 +1025,361 @@ def list_exceptions(
             "created_at": r[12].isoformat() if r[12] else None,
             "resolved_at": r[13].isoformat() if r[13] else None,
             "asset_name": r[14],
+            "longitude": float(r[15]) if r[15] is not None else None,
+            "latitude": float(r[16]) if r[16] is not None else None,
+            "location_key": r[17],
+            "colocated_staging_count": colocated if colocated > 0 else None,
+            "colocated_staging_peers": peers if colocated > 1 else None,
+            "staging_validation": r[20],
+            "can_release_to_operations": (
+                r[20] == "PENDING_FIELD" and int(r[21] or 0) == 0
+            ),
+            "rule_description": r[22],
+            "blocks_promotion": bool(r[23]) if r[23] is not None else False,
+            "record_context": record_context or None,
         }
-        for r in rows
-    ]
+        out.append(item)
+    return out
+
+
+_DQ_DUPLICATES_ONLY_SQL = """
+(
+  (
+    cn.geom IS NOT NULL
+    AND (
+      SELECT COUNT(*)::int
+      FROM staging.connectivity_nodes cn2
+      JOIN staging.identified_objects io2 ON io2.mrid = cn2.mrid
+      WHERE cn2.geom = cn.geom
+        AND io2.validation <> 'REJECTED'
+    ) > 1
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM public.data_quality_exceptions e
+    WHERE e.record_mrid = cn.mrid
+      AND e.status = 'OPEN'
+      AND e.rule_code = 'ASSET_DUPLICATE_NEAR'
+  )
+)
+"""
+
+
+def _dq_queue_asset_filters(
+    *,
+    validation: str | None = None,
+    exception_status: str | None = None,
+    severity: str | None = None,
+    domain: str | None = None,
+    duplicates_only: bool = False,
+) -> tuple[list[str], list[Any], str, list[Any]]:
+    """Filters for staging assets in the DQ inbox (base table alias: cn, io)."""
+    filters = ["io.validation::text = ANY(%s)", "io.validation <> 'REJECTED'"]
+    params: list[Any] = [list(DQ_STAGING_QUEUE)]
+    if validation in DQ_STAGING_QUEUE:
+        filters[0] = "io.validation::text = %s"
+        params[0] = validation
+
+    exc_parts: list[str] = []
+    exc_params: list[Any] = []
+    if exception_status and exception_status not in ("ALL", "CLEAR"):
+        exc_parts.append("e.status = %s::dq_exception_status")
+        exc_params.append(exception_status)
+    if severity:
+        exc_parts.append("e.severity = %s::dq_severity")
+        exc_params.append(severity)
+    if domain:
+        exc_parts.append("r.domain = %s")
+        exc_params.append(domain)
+
+    if exception_status == "CLEAR":
+        filters.append(
+            """
+            NOT EXISTS (
+              SELECT 1 FROM public.data_quality_exceptions e
+              WHERE e.record_mrid = cn.mrid AND e.status = 'OPEN'
+            )
+            """
+        )
+    elif exc_parts:
+        filters.append(
+            f"""
+            EXISTS (
+              SELECT 1
+              FROM public.data_quality_exceptions e
+              JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
+              WHERE e.record_mrid = cn.mrid
+                AND {' AND '.join(exc_parts)}
+            )
+            """
+        )
+        params.extend(exc_params)
+
+    if duplicates_only:
+        filters.append(_DQ_DUPLICATES_ONLY_SQL)
+
+    nested_where = ""
+    nested_params: list[Any] = []
+    if exc_parts:
+        nested_where = f"AND {' AND '.join(exc_parts)}"
+        nested_params = list(exc_params)
+    elif exception_status and exception_status not in ("ALL", "CLEAR"):
+        nested_where = "AND e.status = %s::dq_exception_status"
+        nested_params = [exception_status]
+    else:
+        nested_where = "AND e.status = 'OPEN'"
+
+    return filters, params, nested_where, nested_params
+
+
+def count_dq_queue(
+    conn,
+    *,
+    validation: str | None = None,
+    exception_status: str | None = None,
+    severity: str | None = None,
+    domain: str | None = None,
+    duplicates_only: bool = False,
+) -> int:
+    filters, params, _, _ = _dq_queue_asset_filters(
+        validation=validation,
+        exception_status=exception_status,
+        severity=severity,
+        domain=domain,
+        duplicates_only=duplicates_only,
+    )
+    where = f"WHERE {' AND '.join(filters)}"
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM staging.connectivity_nodes cn
+            JOIN staging.identified_objects io ON io.mrid = cn.mrid
+            {where}
+            """,
+            params,
+        )
+        row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def list_dq_queue(
+    conn,
+    *,
+    validation: str | None = None,
+    exception_status: str | None = None,
+    severity: str | None = None,
+    domain: str | None = None,
+    duplicates_only: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """All field captures in the DQ staging inbox, with nested DQ exceptions."""
+    filters, params, nested_where, nested_params = _dq_queue_asset_filters(
+        validation=validation,
+        exception_status=exception_status,
+        severity=severity,
+        domain=domain,
+        duplicates_only=duplicates_only,
+    )
+    where = f"WHERE {' AND '.join(filters)}"
+    query_params = [*params, *nested_params, limit, offset]
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+              cn.mrid::text,
+              io.name,
+              io.validation::text,
+              io.submitted_by,
+              io.work_order_id,
+              io.photo_url,
+              io.updated_at,
+              io.lifecycle_state::text,
+              ST_X(cn.geom) AS longitude,
+              ST_Y(cn.geom) AS latitude,
+              cn.boundary_feeder_id,
+              COALESCE(ga.asset_kind, 'connectivity_node') AS asset_kind,
+              ga.operating_utility::text,
+              ga.substation_name,
+              CASE
+                WHEN cn.geom IS NOT NULL THEN ST_AsText(cn.geom)
+                ELSE NULL
+              END AS location_key,
+              (
+                SELECT COUNT(*)::int
+                FROM staging.connectivity_nodes cn2
+                JOIN staging.identified_objects io2 ON io2.mrid = cn2.mrid
+                WHERE cn.geom IS NOT NULL
+                  AND cn2.geom = cn.geom
+                  AND io2.validation <> 'REJECTED'
+              ) AS colocated_staging_count,
+              (
+                SELECT COALESCE(
+                  json_agg(
+                    json_build_object(
+                      'mrid', io2.mrid::text,
+                      'name', io2.name,
+                      'validation', io2.validation::text
+                    )
+                    ORDER BY io2.name, io2.mrid
+                  ),
+                  '[]'::json
+                )
+                FROM staging.connectivity_nodes cn2
+                JOIN staging.identified_objects io2 ON io2.mrid = cn2.mrid
+                WHERE cn.geom IS NOT NULL
+                  AND cn2.geom = cn.geom
+                  AND io2.validation <> 'REJECTED'
+              ) AS colocated_staging_peers,
+              (
+                SELECT COUNT(*)::int
+                FROM public.data_quality_exceptions e
+                WHERE e.record_mrid = cn.mrid AND e.status = 'OPEN'
+              ) AS open_exception_count,
+              (
+                SELECT COUNT(*)::int
+                FROM public.data_quality_exceptions e
+                JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
+                WHERE e.record_mrid = cn.mrid
+                  AND e.status = 'OPEN'
+                  AND r.blocks_promotion = TRUE
+              ) AS blocking_open_count,
+              (
+                SELECT COALESCE(
+                  json_agg(
+                    json_build_object(
+                      'id', ex.id,
+                      'record_type', ex.record_type,
+                      'record_mrid', ex.record_mrid,
+                      'rule_code', ex.rule_code,
+                      'domain', ex.domain,
+                      'severity', ex.severity,
+                      'status', ex.status,
+                      'error_message', ex.error_message,
+                      'details', ex.details,
+                      'created_at', ex.created_at,
+                      'rule_description', ex.rule_description,
+                      'blocks_promotion', ex.blocks_promotion
+                    )
+                    ORDER BY ex.created_at DESC
+                  ),
+                  '[]'::json
+                )
+                FROM (
+                  SELECT
+                    e.id::text,
+                    e.record_type,
+                    e.record_mrid::text,
+                    e.rule_code,
+                    r.domain,
+                    e.severity::text AS severity,
+                    e.status::text AS status,
+                    e.error_message,
+                    e.details,
+                    e.created_at,
+                    r.description AS rule_description,
+                    r.blocks_promotion
+                  FROM public.data_quality_exceptions e
+                  JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
+                  WHERE e.record_mrid = cn.mrid
+                    {nested_where}
+                ) ex
+              ) AS exceptions
+            FROM staging.connectivity_nodes cn
+            JOIN staging.identified_objects io ON io.mrid = cn.mrid
+            LEFT JOIN staging.ghana_grid_assets ga ON ga.mrid = cn.mrid
+            {where}
+            ORDER BY io.updated_at DESC
+            LIMIT %s OFFSET %s
+            """,
+            query_params,
+        )
+        rows = cur.fetchall()
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        validation_state = r[2]
+        colocated = int(r[15] or 0)
+        peers = r[16]
+        if isinstance(peers, str):
+            peers = json.loads(peers)
+        open_count = int(r[17] or 0)
+        blocking_count = int(r[18] or 0)
+        raw_exceptions = r[19]
+        if isinstance(raw_exceptions, str):
+            raw_exceptions = json.loads(raw_exceptions)
+        record_context = {
+            k: v
+            for k, v in {
+                "tier": "staging",
+                "submitted_by": r[3],
+                "work_order_id": r[4],
+                "photo_url": r[5],
+                "record_updated_at": r[6].isoformat() if r[6] else None,
+                "lifecycle_state": r[7],
+                "asset_kind": r[11],
+                "operating_utility": r[12],
+                "substation_name": r[13],
+                "boundary_feeder_id": r[10],
+            }.items()
+            if v is not None and v != ""
+        }
+        exceptions: list[dict[str, Any]] = []
+        for ex in raw_exceptions or []:
+            created = ex.get("created_at")
+            exceptions.append(
+                {
+                    "id": ex["id"],
+                    "record_type": ex.get("record_type") or "connectivity_node",
+                    "record_mrid": ex.get("record_mrid") or r[0],
+                    "rule_code": ex["rule_code"],
+                    "domain": ex.get("domain"),
+                    "severity": ex.get("severity"),
+                    "status": ex.get("status"),
+                    "error_message": ex.get("error_message"),
+                    "details": ex.get("details"),
+                    "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
+                    "asset_name": r[1],
+                    "longitude": float(r[8]) if r[8] is not None else None,
+                    "latitude": float(r[9]) if r[9] is not None else None,
+                    "staging_validation": validation_state,
+                    "rule_description": ex.get("rule_description"),
+                    "blocks_promotion": bool(ex.get("blocks_promotion")),
+                    "record_context": record_context or None,
+                }
+            )
+        updated_at = r[6]
+        out.append(
+            {
+                "mrid": r[0],
+                "name": r[1],
+                "validation": validation_state,
+                "submitted_by": r[3],
+                "work_order_id": r[4],
+                "photo_url": r[5],
+                "updated_at": updated_at.isoformat() if updated_at else None,
+                "lifecycle_state": r[7],
+                "longitude": float(r[8]) if r[8] is not None else None,
+                "latitude": float(r[9]) if r[9] is not None else None,
+                "boundary_feeder_id": r[10],
+                "asset_kind": r[11],
+                "operating_utility": r[12],
+                "substation_name": r[13],
+                "location_key": r[14],
+                "colocated_staging_count": colocated if colocated > 0 else None,
+                "colocated_staging_peers": peers if colocated > 1 else None,
+                "open_exception_count": open_count,
+                "blocking_open_count": blocking_count,
+                "can_release_to_operations": (
+                    validation_state == "PENDING_FIELD" and blocking_count == 0
+                ),
+                "exceptions": exceptions,
+                "record_context": record_context or None,
+                "tier": "staging",
+            }
+        )
+    return out
 
 
 def list_rules(conn) -> list[dict[str, Any]]:
@@ -887,23 +1405,41 @@ def list_rules(conn) -> list[dict[str, Any]]:
     ]
 
 
-def summary(conn) -> dict[str, Any]:
+def summary(conn, *, tier: str | None = None) -> dict[str, Any]:
+    tier_filter = ""
+    if tier == "staging":
+        tier_filter = """
+            AND EXISTS (
+              SELECT 1 FROM staging.identified_objects sio
+              WHERE sio.mrid = e.record_mrid
+                AND sio.validation NOT IN ('REJECTED', 'APPROVED')
+            )
+        """
+    elif tier == "master":
+        tier_filter = """
+            AND EXISTS (
+              SELECT 1 FROM public.identified_objects pio
+              WHERE pio.mrid = e.record_mrid
+            )
+        """
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             SELECT e.severity::text, COUNT(*)
             FROM public.data_quality_exceptions e
             WHERE e.status = 'OPEN'
+            {tier_filter}
             GROUP BY e.severity
             """
         )
         by_sev = {r[0]: int(r[1]) for r in cur.fetchall()}
         cur.execute(
-            """
+            f"""
             SELECT r.domain, COUNT(*)
             FROM public.data_quality_exceptions e
             JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
             WHERE e.status = 'OPEN'
+            {tier_filter}
             GROUP BY r.domain
             """
         )
@@ -912,6 +1448,7 @@ def summary(conn) -> dict[str, Any]:
         "open_by_severity": by_sev,
         "open_by_domain": by_domain,
         "open_total": sum(by_sev.values()),
+        "tier": tier or "all",
     }
 
 
@@ -954,3 +1491,71 @@ def resolve_exception(
         after_state={"rule_code": row[1], "status": row[2], "note": note},
     )
     return {"id": exception_id, "record_mrid": row[0], "status": row[2]}
+
+
+def release_staging_to_operations(
+    conn,
+    mrid: str,
+    *,
+    operator: str | None = None,
+    run_checks: bool = True,
+) -> dict[str, Any]:
+    """Move a staging asset from the DQ queue (PENDING_FIELD) to Operations (STAGED).
+
+  Requires no open blocking data-quality exceptions. Optionally re-runs per-asset
+  checks before release so stewards see a fresh exception snapshot.
+  """
+    if run_checks:
+        run_asset_checks(conn, mrid, "staging")
+    blocking = count_blocking_open(conn, mrid)
+    if blocking:
+        raise ValueError(
+            f"Cannot release to Operations: {len(blocking)} blocking open exception(s)"
+        )
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT validation::text
+            FROM staging.identified_objects
+            WHERE mrid = %s::uuid
+            """,
+            (mrid,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Staging asset {mrid} not found")
+        previous = row[0]
+        if previous != "PENDING_FIELD":
+            raise ValueError(
+                f"Asset is not in the Data Quality queue (validation={previous})"
+            )
+        cur.execute(
+            """
+            UPDATE staging.identified_objects
+            SET validation = 'STAGED'::staging_validation_state,
+                updated_at = NOW()
+            WHERE mrid = %s::uuid
+            RETURNING mrid::text, name, validation::text
+            """,
+            (mrid,),
+        )
+        updated = cur.fetchone()
+        if not updated:
+            raise ValueError(f"Staging asset {mrid} not found")
+    log_lineage(
+        conn,
+        target_mrid=mrid,
+        source_type="MANUAL_EDIT",
+        action_type="DQ_RELEASE_TO_OPS",
+        operator_id=operator,
+        provenance_ref="release_staging_to_operations",
+        before_state={"validation": previous},
+        after_state={"validation": "STAGED"},
+    )
+    return {
+        "mrid": updated[0],
+        "name": updated[1],
+        "validation": updated[2],
+        "previous_validation": previous,
+        "released": True,
+    }

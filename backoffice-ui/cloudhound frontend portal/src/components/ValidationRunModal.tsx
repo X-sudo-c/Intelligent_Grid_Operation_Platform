@@ -58,7 +58,7 @@ export function ValidationRunModal({
   const overlay = isLightMode ? 'bg-slate-900/50' : 'bg-black/70';
   const panel = isLightMode
     ? 'bg-white border-slate-200 text-slate-900'
-    : 'bg-slate-900 border-slate-700 text-slate-100';
+    : 'bg-premium-surface border-premium-border/70 text-premium-text';
 
   const modal = (
     <div
@@ -74,7 +74,7 @@ export function ValidationRunModal({
               {mode === 'agent' ? 'Agent validation cycle' : 'Validation cycle'}
             </h2>
             {isTerminal && progress?.status === 'completed' && autoCloseSec !== null && (
-              <p className={`text-xs mt-0.5 ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>
+              <p className={`text-xs mt-0.5 ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>
                 Closing in {autoCloseSec}s…
               </p>
             )}
@@ -82,7 +82,7 @@ export function ValidationRunModal({
           <button
             type="button"
             onClick={onClose}
-            className={`p-1 rounded ${isLightMode ? 'hover:bg-slate-100' : 'hover:bg-slate-800'}`}
+            className={`p-1 rounded ${isLightMode ? 'hover:bg-slate-100' : 'hover:bg-premium-hover'}`}
             aria-label="Close"
           >
             <X className="w-4 h-4" />

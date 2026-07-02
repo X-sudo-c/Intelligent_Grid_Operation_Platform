@@ -1,16 +1,20 @@
-"""Master topology DQ at scale — set-based orphan & dangling line scans."""
+"""Master & staging topology DQ — set-based orphan & dangling line scans."""
 
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal
 
 from lineage import log_lineage
+
+TopologyTier = Literal["master", "staging"]
 
 # Open topology exceptions above this count in an export clip block the export job.
 EXPORT_TOPOLOGY_EXCEPTION_CAP = 500
 # Orphan ratio in clip above this fraction triggers export block (when orphans > cap).
 EXPORT_ORPHAN_RATIO_CAP = 0.15
+
+_STAGING_ACTIVE_SQL = "io.validation NOT IN ('REJECTED', 'APPROVED')"
 
 
 def _bbox_clause(alias: str, clip: dict[str, float] | None) -> tuple[str, list[Any]]:
@@ -22,7 +26,19 @@ def _bbox_clause(alias: str, clip: dict[str, float] | None) -> tuple[str, list[A
     )
 
 
-def live_topology_counts(conn, *, clip: dict[str, float] | None = None) -> dict[str, int]:
+def live_topology_counts(
+    conn,
+    *,
+    clip: dict[str, float] | None = None,
+    tier: TopologyTier = "master",
+) -> dict[str, int]:
+    """Live topology counts for master or staging tables."""
+    if tier == "staging":
+        return live_staging_topology_counts(conn, clip=clip)
+    return live_master_topology_counts(conn, clip=clip)
+
+
+def live_master_topology_counts(conn, *, clip: dict[str, float] | None = None) -> dict[str, int]:
     """Live counts from master tables (not exception queue)."""
     node_bbox, node_params = _bbox_clause("cn", clip)
     line_bbox, line_params = _bbox_clause("als", clip)
@@ -112,7 +128,110 @@ def live_topology_counts(conn, *, clip: dict[str, float] | None = None) -> dict[
     }
 
 
-def _open_topology_exception_counts(conn, *, clip: dict[str, float] | None = None) -> dict[str, int]:
+def live_staging_topology_counts(conn, *, clip: dict[str, float] | None = None) -> dict[str, int]:
+    """Live topology counts from staging field-capture tables."""
+    node_bbox, node_params = _bbox_clause("cn", clip)
+    line_bbox, line_params = _bbox_clause("als", clip)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM staging.connectivity_nodes cn
+            JOIN staging.identified_objects io ON io.mrid = cn.mrid
+            WHERE {_STAGING_ACTIVE_SQL}
+            {node_bbox}
+            """,
+            node_params,
+        )
+        staging_nodes = int(cur.fetchone()[0])
+
+        cur.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM staging.connectivity_nodes cn
+            JOIN staging.identified_objects io ON io.mrid = cn.mrid
+            WHERE {_STAGING_ACTIVE_SQL}
+            {node_bbox}
+              AND NOT EXISTS (
+                SELECT 1 FROM staging.ac_line_segments als
+                WHERE als.source_node_id = cn.mrid OR als.target_node_id = cn.mrid
+              )
+            """,
+            node_params,
+        )
+        orphan_nodes = int(cur.fetchone()[0])
+
+        cur.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM staging.ac_line_segments als
+            JOIN staging.identified_objects io ON io.mrid = als.mrid
+            WHERE {_STAGING_ACTIVE_SQL}
+            {line_bbox}
+              AND (
+                NOT EXISTS (
+                  SELECT 1 FROM staging.connectivity_nodes cn
+                  WHERE cn.mrid = als.source_node_id
+                )
+                OR NOT EXISTS (
+                  SELECT 1 FROM staging.connectivity_nodes cn
+                  WHERE cn.mrid = als.target_node_id
+                )
+              )
+            """,
+            line_params,
+        )
+        dangling_lines = int(cur.fetchone()[0])
+
+        cur.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM staging.ac_line_segments als
+            JOIN staging.identified_objects io ON io.mrid = als.mrid
+            WHERE {_STAGING_ACTIVE_SQL}
+            {line_bbox}
+              AND (
+                NOT EXISTS (
+                  SELECT 1 FROM staging.connectivity_nodes cn
+                  JOIN staging.identified_objects nio ON nio.mrid = cn.mrid
+                  WHERE cn.mrid = als.source_node_id AND {_STAGING_ACTIVE_SQL.replace('io.', 'nio.')}
+                )
+                OR NOT EXISTS (
+                  SELECT 1 FROM staging.connectivity_nodes cn
+                  JOIN staging.identified_objects nio ON nio.mrid = cn.mrid
+                  WHERE cn.mrid = als.target_node_id AND {_STAGING_ACTIVE_SQL.replace('io.', 'nio.')}
+                )
+              )
+            """,
+            line_params,
+        )
+        bad_endpoints = int(cur.fetchone()[0])
+
+    orphan_ratio = round(orphan_nodes / staging_nodes, 6) if staging_nodes else 0.0
+    return {
+        "approved_nodes": staging_nodes,
+        "orphan_nodes": orphan_nodes,
+        "orphan_ratio": orphan_ratio,
+        "dangling_lines": dangling_lines,
+        "lines_with_unapproved_endpoints": bad_endpoints,
+    }
+
+
+def _open_topology_exception_counts(
+    conn,
+    *,
+    clip: dict[str, float] | None = None,
+    tier: TopologyTier = "master",
+) -> dict[str, int]:
+    if tier == "staging":
+        return _open_staging_topology_exception_counts(conn, clip=clip)
+    return _open_master_topology_exception_counts(conn, clip=clip)
+
+
+def _open_master_topology_exception_counts(
+    conn, *, clip: dict[str, float] | None = None
+) -> dict[str, int]:
     node_bbox, node_params = _bbox_clause("cn", clip)
     line_bbox, line_params = _bbox_clause("als", clip)
 
@@ -155,19 +274,72 @@ def _open_topology_exception_counts(conn, *, clip: dict[str, float] | None = Non
     return merged
 
 
-def topology_dq_summary(conn, *, clip: dict[str, float] | None = None) -> dict[str, Any]:
-    """Compute the LIVE topology summary (expensive at national scale).
+def _open_staging_topology_exception_counts(
+    conn, *, clip: dict[str, float] | None = None
+) -> dict[str, int]:
+    node_bbox, node_params = _bbox_clause("cn", clip)
+    line_bbox, line_params = _bbox_clause("als", clip)
 
-    The expensive live/queue counts are computed once and reused for the export
-    gate (previously this scanned the master tables twice). For interactive
-    reads prefer ``latest_topology_snapshot()``, which serves the last scan.
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT e.rule_code, COUNT(*)
+            FROM public.data_quality_exceptions e
+            JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
+            JOIN staging.connectivity_nodes cn ON cn.mrid = e.record_mrid
+            JOIN staging.identified_objects sio ON sio.mrid = e.record_mrid
+            WHERE e.status = 'OPEN' AND r.domain = 'topology'
+              AND e.record_type = 'connectivity_node'
+              AND {_STAGING_ACTIVE_SQL.replace('io.', 'sio.')}
+            {node_bbox}
+            GROUP BY e.rule_code
+            """,
+            node_params,
+        )
+        node_counts = {r[0]: int(r[1]) for r in cur.fetchall()}
+
+        cur.execute(
+            f"""
+            SELECT e.rule_code, COUNT(*)
+            FROM public.data_quality_exceptions e
+            JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
+            JOIN staging.ac_line_segments als ON als.mrid = e.record_mrid
+            JOIN staging.identified_objects sio ON sio.mrid = e.record_mrid
+            WHERE e.status = 'OPEN' AND r.domain = 'topology'
+              AND e.record_type = 'ac_line_segments'
+              AND {_STAGING_ACTIVE_SQL.replace('io.', 'sio.')}
+            {line_bbox}
+            GROUP BY e.rule_code
+            """,
+            line_params,
+        )
+        line_counts = {r[0]: int(r[1]) for r in cur.fetchall()}
+
+    merged: dict[str, int] = {}
+    for d in (node_counts, line_counts):
+        for k, v in d.items():
+            merged[k] = merged.get(k, 0) + v
+    merged["open_topology_total"] = sum(merged.values())
+    return merged
+
+
+def topology_dq_summary(
+    conn,
+    *,
+    clip: dict[str, float] | None = None,
+    tier: TopologyTier = "master",
+) -> dict[str, Any]:
+    """Compute the LIVE topology summary (expensive at national scale for master).
+
+    Staging is always computed live from the smaller staging tables.
     """
-    live = live_topology_counts(conn, clip=clip)
-    queue = _open_topology_exception_counts(conn, clip=clip)
+    live = live_topology_counts(conn, clip=clip, tier=tier)
+    queue = _open_topology_exception_counts(conn, clip=clip, tier=tier)
     summary = {
         "live": live,
         "exception_queue": queue,
-        "export_blocked": export_topology_blocked(conn, clip=clip, live=live, queue=queue),
+        "export_blocked": export_topology_blocked(conn, clip=clip, live=live, queue=queue, tier=tier),
+        "tier": tier,
     }
     summary["source"] = "live"
     return summary
@@ -203,8 +375,16 @@ def latest_topology_snapshot(conn) -> dict[str, Any] | None:
 
     result = dict(snapshot)
     result["source"] = "snapshot"
+    result["tier"] = "master"
     result["scanned_at"] = completed_at.isoformat() if completed_at else None
     result["run_id"] = run_id
+    return result
+
+
+def latest_staging_topology_live(conn, *, clip: dict[str, float] | None = None) -> dict[str, Any]:
+    """Always-live staging topology summary (no batch snapshot yet)."""
+    result = topology_dq_summary(conn, clip=clip, tier="staging")
+    result["scanned_at"] = None
     return result
 
 
@@ -214,21 +394,19 @@ def export_topology_blocked(
     clip: dict[str, float] | None,
     live: dict[str, int] | None = None,
     queue: dict[str, int] | None = None,
+    tier: TopologyTier = "master",
 ) -> dict[str, Any]:
-    """Whether an export in this clip should be blocked by topology DQ.
-
-    Pass precomputed ``live``/``queue`` counts to avoid re-scanning the master
-    tables when the caller already has them.
-    """
+    """Whether an export / release in this clip should be blocked by topology DQ."""
     if live is None:
-        live = live_topology_counts(conn, clip=clip)
+        live = live_topology_counts(conn, clip=clip, tier=tier)
     if queue is None:
-        queue = _open_topology_exception_counts(conn, clip=clip)
+        queue = _open_topology_exception_counts(conn, clip=clip, tier=tier)
     reasons: list[str] = []
 
     if live["dangling_lines"] > 0:
+        label = "staging" if tier == "staging" else "master"
         reasons.append(
-            f"{live['dangling_lines']} dangling line(s) in scope (missing endpoint node)"
+            f"{live['dangling_lines']} dangling line(s) in {label} scope (missing endpoint node)"
         )
     open_total = queue.get("open_topology_total", 0)
     if open_total > EXPORT_TOPOLOGY_EXCEPTION_CAP:
@@ -643,6 +821,9 @@ def execute_topology_batch_scan(
             "export_gate": gate,
         }
     except Exception as exc:
+        # Discard partial scan work, then persist the failure so the run
+        # doesn't stay stuck in 'running' (callers may rollback on re-raise).
+        conn.rollback()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -652,6 +833,7 @@ def execute_topology_batch_scan(
                 """,
                 (str(exc)[:2000], run_id),
             )
+        conn.commit()
         raise
 
 

@@ -33,8 +33,8 @@ export function GiopMigrationTab({ isLightMode }: GiopMigrationTabProps) {
   const [scale, setScale] = useState('0.0001');
   const [rotation, setRotation] = useState('0');
 
-  const card = isLightMode ? 'border-slate-200 bg-white' : 'border-slate-700 bg-slate-900/40';
-  const muted = isLightMode ? 'text-slate-500' : 'text-slate-400';
+  const card = isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/70 bg-premium-card';
+  const muted = isLightMode ? 'text-slate-500' : 'text-premium-muted';
   const input = `w-full rounded border px-2 py-1 text-xs ${
     isLightMode ? 'border-slate-300 bg-white' : 'border-slate-700 bg-slate-800 text-slate-100'
   }`;
@@ -217,7 +217,7 @@ export function GiopMigrationTab({ isLightMode }: GiopMigrationTabProps) {
               <tr
                 key={run.id}
                 onClick={() => void viewFailed(run.id)}
-                className={`border-t cursor-pointer ${isLightMode ? 'border-slate-200 hover:bg-slate-50' : 'border-slate-800 hover:bg-slate-800/50'} ${
+                className={`border-t cursor-pointer ${isLightMode ? 'border-slate-200 hover:bg-slate-50' : 'border-slate-800 hover:bg-premium-hover/50'} ${
                   selected === run.id ? (isLightMode ? 'bg-slate-100' : 'bg-slate-800/70') : ''
                 }`}
               >
@@ -260,7 +260,7 @@ export function GiopMigrationTab({ isLightMode }: GiopMigrationTabProps) {
             </thead>
             <tbody>
               {failed.map((row) => (
-                <tr key={row.id} className={`border-t ${isLightMode ? 'border-slate-200' : 'border-slate-800'}`}>
+                <tr key={row.id} className={`border-t ${isLightMode ? 'border-slate-200' : 'border-premium-border/80'}`}>
                   <td className="px-3 py-2 whitespace-nowrap">{row.source_ref}</td>
                   <td className="px-3 py-2">{row.primitive}</td>
                   <td className="px-3 py-2 text-rose-500">{row.error_message}</td>

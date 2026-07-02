@@ -58,6 +58,10 @@ export function useGiopTopology(
   const [error, setError] = useState<string | null>(null);
   const [traceScope, setTraceScope] = useState<'traced' | 'full'>('traced');
   const loadedTraceKeyRef = useRef<string | null>(null);
+  /** Monotonic id so an older in-flight refresh can't clobber a newer one. */
+  const refreshSeqRef = useRef(0);
+  const stagingInFlightRef = useRef(false);
+  const lastStagingPayloadRef = useRef<string | null>(null);
 
   useEffect(() => {
     loadedTraceKeyRef.current = null;
@@ -72,8 +76,12 @@ export function useGiopTopology(
 
   const refresh = useCallback(
     async (queryKey: GiopGraphQueryKey = graphQuery) => {
+      const seq = ++refreshSeqRef.current;
+      const isStale = () => seq !== refreshSeqRef.current;
       const scope = traceScopeForQuery(queryKey);
       const stagingData = await getStagingAssets().catch(() => [] as GiopStagingAsset[]);
+      if (isStale()) return;
+      lastStagingPayloadRef.current = JSON.stringify(stagingData);
       setStaging(stagingData);
 
       if (queryKey === 'topology_gaps') {
@@ -82,14 +90,16 @@ export function useGiopTopology(
         setError(null);
         try {
           const gapsData = await getTopologyGaps({ limit: 2000 });
+          if (isStale()) return;
           setTrace(null);
           setTraceScope(scope);
           setGraph(topologyPayloadToPortalGraph(gapsData, stagingData, queryKey, 'Disconnected assets'));
         } catch (err) {
+          if (isStale()) return;
           setError(err instanceof Error ? err.message : 'Failed to load topology');
           setGraph(null);
         } finally {
-          setLoading(false);
+          if (!isStale()) setLoading(false);
         }
         return;
       }
@@ -105,30 +115,17 @@ export function useGiopTopology(
         }
         if (cachedTrace) {
           setTrace(cachedTrace);
-          setTraceScope('traced');
+          setTraceScope(traceScopeForQuery(queryKey));
           setGraph(traceToPortalGraph(cachedTrace, stagingData, queryKey));
           setLoading(false);
-        } else {
-          setLoading(true);
-        }
-        setError(null);
-        setRevalidating(hadCachedTrace);
-        try {
-          const traceData = await getTrace(startMrid, 'traced');
-          writeSwCache(traceCacheKey(startMrid, 'traced'), traceData);
-          setTrace(traceData);
-          setTraceScope('traced');
-          setGraph(traceToPortalGraph(traceData, stagingData, queryKey));
-        } catch (err) {
-          if (!hadCachedTrace) {
-            setError(err instanceof Error ? err.message : 'Failed to load topology');
-            setTrace(null);
-            setGraph(null);
-          }
-        } finally {
-          setLoading(false);
+          setError(null);
           setRevalidating(false);
+          return;
         }
+        // Viewport / filter modes do not need Memgraph trace (chunks or trace-derived views).
+        setLoading(false);
+        setRevalidating(false);
+        setError(null);
         return;
       }
 
@@ -146,18 +143,22 @@ export function useGiopTopology(
       try {
         const traceData = await getTrace(startMrid, scope);
         writeSwCache(cacheKey, traceData);
+        if (isStale()) return;
         setTrace(traceData);
         setTraceScope(scope);
         setGraph(traceToPortalGraph(traceData, stagingData, queryKey));
       } catch (err) {
+        if (isStale()) return;
         if (!hadCachedTrace) {
           setError(err instanceof Error ? err.message : 'Failed to load topology');
           setTrace(null);
           setGraph(null);
         }
       } finally {
-        setLoading(false);
-        setRevalidating(false);
+        if (!isStale()) {
+          setLoading(false);
+          setRevalidating(false);
+        }
       }
     },
     [startMrid, graphQuery, trace, rebuildGraph],
@@ -165,14 +166,24 @@ export function useGiopTopology(
 
   /** Fast path: refresh staging overlay only (map + graph node styling). */
   const refreshStaging = useCallback(async () => {
+    // Poll + realtime + tab switches can coincide; one fetch at a time.
+    if (stagingInFlightRef.current) return;
+    stagingInFlightRef.current = true;
     try {
       const stagingData = await getStagingAssets().catch(() => [] as GiopStagingAsset[]);
+      // 10s poll usually returns identical data — skip the re-render (and the
+      // map source setData churn) when nothing changed.
+      const payload = JSON.stringify(stagingData);
+      if (payload === lastStagingPayloadRef.current) return;
+      lastStagingPayloadRef.current = payload;
       setStaging(stagingData);
       if (trace) {
         setGraph(traceToPortalGraph(trace, stagingData, graphQuery));
       }
     } catch {
       // Staging overlay is best-effort; full refresh can recover.
+    } finally {
+      stagingInFlightRef.current = false;
     }
   }, [trace, graphQuery]);
 
@@ -212,6 +223,13 @@ export function useGiopTopology(
   const applyQuery = useCallback(
     (queryKey: GiopGraphQueryKey) => {
       setGraphQuery(queryKey);
+      // When trace is inactive (e.g. the Operations desk, which renders from map
+      // chunks), never hit Memgraph — a stale traced query in the URL must not
+      // trigger a /trace fetch for a staging-only MRID.
+      if (!traceActive && needsTraceFetch(queryKey)) {
+        if (trace) rebuildGraph(trace, staging, queryKey);
+        return;
+      }
       if (queryKey === 'topology_gaps') {
         void refresh(queryKey);
         return;
@@ -236,7 +254,7 @@ export function useGiopTopology(
       }
       void refresh(queryKey);
     },
-    [trace, traceScope, staging, rebuildGraph, refresh],
+    [trace, traceScope, staging, rebuildGraph, refresh, traceActive],
   );
 
   return {

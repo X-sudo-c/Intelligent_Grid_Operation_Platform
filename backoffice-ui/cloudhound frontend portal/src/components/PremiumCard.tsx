@@ -1,6 +1,7 @@
 import { motion } from 'framer-motion';
 import type { HTMLMotionProps } from 'framer-motion';
 import type { ReactNode } from 'react';
+import { giopThemeTokens } from '../lib/giopTheme';
 import { ease } from '../lib/motion';
 
 export interface PremiumCardProps extends Omit<HTMLMotionProps<'div'>, 'children'> {
@@ -10,10 +11,6 @@ export interface PremiumCardProps extends Omit<HTMLMotionProps<'div'>, 'children
   hoverEffect?: 'lift' | 'glow' | 'scale' | 'none';
 }
 
-/**
- * Premium card component with sophisticated hover effects.
- * Supports glass morphism, elevation, and glow variants.
- */
 export function PremiumCard({
   children,
   isLightMode = false,
@@ -22,38 +19,37 @@ export function PremiumCard({
   className = '',
   ...motionProps
 }: PremiumCardProps) {
+  const t = giopThemeTokens(isLightMode);
   const baseStyles = 'rounded-xl border overflow-hidden';
 
   const variantStyles = {
-    default: isLightMode
-      ? 'bg-white border-slate-200'
-      : 'bg-[#0f141d] border-[#283246]/75',
+    default: t.card,
     glass: isLightMode
       ? 'bg-white/80 backdrop-blur-xl border-white/20 shadow-lg'
-      : 'bg-[#0f141d]/80 backdrop-blur-xl border-white/5 shadow-xl',
+      : 'bg-premium-card/85 backdrop-blur-xl border-premium-border/40 shadow-premium',
     elevated: isLightMode
       ? 'bg-white border-slate-200 shadow-lg'
-      : 'bg-[#131922] border-[#364258]/50 shadow-2xl',
+      : 'bg-premium-card border-premium-border/70 shadow-premium-lg',
     glow: isLightMode
       ? 'bg-white border-slate-200 shadow-[0_0_40px_rgba(99,102,241,0.1)]'
-      : 'bg-[#0f141d] border-[#4f46e5]/30 shadow-[0_0_40px_rgba(79,70,229,0.15)]',
+      : 'bg-premium-card border-premium-border/50 shadow-[0_0_24px_rgba(0,0,0,0.25)]',
   };
 
   const hoverStyles = {
     lift: {
       whileHover: {
-        y: -4,
+        y: -3,
         boxShadow: isLightMode
-          ? '0 20px 40px rgba(15,23,42,0.12)'
-          : '0 20px 40px rgba(0,0,0,0.4)',
+          ? '0 16px 32px rgba(15,23,42,0.1)'
+          : '0 16px 32px rgba(0,0,0,0.45)',
       },
-      whileTap: { y: -2, scale: 0.995 },
+      whileTap: { y: -1, scale: 0.995 },
     },
     glow: {
       whileHover: {
         boxShadow: isLightMode
           ? '0 0 30px rgba(99,102,241,0.2)'
-          : '0 0 30px rgba(79,70,229,0.3)',
+          : '0 0 24px rgba(0,0,0,0.3)',
       },
       whileTap: { scale: 0.995 },
     },
@@ -82,7 +78,7 @@ export function PremiumCard({
 
 interface PremiumMetricCardProps {
   label: string;
-  value: string | number;
+  value: ReactNode;
   trend?: 'up' | 'down' | 'neutral';
   trendValue?: string;
   isLightMode?: boolean;
@@ -99,12 +95,13 @@ export function PremiumMetricCard({
   icon,
   color = 'default',
 }: PremiumMetricCardProps) {
+  const t = giopThemeTokens(isLightMode);
   const colorStyles = {
-    default: isLightMode ? 'text-slate-700' : 'text-slate-300',
+    default: t.textSecondary,
     success: 'text-emerald-500',
     warning: 'text-amber-500',
     danger: 'text-rose-500',
-    info: 'text-cyan-500',
+    info: 'text-premium-accent',
   };
 
   const trendIcons = {
@@ -122,9 +119,7 @@ export function PremiumMetricCard({
     >
       <div className="flex items-start justify-between">
         <div>
-          <p className={`text-xs font-medium uppercase tracking-wider ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>
-            {label}
-          </p>
+          <p className={`text-xs font-medium uppercase tracking-wider ${t.muted}`}>{label}</p>
           <motion.h3
             className={`text-2xl font-semibold mt-1 ${colorStyles[color]}`}
             initial={{ opacity: 0, scale: 0.8 }}
@@ -139,7 +134,7 @@ export function PremiumMetricCard({
               animate={{ opacity: 1, x: 0 }}
               transition={{ delay: 0.2 }}
               className={`flex items-center gap-1 mt-2 text-xs ${
-                trend === 'up' ? 'text-emerald-500' : trend === 'down' ? 'text-rose-500' : 'text-slate-500'
+                trend === 'up' ? 'text-emerald-500' : trend === 'down' ? 'text-rose-500' : t.muted
               }`}
             >
               <span>{trendIcons[trend]}</span>
@@ -152,7 +147,7 @@ export function PremiumMetricCard({
             initial={{ opacity: 0, scale: 0 }}
             animate={{ opacity: 1, scale: 1 }}
             transition={{ delay: 0.15, type: 'spring', stiffness: 400 }}
-            className={`p-2.5 rounded-lg ${isLightMode ? 'bg-slate-100' : 'bg-slate-800/60'}`}
+            className={`p-2.5 rounded-lg ${isLightMode ? 'bg-slate-100' : 'bg-premium-hover'}`}
           >
             {icon}
           </motion.div>
@@ -177,19 +172,18 @@ export function StatCard({
   isLightMode = false,
   animate = true,
 }: StatCardProps) {
+  const t = giopThemeTokens(isLightMode);
   const percentage = max ? (value / max) * 100 : undefined;
 
   return (
     <motion.div
-      className={`p-4 rounded-lg border ${isLightMode ? 'bg-white border-slate-200' : 'bg-[#131922] border-[#364258]/50'}`}
+      className={`p-4 rounded-lg border ${t.card}`}
       whileHover={{ y: -2, transition: { duration: 0.2 } }}
     >
-      <p className={`text-xs uppercase tracking-wide ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>
-        {title}
-      </p>
+      <p className={`text-xs uppercase tracking-wide ${t.muted}`}>{title}</p>
       <div className="flex items-baseline gap-2 mt-1">
         <motion.span
-          className={`text-2xl font-semibold ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}
+          className={`text-2xl font-semibold ${t.text}`}
           initial={animate ? { opacity: 0, y: 10 } : undefined}
           animate={animate ? { opacity: 1, y: 0 } : undefined}
           transition={{ type: 'spring', stiffness: 300 }}
@@ -197,13 +191,11 @@ export function StatCard({
           {value.toLocaleString()}
         </motion.span>
         {max && (
-          <span className={`text-sm ${isLightMode ? 'text-slate-400' : 'text-slate-500'}`}>
-            / {max.toLocaleString()}
-          </span>
+          <span className={`text-sm ${t.mutedDim}`}>/ {max.toLocaleString()}</span>
         )}
       </div>
       {percentage !== undefined && (
-        <div className={`mt-3 h-1.5 rounded-full overflow-hidden ${isLightMode ? 'bg-slate-100' : 'bg-slate-800'}`}>
+        <div className={`mt-3 h-1.5 rounded-full overflow-hidden ${isLightMode ? 'bg-slate-100' : 'bg-premium-hover'}`}>
           <motion.div
             className={`h-full rounded-full ${percentage >= 80 ? 'bg-emerald-500' : percentage >= 50 ? 'bg-amber-500' : 'bg-rose-500'}`}
             initial={{ width: 0 }}

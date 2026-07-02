@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react';
+import { giopLog } from '../lib/giopDebugLog';
 
 interface GiopMapErrorBoundaryProps {
   children: ReactNode;
@@ -21,7 +22,7 @@ export class GiopMapErrorBoundary extends Component<
   }
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
-    console.error('[GiopMap] render error:', error, info.componentStack);
+    giopLog.map.error('render error', { error, componentStack: info.componentStack });
   }
 
   private handleReset = (): void => {
@@ -36,12 +37,12 @@ export class GiopMapErrorBoundary extends Component<
     const { isLightMode = false } = this.props;
     const card = isLightMode
       ? 'border-slate-200 bg-white text-slate-800'
-      : 'border-slate-700 bg-slate-900/60 text-slate-200';
+      : 'border-premium-border/70 bg-premium-surface/90 text-slate-200';
 
     return (
       <div className={`m-3 rounded-lg border p-4 text-sm ${card}`}>
         <p className="font-medium">Map preview failed to load</p>
-        <p className={`mt-1 text-xs ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>
+        <p className={`mt-1 text-xs ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>
           {error.message || 'Unexpected map error'}
         </p>
         <button

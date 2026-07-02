@@ -72,11 +72,11 @@ export function GiopCasesTab({ isLightMode }: GiopCasesTabProps) {
     }
   };
 
-  const card = isLightMode ? 'border-slate-200 bg-white' : 'border-slate-700 bg-slate-900/40';
+  const card = isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/70 bg-premium-card';
 
   return (
     <div className="h-full overflow-auto p-6">
-      <h3 className={`text-sm font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>
+      <h3 className={`text-sm font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>
         Contact Centre Cases
       </h3>
       <div className={`rounded-lg border p-4 mb-6 ${card}`}>

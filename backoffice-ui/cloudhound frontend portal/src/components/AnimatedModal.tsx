@@ -53,7 +53,7 @@ export function AnimatedModal({
   const overlayClass = isLightMode ? 'bg-slate-900/60' : 'bg-black/70';
   const panelClass = isLightMode
     ? 'bg-white border-slate-200 text-slate-900'
-    : 'bg-slate-900 border-slate-700 text-slate-100';
+    : 'bg-premium-surface border-premium-border/70 text-premium-text';
 
   if (!open) return null;
 
@@ -99,7 +99,7 @@ export function AnimatedModal({
                     onClick={onClose}
                     whileHover={{ scale: 1.1, rotate: 90 }}
                     whileTap={{ scale: 0.9 }}
-                    className={`p-2 rounded-full transition ${isLightMode ? 'hover:bg-slate-100' : 'hover:bg-slate-800'}`}
+                    className={`p-2 rounded-full transition ${isLightMode ? 'hover:bg-slate-100' : 'hover:bg-premium-hover'}`}
                     aria-label="Close"
                   >
                     <X className="w-4 h-4" />
@@ -190,7 +190,7 @@ export function ConfirmModal({
             className={`px-4 py-2 rounded-lg text-sm font-medium transition ${
               isLightMode
                 ? 'border border-slate-300 hover:bg-slate-100'
-                : 'border border-slate-600 hover:bg-slate-800'
+                : 'border border-slate-600 hover:bg-premium-hover'
             }`}
           >
             {cancelLabel}
@@ -219,7 +219,7 @@ export function ConfirmModal({
         </div>
       }
     >
-      <p className={`text-sm ${isLightMode ? 'text-slate-600' : 'text-slate-300'}`}>{message}</p>
+      <p className={`text-sm ${isLightMode ? 'text-slate-600' : 'text-premium-text-secondary'}`}>{message}</p>
     </AnimatedModal>
   );
 }

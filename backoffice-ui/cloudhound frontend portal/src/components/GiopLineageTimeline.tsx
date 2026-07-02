@@ -42,8 +42,8 @@ export function GiopLineageTimeline({
 
   if (!assetMrid) return null;
 
-  const border = isLightMode ? 'border-slate-200 bg-slate-50' : 'border-slate-700 bg-slate-900/50';
-  const muted = isLightMode ? 'text-slate-500' : 'text-slate-400';
+  const border = isLightMode ? 'border-slate-200 bg-slate-50' : 'border-premium-border/70 bg-premium-card/90';
+  const muted = isLightMode ? 'text-slate-500' : 'text-premium-muted';
   const diffBg = isLightMode ? 'bg-white border-slate-200' : 'bg-slate-950 border-slate-800';
 
   return (

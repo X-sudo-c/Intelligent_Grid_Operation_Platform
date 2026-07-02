@@ -45,6 +45,26 @@ export type GiopCopilotUiAction =
       geojson?: TerritoryGeoJson;
     };
 
+/** Human-readable "here's what I did" line for a UI action the copilot ran. */
+export function describeCopilotUiAction(action: GiopCopilotUiAction): string {
+  switch (action.type) {
+    case 'navigate':
+      return action.focus_mrid
+        ? `Opened the ${action.tab} tab and focused the asset`
+        : `Opened the ${action.tab} tab`;
+    case 'fit_bounds': {
+      const where = action.district ?? action.region;
+      return where ? `Framed ${where} on the map` : 'Framed the area on the map';
+    }
+    case 'fly_to':
+      return 'Moved the map to the location';
+    case 'highlight_territory':
+      return `Highlighted ${action.label ?? action.district ?? action.region ?? 'the territory'} on the map`;
+    default:
+      return 'Updated the map';
+  }
+}
+
 export interface GiopCopilotMessage {
   id: string;
   role: 'user' | 'assistant';

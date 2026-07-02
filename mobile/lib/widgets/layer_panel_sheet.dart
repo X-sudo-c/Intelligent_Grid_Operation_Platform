@@ -76,6 +76,9 @@ class LayerPanelSheet extends StatelessWidget {
     required this.pendingCount,
     required this.onSync,
     required this.syncing,
+    this.showWorkOrders = true,
+    this.onShowWorkOrdersChanged,
+    this.onOpenSyncQueue,
   });
 
   final LayerVisibility visibility;
@@ -83,6 +86,9 @@ class LayerPanelSheet extends StatelessWidget {
   final int pendingCount;
   final VoidCallback onSync;
   final bool syncing;
+  final bool showWorkOrders;
+  final ValueChanged<bool>? onShowWorkOrdersChanged;
+  final VoidCallback? onOpenSyncQueue;
 
   @override
   Widget build(BuildContext context) {
@@ -109,9 +115,22 @@ class LayerPanelSheet extends StatelessWidget {
                         : const Icon(Icons.sync, size: 18),
                     label: Text('Sync $pendingCount'),
                   ),
+                if (onOpenSyncQueue != null)
+                  TextButton.icon(
+                    onPressed: onOpenSyncQueue,
+                    icon: const Icon(Icons.cloud_upload_outlined, size: 18),
+                    label: const Text('Queue'),
+                  ),
               ],
             ),
           ),
+          if (onShowWorkOrdersChanged != null)
+            SwitchListTile(
+              secondary: const Icon(Icons.assignment, color: Colors.indigo),
+              title: const Text('Work order pins'),
+              value: showWorkOrders,
+              onChanged: (v) => onShowWorkOrdersChanged!(v),
+            ),
           SwitchListTile(
             secondary: Icon(layerIcon(MapNodeLayer.onGrid), color: layerColor(MapNodeLayer.onGrid)),
             title: Text(layerLabel(MapNodeLayer.onGrid)),

@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
-# Staging assets that still need steward action.
-STAGING_ACTIONABLE = ("STAGED", "PENDING_FIELD", "IN_CONFLICT")
+# Staging assets released to Operations for steward review / promotion.
+STAGING_ACTIONABLE = ("STAGED", "IN_CONFLICT")
 # Work-order statuses that count as "done" (everything else is open work).
 WORK_ORDER_CLOSED = ("COMPLETED", "CANCELLED")
 

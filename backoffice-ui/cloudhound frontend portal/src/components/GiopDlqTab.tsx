@@ -20,7 +20,7 @@ export function GiopDlqTab({ isLightMode }: GiopDlqTabProps) {
   const [sapBusy, setSapBusy] = useState(false);
   const [status, setStatus] = useState('');
 
-  const card = isLightMode ? 'border-slate-200 bg-white' : 'border-slate-700 bg-slate-900/40';
+  const card = isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/70 bg-premium-card';
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -85,10 +85,10 @@ export function GiopDlqTab({ isLightMode }: GiopDlqTabProps) {
       <div className={`rounded-lg border p-4 ${card}`}>
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h3 className={`text-sm font-semibold ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>
+            <h3 className={`text-sm font-semibold ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>
               SAP customer sync
             </h3>
-            <p className={`text-xs mt-1 ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>
+            <p className={`text-xs mt-1 ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>
               Mock mode pulls sample customers into <code className="text-xs">customer_accounts</code>.
               Swap env vars for live S/4HANA OData when ECG provides an endpoint.
             </p>
@@ -131,7 +131,7 @@ export function GiopDlqTab({ isLightMode }: GiopDlqTabProps) {
       </div>
 
       <div>
-        <h3 className={`text-sm font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>
+        <h3 className={`text-sm font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>
           Integration DLQ
         </h3>
         {status && <p className="text-xs text-slate-500 mb-2">{status}</p>}

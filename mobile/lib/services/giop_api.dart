@@ -298,9 +298,10 @@ class GiopApi {
       final mrid = row['mrid'] as String?;
       if (mrid != null && seenMrids.contains(mrid)) continue;
       final localId = row['id'] as int;
+      final displayMrid = mrid ?? 'local:$localId';
       nodes.add(
         AssetNode(
-          mrid: mrid ?? 'local-$localId',
+          mrid: displayMrid,
           name: row['name'] as String,
           validation: 'PENDING_FIELD',
           latitude: (row['latitude'] as num).toDouble(),
@@ -308,6 +309,9 @@ class GiopApi {
           tier: 'staging',
           layer: MapNodeLayer.queuedLocal,
           assetKind: assetKindFromString(row['asset_kind'] as String?),
+          boundaryFeederId: row['boundary_feeder_id'] as String?,
+          operatingUtility: row['operating_utility'] as String?,
+          substationName: row['substation_name'] as String?,
         ),
       );
     }
@@ -422,6 +426,12 @@ class GiopApi {
     return error.toString();
   }
 
+  String _syncHostHint() {
+    final host = Uri.tryParse(_syncUrl)?.host ?? _syncUrl;
+    return 'Tip: PC LAN IP may have changed — Settings → PC LAN IP (now trying $host). '
+        'On PC run: ip -4 addr | grep inet';
+  }
+
   List<dynamic> _parseRpcRows(dynamic raw) {
     if (raw is List) return raw;
     if (raw is String) {
@@ -455,6 +465,7 @@ class GiopApi {
       lines.add('Map nodes (sync :5000): OK ($count sample nodes)');
     } catch (e) {
       lines.add('Map nodes (sync :5000): FAIL — ${_shortError(e)}');
+      lines.add(_syncHostHint());
       lines.add('On PC run: ./scripts/start-sync-service.sh');
     }
 
@@ -507,6 +518,28 @@ class GiopApi {
       lines.add('Sync service: OK ($count staging)');
     } catch (e) {
       lines.add('Sync service: FAIL — ${_shortError(e)}');
+    }
+
+    try {
+      await _dio.post(
+        '$_syncUrl/api/v1/field/location',
+        data: {
+          'technician_id': config.technicianId,
+          'longitude': defaultMapLon,
+          'latitude': defaultMapLat,
+        },
+        options: Options(
+          contentType: 'application/json',
+          receiveTimeout: const Duration(seconds: 8),
+          connectTimeout: const Duration(seconds: 8),
+        ),
+      );
+      lines.add(
+        'Field location (sync :5000): OK — technician ${config.technicianId}',
+      );
+    } catch (e) {
+      lines.add('Field location (sync :5000): FAIL — ${_shortError(e)}');
+      lines.add(_syncHostHint());
     }
 
     if (config.usesEmulatorLoopback) {
@@ -1170,7 +1203,11 @@ class GiopApi {
         if (workOrderId != null) 'work_order_id': workOrderId,
         'session_started_at': DateTime.now().toUtc().toIso8601String(),
       },
-      options: Options(contentType: 'application/json'),
+      options: Options(
+        contentType: 'application/json',
+        connectTimeout: const Duration(seconds: 5),
+        receiveTimeout: const Duration(seconds: 8),
+      ),
     );
   }
 
@@ -1183,7 +1220,10 @@ class GiopApi {
     double? nearLon,
     int maxNodes = 80,
   }) async {
-    var unique = mrids.where((m) => m.isNotEmpty).toSet().toList();
+    var unique = mrids
+        .where((m) => m.isNotEmpty && !_isLocalQueuedMrid(m))
+        .toSet()
+        .toList();
     if (unique.isEmpty) return 0;
 
     if (nearLat != null &&
@@ -1240,6 +1280,8 @@ class GiopApi {
   }
 
   Future<Map<String, dynamic>?> fetchNodeConnections(String mrid) async {
+    if (_isLocalQueuedMrid(mrid)) return null;
+
     final cached = await OfflineDb.getCachedNodeTopology(mrid);
     if (cached != null) return cached;
 
@@ -1340,7 +1382,7 @@ class GiopApi {
     String? user,
     String? crew,
   }) async {
-    final effectiveUser = user ?? 'tech.demo';
+    final effectiveUser = user ?? config.technicianId;
     final query = crew != null ? 'crew=${Uri.encodeComponent(crew)}' : 'user=${Uri.encodeComponent(effectiveUser)}';
     final response = await _dio.get<Map<String, dynamic>>(
       '$_syncUrl/api/v1/work-orders/assigned?$query',
@@ -1363,7 +1405,7 @@ class GiopApi {
       data: {
         'status': status,
         if (notes != null) 'notes': notes,
-        'operator_id': 'tech.demo',
+        'operator_id': config.technicianId,
       },
       options: Options(contentType: 'application/json'),
     );
@@ -1384,6 +1426,14 @@ class GiopApi {
           notes: notes,
         );
         await OfflineDb.markWorkOrderStatusUpdateSynced(queueId, woId);
+      } on DioException catch (e) {
+        final code = e.response?.statusCode ?? 0;
+        if (code >= 400 && code < 500) {
+          // Server definitively rejected this transition — drop it so it does
+          // not retry forever; the fetch below restores the authoritative status.
+          await OfflineDb.markWorkOrderStatusUpdateSynced(queueId, woId);
+        }
+        // 5xx / network errors stay queued for the next sync.
       } catch (_) {
         // keep queued for next sync
       }
@@ -1433,3 +1483,6 @@ class GiopApi {
         .toList();
   }
 }
+
+bool _isLocalQueuedMrid(String mrid) =>
+    mrid.startsWith('local:') || mrid.startsWith('local-');

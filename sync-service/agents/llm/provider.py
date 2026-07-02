@@ -13,6 +13,31 @@ def llm_configured() -> bool:
     return bool(os.getenv("GIOP_LLM_API_KEY") or os.getenv("OPENAI_API_KEY"))
 
 
+def _deterministic_fallback(
+    messages: list[dict[str, str]], *, reason: str = "LLM not configured"
+) -> dict[str, Any]:
+    """No-LLM answer assembled from context/tool output so the copilot never dies."""
+    user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+    for msg in reversed(messages):
+        if msg.get("role") == "tool":
+            snippet = (msg.get("content") or "")[:1500]
+            return {
+                "content": (
+                    f"[GIOP agent — {reason}] Tool results available. "
+                    f"Question context: {user[:400]}\n\nLatest tool output:\n{snippet}"
+                ),
+                "model": "deterministic-fallback",
+                "tools_used": [],
+                "raw": {"content": snippet},
+            }
+    return {
+        "content": f"[GIOP agent — {reason}] Based on available data: {user[:500]}",
+        "model": "deterministic-fallback",
+        "tools_used": [],
+        "raw": {"content": user[:500]},
+    }
+
+
 def complete_chat(
     messages: list[dict[str, str]],
     *,
@@ -26,26 +51,7 @@ def complete_chat(
     model = model or os.getenv("GIOP_LLM_MODEL") or "gpt-4o-mini"
 
     if not api_key:
-        # Deterministic fallback: execute first requested tool from prior assistant turn if present
-        user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
-        for msg in reversed(messages):
-            if msg.get("role") == "tool":
-                snippet = (msg.get("content") or "")[:1500]
-                return {
-                    "content": (
-                        f"[GIOP agent — LLM not configured] Tool results available. "
-                        f"Question context: {user[:400]}\n\nLatest tool output:\n{snippet}"
-                    ),
-                    "model": "deterministic-fallback",
-                    "tools_used": [],
-                    "raw": {"content": snippet},
-                }
-        return {
-            "content": f"[GIOP agent — LLM not configured] Based on available data: {user[:500]}",
-            "model": "deterministic-fallback",
-            "tools_used": [],
-            "raw": {"content": user[:500]},
-        }
+        return _deterministic_fallback(messages)
 
     payload: dict[str, Any] = {
         "model": model,
@@ -65,12 +71,16 @@ def complete_chat(
     if workspace_id:
         headers["X-DashScope-Workspace"] = workspace_id
 
-    resp = requests.post(
-        f"{base_url}/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=60,
-    )
+    try:
+        resp = requests.post(
+            f"{base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=60,
+        )
+    except requests.RequestException:
+        # Provider unreachable (offline, DNS, timeout) — degrade, don't 500.
+        return _deterministic_fallback(messages, reason="LLM unreachable")
     if resp.status_code >= 400:
         detail = resp.text[:500]
         try:
@@ -80,6 +90,10 @@ def complete_chat(
             detail = f"{code}: {message}" if code else message
         except Exception:
             pass
+        if resp.status_code in (401, 402, 403) or resp.status_code >= 500:
+            # Bad key / unpurchased model / provider outage — the copilot
+            # must still answer from tools instead of crashing the request.
+            return _deterministic_fallback(messages, reason=f"LLM error: {detail[:160]}")
         resp.reason = detail
     resp.raise_for_status()
     data = resp.json()

@@ -1,14 +1,14 @@
 import { useCallback, useMemo } from 'react';
 import { GiopMapView } from './GiopMapView';
 import { GiopTopologyTab } from './GiopTopologyTab';
-import { SPLIT_VIEW_GRAPH_QUERY_OPTIONS, type GiopGraphQueryKey } from '../lib/giopGraphTypes';
+import { SPLIT_VIEW_GRAPH_QUERY_OPTIONS, GIOP_GRAPH_QUERY_OPTIONS, type GiopGraphQueryKey } from '../lib/giopGraphTypes';
 import type { PortalGraphResponse } from '../lib/giopGraphTypes';
 import type { GiopFieldTechnician, GiopStagingAsset, GiopWorkOrder, GiopTopologyPayload } from '../api/giop-api';
 import { useGiopGraphChunk } from '../hooks/useGiopGraphChunk';
 import { chunkToPortalGraph } from '../lib/giopGraphAdapter';
 import type { MapBbox } from '../hooks/useGiopGraphChunk';
 
-interface GiopSplitViewProps {
+export interface GiopSplitViewProps {
   graph: PortalGraphResponse | null;
   loading: boolean;
   revalidating?: boolean;
@@ -40,6 +40,14 @@ interface GiopSplitViewProps {
   };
   workOrders?: GiopWorkOrder[];
   impactOverlay?: GiopTopologyPayload | null;
+  focusLabel?: string | null;
+  pulseFocus?: boolean;
+  mapChrome?: 'full' | 'operations';
+  /** Ops desk: topology highlight is independent of map/table focus. */
+  topologyFocusMrid?: string | null;
+  /** Ops desk "View on map": imperative pan request forwarded to the embedded map. */
+  flyRequest?: { id: number; coordinates: [number, number] | null } | null;
+  topologyGraphQueryOptions?: typeof GIOP_GRAPH_QUERY_OPTIONS;
 }
 
 const SPLIT_RATIO_KEY = 'giop.portal.splitRatio.v1';
@@ -77,7 +85,14 @@ export function GiopSplitView({
   fieldCrews,
   workOrders = [],
   impactOverlay = null,
+  focusLabel,
+  pulseFocus = false,
+  mapChrome = 'full',
+  topologyFocusMrid,
+  flyRequest = null,
+  topologyGraphQueryOptions,
 }: GiopSplitViewProps) {
+  const isOpsDesk = mapChrome === 'operations';
   const ratio = readSplitRatio();
   const { chunk, loading: chunkLoading, error: chunkError, loadBbox } = useGiopGraphChunk(startMrid);
 
@@ -106,6 +121,10 @@ export function GiopSplitView({
           isLightMode={isLightMode}
           focusMrid={focusMrid}
           focusCoordinates={focusCoordinates}
+          focusLabel={focusLabel}
+          pulseFocus={pulseFocus}
+          mapChrome={mapChrome}
+          flyRequest={flyRequest}
           stagingAssets={stagingAssets}
           fieldTechnicians={fieldTechnicians}
           fieldCrews={fieldCrews}
@@ -132,11 +151,12 @@ export function GiopSplitView({
           graphQuery={graphQuery}
           onQueryChange={onQueryChange}
           isLightMode={isLightMode}
-          focusMrid={focusMrid}
+          focusMrid={isOpsDesk ? topologyFocusMrid : focusMrid}
           onFocusHandled={onFocusHandled}
           onNodeSelect={onGraphNodeSelect}
-          graphQueryOptions={SPLIT_VIEW_GRAPH_QUERY_OPTIONS}
+          graphQueryOptions={topologyGraphQueryOptions ?? SPLIT_VIEW_GRAPH_QUERY_OPTIONS}
           compact
+          graphChrome={isOpsDesk ? 'operations' : 'full'}
         />
       </div>
     </div>

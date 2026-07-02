@@ -53,8 +53,10 @@ export function AnimatedBadge({
         damping: 20,
       }}
       className={`inline-flex items-center justify-center rounded-full font-semibold leading-none ${
-        isLightMode ? 'bg-amber-600 text-white' : 'bg-amber-500 text-slate-950'
-      } ${sizeStyles[size]} ${hasChanged ? 'ring-2 ring-offset-2 ' + (isLightMode ? 'ring-amber-400' : 'ring-amber-500') : ''}`}
+        isLightMode
+          ? 'bg-amber-600 text-white'
+          : 'border border-premium-border/60 bg-premium-hover-strong text-premium-text-secondary'
+      } ${sizeStyles[size]} ${hasChanged ? 'ring-2 ring-offset-2 ' + (isLightMode ? 'ring-amber-400' : 'ring-premium-border') : ''}`}
     >
       <AnimatePresence mode="wait">
         <motion.span
@@ -69,7 +71,7 @@ export function AnimatedBadge({
       </AnimatePresence>
       {pulse && (
         <motion.span
-          className={`absolute inset-0 rounded-full ${isLightMode ? 'bg-amber-600' : 'bg-amber-500'}`}
+          className={`absolute inset-0 rounded-full ${isLightMode ? 'bg-amber-600' : 'bg-premium-muted-dim'}`}
           animate={{
             scale: [1, 1.4, 1],
             opacity: [0.5, 0, 0.5],

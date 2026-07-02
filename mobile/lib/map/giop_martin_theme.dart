@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -7,6 +8,7 @@ import 'package:vector_map_tiles/vector_map_tiles.dart';
 import 'package:vector_tile_renderer/vector_tile_renderer.dart';
 
 import '../debug_agent_log.dart';
+import '../services/offline_db.dart';
 
 /// Martin vector-tile theme + providers matching the portal Network Map.
 abstract final class GiopMartinTheme {
@@ -18,8 +20,9 @@ abstract final class GiopMartinTheme {
   // whole theme (JSON + expression parsers) on every map rebuild, saturating the
   // UI thread and causing tile loads to be cancelled (lines vanishing).
   static Theme? _cachedTheme;
+  static int? _cachedThemeVersion;
   static final Map<String, TileProviders> _cachedProviders = {};
-  static const _themeVersion = 2;
+  static const _themeVersion = 3;
 
   static String _tileUrl(String base, String layer) =>
       '${base.replaceAll(RegExp(r'/+$'), '')}/$layer/{z}/{x}/{y}';
@@ -51,12 +54,12 @@ abstract final class GiopMartinTheme {
   }
 
   static Theme readGridTheme() {
-    final cached = _cachedTheme;
-    if (cached != null) {
-      return cached;
+    if (_cachedTheme != null && _cachedThemeVersion == _themeVersion) {
+      return _cachedTheme!;
     }
     final theme = ThemeReader().read(_themeJson);
     _cachedTheme = theme;
+    _cachedThemeVersion = _themeVersion;
     // #region agent log
     agentLog(
       location: 'giop_martin_theme.dart:readGridTheme',
@@ -85,10 +88,10 @@ abstract final class GiopMartinTheme {
     'MV_11KV',
     '#B91C1C',
     'LV_230V',
-    '#0F172A',
+    '#334155',
     'LV_400V',
-    '#0F172A',
-    '#64748B',
+    '#334155',
+    '#475569',
   ];
 
   static final Map<String, dynamic> _themeJson = {
@@ -119,7 +122,7 @@ abstract final class GiopMartinTheme {
             14,
             2.2,
           ],
-          'line-opacity': 0.88,
+          'line-opacity': 0.96,
         },
       },
       {
@@ -144,7 +147,7 @@ abstract final class GiopMartinTheme {
             12,
             1.9,
           ],
-          'line-opacity': 0.88,
+          'line-opacity': 0.96,
         },
       },
       {
@@ -171,7 +174,7 @@ abstract final class GiopMartinTheme {
             14,
             2.2,
           ],
-          'line-opacity': 0.75,
+          'line-opacity': 0.88,
           'line-dasharray': [4, 3],
         },
       },
@@ -197,7 +200,7 @@ abstract final class GiopMartinTheme {
             12,
             1.9,
           ],
-          'line-opacity': 0.75,
+          'line-opacity': 0.88,
           'line-dasharray': [4, 3],
         },
       },
@@ -227,7 +230,7 @@ abstract final class GiopMartinTheme {
             15,
             2.5,
           ],
-          'line-opacity': 0.92,
+          'line-opacity': 0.98,
         },
       },
       {
@@ -256,7 +259,7 @@ abstract final class GiopMartinTheme {
             15,
             2.5,
           ],
-          'line-opacity': 0.92,
+          'line-opacity': 0.96,
           'line-dasharray': [4, 3],
         },
       },
@@ -272,7 +275,7 @@ abstract final class GiopMartinTheme {
           ['!=', 'installation_type', 'UNDERGROUND'],
         ],
         'paint': {
-          'line-color': '#0F172A',
+          'line-color': '#334155',
           'line-width': [
             'interpolate',
             ['linear'],
@@ -286,7 +289,7 @@ abstract final class GiopMartinTheme {
             16,
             2.4,
           ],
-          'line-opacity': 0.85,
+          'line-opacity': 0.94,
         },
       },
       {
@@ -301,7 +304,7 @@ abstract final class GiopMartinTheme {
           ['==', 'installation_type', 'UNDERGROUND'],
         ],
         'paint': {
-          'line-color': '#0F172A',
+          'line-color': '#64748B',
           'line-width': [
             'interpolate',
             ['linear'],
@@ -315,7 +318,7 @@ abstract final class GiopMartinTheme {
             16,
             2.4,
           ],
-          'line-opacity': 0.85,
+          'line-opacity': 0.9,
           'line-dasharray': [4, 3],
         },
       },
@@ -460,6 +463,15 @@ class GiopMartinTileProvider extends NetworkVectorTileProvider {
   @override
   Future<Uint8List> provide(TileIdentity tile) async {
     try {
+      final cached = await OfflineDb.loadCachedTile(
+        z: tile.z,
+        x: tile.x,
+        y: tile.y,
+        layerId: layerName,
+      );
+      if (cached != null && cached.isNotEmpty) {
+        return Uint8List.fromList(cached);
+      }
       final bytes = await super.provide(tile);
       // #region agent log
       if (_isLineLayer) {
@@ -483,6 +495,17 @@ class GiopMartinTileProvider extends NetworkVectorTileProvider {
         }
       }
       // #endregion
+      if (bytes.isNotEmpty) {
+        unawaited(
+          OfflineDb.cacheTile(
+            z: tile.z,
+            x: tile.x,
+            y: tile.y,
+            layerId: layerName,
+            pbfBytes: bytes,
+          ),
+        );
+      }
       return bytes;
     } on ProviderException catch (e) {
       // #region agent log

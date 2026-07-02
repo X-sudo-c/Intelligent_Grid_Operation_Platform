@@ -72,7 +72,7 @@ export function AnimationShowcase({ isLightMode = false }: ShowcaseProps) {
   ];
 
   return (
-    <div className={`min-h-screen p-8 ${isLightMode ? 'bg-slate-50' : 'bg-[#0a0f18]'}`}>
+    <div className={`min-h-screen p-8 ${isLightMode ? 'bg-slate-50' : 'bg-premium-bg'}`}>
       <AnimatedToastStack toasts={toasts} onDismiss={dismissToast} isLightMode={isLightMode} />
 
       {/* Header */}
@@ -84,7 +84,7 @@ export function AnimationShowcase({ isLightMode = false }: ShowcaseProps) {
         <h1 className={`text-3xl font-bold mb-2 ${isLightMode ? 'text-slate-900' : 'text-white'}`}>
           <span className="text-gradient">Premium</span> Animation Showcase
         </h1>
-        <p className={`${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>
+        <p className={`${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>
           Modern, high-end UI components with smooth animations
         </p>
       </motion.div>
@@ -96,7 +96,7 @@ export function AnimationShowcase({ isLightMode = false }: ShowcaseProps) {
         animate="visible"
         className="mb-12"
       >
-        <h2 className={`text-xl font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>
+        <h2 className={`text-xl font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>
           Badges & Indicators
         </h2>
         <div className="flex flex-wrap items-center gap-6">
@@ -129,7 +129,7 @@ export function AnimationShowcase({ isLightMode = false }: ShowcaseProps) {
         animate="visible"
         className="mb-12"
       >
-        <h2 className={`text-xl font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>
+        <h2 className={`text-xl font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>
           Premium Metric Cards
         </h2>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -187,15 +187,15 @@ export function AnimationShowcase({ isLightMode = false }: ShowcaseProps) {
         animate="visible"
         className="mb-12"
       >
-        <h2 className={`text-xl font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>
+        <h2 className={`text-xl font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>
           Card Variants
         </h2>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           <motion.div variants={fadeUpItem}>
             <PremiumCard isLightMode={isLightMode} variant="default" hoverEffect="lift">
               <div className="p-4">
-                <h3 className={`font-medium mb-2 ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>Default</h3>
-                <p className={`text-sm ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>Lift hover effect</p>
+                <h3 className={`font-medium mb-2 ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>Default</h3>
+                <p className={`text-sm ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>Lift hover effect</p>
               </div>
             </PremiumCard>
           </motion.div>
@@ -203,8 +203,8 @@ export function AnimationShowcase({ isLightMode = false }: ShowcaseProps) {
           <motion.div variants={fadeUpItem}>
             <PremiumCard isLightMode={isLightMode} variant="glass" hoverEffect="glow">
               <div className="p-4">
-                <h3 className={`font-medium mb-2 ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>Glass</h3>
-                <p className={`text-sm ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>Backdrop blur</p>
+                <h3 className={`font-medium mb-2 ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>Glass</h3>
+                <p className={`text-sm ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>Backdrop blur</p>
               </div>
             </PremiumCard>
           </motion.div>
@@ -212,8 +212,8 @@ export function AnimationShowcase({ isLightMode = false }: ShowcaseProps) {
           <motion.div variants={fadeUpItem}>
             <PremiumCard isLightMode={isLightMode} variant="elevated" hoverEffect="scale">
               <div className="p-4">
-                <h3 className={`font-medium mb-2 ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>Elevated</h3>
-                <p className={`text-sm ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>Scale on hover</p>
+                <h3 className={`font-medium mb-2 ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>Elevated</h3>
+                <p className={`text-sm ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>Scale on hover</p>
               </div>
             </PremiumCard>
           </motion.div>
@@ -221,8 +221,8 @@ export function AnimationShowcase({ isLightMode = false }: ShowcaseProps) {
           <motion.div variants={fadeUpItem}>
             <PremiumCard isLightMode={isLightMode} variant="glow" hoverEffect="lift">
               <div className="p-4">
-                <h3 className={`font-medium mb-2 ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>Glow</h3>
-                <p className={`text-sm ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>Purple glow effect</p>
+                <h3 className={`font-medium mb-2 ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>Glow</h3>
+                <p className={`text-sm ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>Purple glow effect</p>
               </div>
             </PremiumCard>
           </motion.div>
@@ -236,7 +236,7 @@ export function AnimationShowcase({ isLightMode = false }: ShowcaseProps) {
         animate="visible"
         className="mb-12"
       >
-        <h2 className={`text-xl font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>
+        <h2 className={`text-xl font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>
           Buttons & Actions
         </h2>
         <div className="flex flex-wrap gap-3">
@@ -293,7 +293,7 @@ export function AnimationShowcase({ isLightMode = false }: ShowcaseProps) {
         animate="visible"
         className="mb-12"
       >
-        <h2 className={`text-xl font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>
+        <h2 className={`text-xl font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>
           Animated Data Table
         </h2>
         <motion.div variants={fadeUpItem}>
@@ -344,7 +344,7 @@ export function AnimationShowcase({ isLightMode = false }: ShowcaseProps) {
         animate="visible"
         className="mb-12"
       >
-        <h2 className={`text-xl font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>
+        <h2 className={`text-xl font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>
           Loading Skeletons
         </h2>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -352,7 +352,7 @@ export function AnimationShowcase({ isLightMode = false }: ShowcaseProps) {
             <MetricCardSkeleton isLightMode={isLightMode} />
           </motion.div>
           <motion.div variants={fadeUpItem} className="col-span-2">
-            <div className={`p-4 rounded-xl border ${isLightMode ? 'bg-white border-slate-200' : 'bg-slate-900/40 border-slate-700'}`}>
+            <div className={`p-4 rounded-xl border ${isLightMode ? 'bg-white border-slate-200' : 'bg-premium-card border-premium-border/70'}`}>
               <TableRowSkeleton isLightMode={isLightMode} columns={3} />
               <TableRowSkeleton isLightMode={isLightMode} columns={3} />
               <TableRowSkeleton isLightMode={isLightMode} columns={3} />
@@ -377,7 +377,7 @@ export function AnimationShowcase({ isLightMode = false }: ShowcaseProps) {
           </AnimatedActionButton>
         }
       >
-        <p className={isLightMode ? 'text-slate-600' : 'text-slate-300'}>
+        <p className={isLightMode ? 'text-slate-600' : 'text-premium-text-secondary'}>
           This modal features a backdrop blur effect, scale entrance animation, 
           and smooth exit transitions. Try hovering over the close button!
         </p>

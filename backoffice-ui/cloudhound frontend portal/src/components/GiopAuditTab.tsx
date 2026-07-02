@@ -5,6 +5,7 @@ import {
 } from '../api/giop-api';
 import { GiopLineageTimeline } from './GiopLineageTimeline';
 import { useGiopMapOverlay } from '../context/GiopMapOverlayContext';
+import { giopLog } from '../lib/giopDebugLog';
 import { LINEAGE_SOURCE_LABELS } from '../lib/giopLineageDiff';
 
 interface GiopAuditTabProps {
@@ -49,11 +50,11 @@ export function GiopAuditTab({ isLightMode }: GiopAuditTabProps) {
 
   const inputClass = isLightMode
     ? 'bg-white border-slate-300 text-slate-900'
-    : 'bg-slate-900 border-slate-700 text-slate-100';
+    : 'bg-premium-surface border-premium-border/70 text-premium-text';
 
   return (
     <div className="space-y-4">
-      <div className={`rounded-lg border p-4 ${isLightMode ? 'border-slate-200' : 'border-slate-700'}`}>
+      <div className={`rounded-lg border p-4 ${isLightMode ? 'border-slate-200' : 'border-premium-border/70'}`}>
         <h3 className="text-sm font-semibold mb-3">Audit ledger search</h3>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
           <label className="text-xs space-y-1">
@@ -105,7 +106,7 @@ export function GiopAuditTab({ isLightMode }: GiopAuditTabProps) {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div className={`rounded-lg border overflow-hidden ${isLightMode ? 'border-slate-200' : 'border-slate-700'}`}>
+        <div className={`rounded-lg border overflow-hidden ${isLightMode ? 'border-slate-200' : 'border-premium-border/70'}`}>
           <div className={`px-3 py-2 text-xs font-semibold uppercase ${isLightMode ? 'bg-slate-100 text-slate-600' : 'bg-slate-800 text-slate-400'}`}>
             Recent events {loading ? '(loading…)' : `(${events.length})`}
           </div>
@@ -126,6 +127,7 @@ export function GiopAuditTab({ isLightMode }: GiopAuditTabProps) {
                     className={`border-t cursor-pointer ${focusMrid === ev.target_mrid ? (isLightMode ? 'bg-cyan-50' : 'bg-cyan-950/30') : ''} ${isLightMode ? 'border-slate-200 hover:bg-slate-50' : 'border-slate-800 hover:bg-slate-900/50'}`}
                     onClick={() => {
                       setFocusMrid(ev.target_mrid);
+                      giopLog.audit.info('lineage row focus', { mrid: ev.target_mrid, action: ev.action_type });
                       void focusOnMap(ev.target_mrid);
                     }}
                   >

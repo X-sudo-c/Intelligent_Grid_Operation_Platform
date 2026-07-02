@@ -2,8 +2,10 @@
 
 import asyncio
 import json
+import logging
 import os
 import secrets
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -17,8 +19,9 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Reques
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from neo4j import GraphDatabase
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
+from db_pool import close_all_pools, pooled_connect
 from dlq import list_dlq, mark_retrying, patch_dlq
 from field_capture import (
     distinct_feeders,
@@ -66,6 +69,7 @@ from redis_cache import (
     claim_idempotency,
     conflicts_key,
     dq_exceptions_key,
+    dq_queue_key,
     dq_rules_key,
     dq_summary_key,
     exports_list_key,
@@ -116,9 +120,14 @@ from lineage import (
     set_lineage_context,
 )
 from data_quality import (
+    OPS_STAGING_QUEUE,
     count_blocking_open,
+    count_exceptions,
+    count_dq_queue,
+    list_dq_queue,
     list_exceptions as dq_list_exceptions,
     list_rules as dq_list_rules,
+    release_staging_to_operations,
     resolve_exception as dq_resolve_exception,
     run_asset_checks,
     summary as dq_summary,
@@ -126,6 +135,7 @@ from data_quality import (
 from topology_dq import (
     create_topology_batch_run,
     execute_topology_batch_scan,
+    latest_staging_topology_live,
     latest_topology_snapshot,
     list_batch_runs as topology_dq_list_runs,
     topology_dq_summary,
@@ -260,7 +270,7 @@ def _push_rejection_notification(
     if not technician_id or not SUPABASE_DB_URI:
         return
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             dispatch_rejection_push(
                 conn,
@@ -299,12 +309,24 @@ graph_driver = GraphDatabase.driver(
 TraceScope = Literal["traced", "full"]
 
 
+_graph_totals_cache: tuple[float, int, int] | None = None
+_GRAPH_TOTALS_TTL_SEC = 30.0
+
+
 def _pg_graph_totals(conn) -> tuple[int, int]:
+    # Totals are display metadata on trace payloads — a COUNT(*) pair per
+    # trace request is wasted work, so serve slightly-stale cached counts.
+    global _graph_totals_cache
+    cached = _graph_totals_cache
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < _GRAPH_TOTALS_TTL_SEC:
+        return cached[1], cached[2]
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM public.connectivity_nodes")
         node_count = int(cur.fetchone()[0])
         cur.execute("SELECT COUNT(*) FROM public.ac_line_segments")
         edge_count = int(cur.fetchone()[0])
+    _graph_totals_cache = (now, node_count, edge_count)
     return node_count, edge_count
 
 
@@ -797,13 +819,13 @@ def _fetch_graph_chunk_from_postgres(
 
 
 class WebhookPayload(BaseModel):
-    model_config = {"extra": "ignore"}
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     type: str
     table: str
     record: Optional[dict[str, Any]] = None
     old_record: Optional[dict[str, Any]] = None
-    schema: Optional[str] = None
+    db_schema: Optional[str] = Field(default=None, validation_alias="schema")
 
 
 class TelemetryPayload(BaseModel):
@@ -1058,7 +1080,7 @@ class H3DeleteAssignmentsPayload(BaseModel):
 def _pg_connect():
     if not SUPABASE_DB_URI:
         return None
-    return psycopg2.connect(SUPABASE_DB_URI)
+    return pooled_connect(SUPABASE_DB_URI)
 
 
 def _lookup_node_name(mrid: str) -> Optional[str]:
@@ -1159,7 +1181,7 @@ def _validate_inspection_background(inspection_id: str, photo_url: str | None) -
 
 def sync_to_graph_store(payload: WebhookPayload) -> None:
     # Master (public) changes only — staging rows must not reach Memgraph until promoted.
-    if payload.schema and payload.schema != "public":
+    if payload.db_schema and payload.db_schema != "public":
         return
     topology_tables = {"connectivity_nodes", "ac_line_segments", "identified_objects", "conducting_equipment"}
     if payload.table in topology_tables and payload.type:
@@ -1174,8 +1196,11 @@ def sync_to_graph_store(payload: WebhookPayload) -> None:
             _lookup_node_name,
             _lookup_equipment,
         )
-    else:
+    elif payload.table in topology_tables:
+        # Metadata tables (names/equipment) — full reconcile refreshes labels.
         reconcile_memgraph(graph_driver)
+    # Non-topology tables (work orders, tickets, …) never trigger a national
+    # Memgraph reconcile — that was a huge accidental cost per webhook.
 
 
 @app.post("/webhook/supabase-sync")
@@ -1186,7 +1211,7 @@ async def handle_supabase_sync(
     dedup_material = {
         "type": payload.type,
         "table": payload.table,
-        "schema": payload.schema,
+        "schema": payload.db_schema,
         "record": payload.record,
         "old_record": payload.old_record,
     }
@@ -1225,7 +1250,7 @@ async def log_meter_interval(payload: TelemetryPayload):
         raise HTTPException(status_code=500, detail="TIMESCALE_URI not configured")
 
     try:
-        conn = psycopg2.connect(TIMESCALE_URI)
+        conn = pooled_connect(TIMESCALE_URI)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1258,19 +1283,27 @@ def _asset_tier(cur, mrid: str) -> str | None:
 async def list_staging_assets(
     include_rejected: bool = Query(default=False),
     submitted_by: str | None = Query(default=None),
+    limit: int = Query(default=5000, ge=1, le=20000),
+    queue: Literal["all", "operations", "dq"] = Query(default="all"),
 ):
-    """Pending field assets awaiting backoffice approval."""
+    """Staging assets. Use queue=operations for the Operations inbox (STAGED/IN_CONFLICT)."""
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    cache_key = assets_staging_key(include_rejected, submitted_by)
+    cache_key = assets_staging_key(include_rejected, submitted_by, limit, queue)
 
     def _fetch():
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             filters = []
             params: list[Any] = []
             if not include_rejected:
                 filters.append("io.validation <> 'REJECTED'")
+            if queue == "operations":
+                filters.append("io.validation::text = ANY(%s)")
+                params.append(list(OPS_STAGING_QUEUE))
+            elif queue == "dq":
+                filters.append("io.validation::text = ANY(%s)")
+                params.append(["PENDING_FIELD", "IN_CONFLICT"])
             if submitted_by:
                 filters.append("io.submitted_by = %s")
                 params.append(submitted_by)
@@ -1296,8 +1329,9 @@ async def list_staging_assets(
                     LEFT JOIN staging.ghana_grid_assets ga ON cn.mrid = ga.mrid
                     {where_clause}
                     ORDER BY io.updated_at DESC
+                    LIMIT %s
                     """,
-                    params,
+                    [*params, limit],
                 )
                 rows = cur.fetchall()
         finally:
@@ -1335,7 +1369,7 @@ async def submit_field_node(payload: FieldNodePayload):
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
 
     if payload.enforce_hex_assignment and payload.operator_id and payload.h3_index:
-        conn_check = psycopg2.connect(SUPABASE_DB_URI)
+        conn_check = pooled_connect(SUPABASE_DB_URI)
         try:
             if not technician_hex_allowed(
                 conn_check,
@@ -1361,7 +1395,7 @@ async def submit_field_node(payload: FieldNodePayload):
             raise HTTPException(status_code=409, detail="Duplicate request in progress")
 
     proposed = payload.model_dump()
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         if payload.mrid and payload.offline_session_started_at:
             with conn.cursor() as cur:
@@ -1572,7 +1606,7 @@ async def get_field_snap_point(
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             return snap_placement_point(conn, longitude=lng, latitude=lat, snap_m=snap_m)
         finally:
@@ -1591,7 +1625,7 @@ async def get_field_nearby_check(
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             hits = nearby_assets(
                 conn, longitude=lng, latitude=lat, radius_m=radius_m, limit=limit
@@ -1611,7 +1645,7 @@ async def get_field_feeder_lookup(
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             feeders = distinct_feeders(conn, q=q, limit=limit)
         finally:
@@ -1629,7 +1663,7 @@ async def get_field_substation_lookup(
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             substations = distinct_substations(conn, q=q, limit=limit)
         finally:
@@ -1646,7 +1680,7 @@ async def list_staging_spans_endpoint(
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             spans = list_staging_spans(conn, submitted_by=submitted_by)
         finally:
@@ -1661,7 +1695,7 @@ async def post_field_span(payload: FieldSpanPayload):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             result = submit_field_span(
                 conn,
@@ -1724,7 +1758,7 @@ async def report_field_location(payload: FieldLocationPayload):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             result = upsert_technician_position(
                 conn,
@@ -1754,7 +1788,7 @@ async def get_field_technicians(
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             technicians = list_active_technicians(conn, stale_minutes=stale_minutes)
         finally:
@@ -1773,7 +1807,7 @@ async def get_technician_submissions(
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             submissions = list_technician_submissions(conn, technician_id, limit=limit)
         finally:
@@ -1789,7 +1823,7 @@ async def post_field_device_token(payload: DeviceTokenPayload):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             result = register_device_token(
                 conn,
@@ -1815,7 +1849,7 @@ async def get_field_notifications(
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             notifications = list_technician_notifications(
                 conn,
@@ -1835,7 +1869,7 @@ async def post_notification_delivered(notification_id: str):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             result = mark_notification_delivered(conn, notification_id)
             if not result:
@@ -1858,7 +1892,7 @@ async def post_notification_read(
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             result = mark_notification_read(conn, notification_id, technician_id)
             if not result:
@@ -1888,7 +1922,7 @@ async def get_map_nodes_near(
     if cached is not None:
         return cached
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             rows = await asyncio.to_thread(
                 lambda: fetch_nodes_near_location(
@@ -1968,7 +2002,7 @@ async def get_nodes_by_cells(
         if cached is not None:
             nodes = cached.get("nodes", [])
         else:
-            conn = psycopg2.connect(SUPABASE_DB_URI)
+            conn = pooled_connect(SUPABASE_DB_URI)
             try:
                 from h3_service import fetch_map_nodes_in_cells
 
@@ -2016,7 +2050,7 @@ async def get_h3_coverage(
     cache_key = h3_coverage_key(west, south, east, north, res, include_reference)
 
     def _fetch():
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             return fetch_coverage(
                 conn,
@@ -2040,7 +2074,7 @@ async def get_h3_assignments(
 ):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         items = await asyncio.to_thread(
             lambda: list_assignments(conn, assigned_to=assigned_to, status=status)
@@ -2112,7 +2146,7 @@ async def get_h3_assignments_geojson(
     cache_key = h3_assignments_geojson_key(assigned_to, status)
 
     def _fetch():
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             return assignments_geojson(
                 conn, assigned_to=assigned_to, statuses=statuses
@@ -2132,7 +2166,7 @@ async def post_h3_assignments_batch(payload: H3BatchAssignmentPayload):
     _require_h3()
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         items = await asyncio.to_thread(
             lambda: batch_upsert_assignments(
@@ -2157,7 +2191,7 @@ async def delete_h3_assignments(payload: H3DeleteAssignmentsPayload):
     """Unassign hex cells (remove territory rows)."""
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         deleted = await asyncio.to_thread(
             lambda: delete_assignments(conn, payload.h3_indexes)
@@ -2177,7 +2211,7 @@ async def post_h3_assignment(payload: H3AssignmentPayload):
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     if not h3x.is_valid_cell(payload.h3_index):
         raise HTTPException(status_code=400, detail="Invalid h3_index")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         result = await asyncio.to_thread(
             lambda: upsert_assignment(
@@ -2210,7 +2244,7 @@ async def get_node_connections(
     if cached is not None:
         return cached
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             result = await asyncio.to_thread(
                 lambda: fetch_node_connections(conn, mrid, limit=limit)
@@ -2233,7 +2267,7 @@ async def get_bulk_node_connections(payload: BulkNodeConnectionsPayload):
     if cached is not None:
         return cached
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             result = await asyncio.to_thread(
                 lambda: fetch_bulk_node_connections(
@@ -2263,32 +2297,19 @@ async def repair_topology(payload: TopologyRepairPayload, background_tasks: Back
                 detail=f"Repair already in progress for {payload.target_mrid}",
             )
         try:
-            conn = psycopg2.connect(SUPABASE_DB_URI)
+            conn = pooled_connect(SUPABASE_DB_URI)
             try:
                 with conn.cursor() as cur:
                     tier = _asset_tier(cur, payload.target_mrid)
                     if tier == "staging":
-                        if payload.dry_run:
-                            cur.execute(
-                                """
-                                SELECT jsonb_build_object(
-                                  'target_mrid', %s::text,
-                                  'tier', 'staging',
-                                  'dry_run', true,
-                                  'proposed', jsonb_build_array(
-                                    jsonb_build_object('action', 'staging_asset_verified')
-                                  ),
-                                  'applied', '[]'::jsonb,
-                                  'skipped', '[]'::jsonb
-                                )
-                                """,
-                                (payload.target_mrid,),
+                        cur.execute(
+                            """
+                            SELECT staging.repair_asset_topology_and_attributes(
+                              %s::uuid, %s, %s
                             )
-                        else:
-                            cur.execute(
-                                "SELECT repair_staging_asset_topology_and_attributes(%s::uuid, %s)",
-                                (payload.target_mrid, payload.radius_meters),
-                            )
+                            """,
+                            (payload.target_mrid, payload.radius_meters, payload.dry_run),
+                        )
                     elif tier == "master":
                         cur.execute(
                             """
@@ -2317,6 +2338,8 @@ async def repair_topology(payload: TopologyRepairPayload, background_tasks: Back
                             after_state={"result": result},
                         )
                     elif not payload.dry_run and tier == "staging":
+                        if applied:
+                            run_asset_checks(conn, payload.target_mrid, "staging")
                         log_lineage(
                             conn,
                             target_mrid=payload.target_mrid,
@@ -2431,7 +2454,7 @@ async def update_asset_validation(
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
 
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             with conn.cursor() as cur:
                 tier = _asset_tier(cur, mrid)
@@ -2439,6 +2462,25 @@ async def update_asset_validation(
                     raise HTTPException(status_code=404, detail=f"Asset {mrid} not found")
 
                 if tier == "staging" and payload.validation == "APPROVED":
+                    cur.execute(
+                        """
+                        SELECT validation::text
+                        FROM staging.identified_objects
+                        WHERE mrid = %s::uuid
+                        """,
+                        (mrid,),
+                    )
+                    staging_row = cur.fetchone()
+                    if not staging_row:
+                        raise HTTPException(status_code=404, detail=f"Asset {mrid} not found")
+                    if staging_row[0] != "STAGED":
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"Asset {mrid} must be released from Data Quality before "
+                                f"promotion (validation={staging_row[0]})"
+                            ),
+                        )
                     run_asset_checks(conn, mrid, "staging")
                     blocking = count_blocking_open(conn, mrid)
                     if blocking and not payload.override_data_quality:
@@ -2468,7 +2510,8 @@ async def update_asset_validation(
                     result = cur.fetchone()[0]
                     conn.commit()
                     invalidate_after_promote()
-                    reconcile_memgraph(graph_driver)
+                    # National reconcile is heavy — never block the approve response.
+                    background_tasks.add_task(reconcile_memgraph, graph_driver)
                     return {
                         "mrid": result["mrid"],
                         "validation": result["validation"],
@@ -2589,7 +2632,7 @@ async def update_asset(mrid: str, payload: AssetUpdatePayload):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             with conn.cursor() as cur:
                 tier = _asset_tier(cur, mrid)
@@ -2655,7 +2698,7 @@ async def update_asset_equipment(mrid: str, payload: EquipmentUpdatePayload):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             with conn.cursor() as cur:
                 tier = _asset_tier(cur, mrid)
@@ -2704,7 +2747,7 @@ async def sync_spot_bill(payload: SpotBillPayload, background_tasks: BackgroundT
         raise HTTPException(status_code=400, detail="current_reading_kwh must exceed previous_reading_kwh")
 
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2775,7 +2818,7 @@ async def create_inspection(payload: InspectionCreatePayload, background_tasks: 
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2811,7 +2854,7 @@ async def list_inspections(asset_mrid: str | None = Query(default=None)):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             with conn.cursor() as cur:
                 if asset_mrid:
@@ -2860,7 +2903,7 @@ async def validate_inspection(inspection_id: str, background_tasks: BackgroundTa
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2904,7 +2947,7 @@ async def list_master_assets_bbox(
     cache_key = assets_master_key(west, south, east, north, limit)
 
     def _fetch():
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2955,7 +2998,7 @@ async def api_map_places_index():
     cache_key = "map:places-index:v1"
 
     def _fetch():
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             return {"places": list_places_index(conn)}
         finally:
@@ -2984,7 +3027,7 @@ async def api_map_search(
             raise HTTPException(status_code=400, detail=f"Invalid kind: {', '.join(sorted(invalid))}")
         kinds = parsed or None
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             results = search_map(conn, query=q, limit=limit, kinds=kinds)
         finally:
@@ -3006,7 +3049,7 @@ async def get_asset_detail(mrid: str):
     if cached is not None:
         return cached
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             with conn.cursor() as cur:
                 tier = _asset_tier(cur, mrid)
@@ -3158,7 +3201,7 @@ async def get_lineage(
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             events = fetch_lineage(conn, asset_mrid, limit)
         finally:
@@ -3179,7 +3222,7 @@ async def search_lineage_endpoint(
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             events = search_lineage(
                 conn,
@@ -3202,7 +3245,7 @@ async def get_dq_rules():
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
 
     def _fetch():
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             return {"rules": dq_list_rules(conn)}
         finally:
@@ -3215,19 +3258,21 @@ async def get_dq_rules():
 
 
 @app.get("/api/v1/dq/summary")
-async def get_dq_summary():
+async def get_dq_summary(
+    tier: Literal["master", "staging", "all"] = Query(default="all"),
+):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
 
     def _fetch():
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
-            return dq_summary(conn)
+            return dq_summary(conn, tier=None if tier == "all" else tier)
         finally:
             conn.close()
 
     try:
-        return cached_json(dq_summary_key(), _fetch, OPS_CACHE_TTL_SEC)
+        return cached_json(dq_summary_key(tier), _fetch, OPS_CACHE_TTL_SEC)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -3238,24 +3283,99 @@ async def get_dq_exceptions(
     severity: str | None = Query(default=None),
     domain: str | None = Query(default=None),
     record_mrid: str | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=500),
+    queue: Literal["dq", "operations", "all"] = Query(default="dq"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    cache_key = dq_exceptions_key(status, severity, domain, record_mrid, limit)
+    cache_key = dq_exceptions_key(status, severity, domain, record_mrid, limit, queue, offset)
 
     def _fetch():
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
-            items = dq_list_exceptions(
+            status_val = None if status in (None, "ALL") else status
+            queue_val = None if queue == "all" else queue
+            total = count_exceptions(
                 conn,
-                status=None if status in (None, "ALL") else status,
+                status=status_val,
                 severity=severity,
                 domain=domain,
                 record_mrid=record_mrid,
-                limit=limit,
+                queue=queue_val,
             )
-            return {"exceptions": items, "count": len(items)}
+            items = dq_list_exceptions(
+                conn,
+                status=status_val,
+                severity=severity,
+                domain=domain,
+                record_mrid=record_mrid,
+                queue=queue_val,
+                limit=limit,
+                offset=offset,
+            )
+            return {
+                "exceptions": items,
+                "count": len(items),
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+            }
+        finally:
+            conn.close()
+
+    try:
+        return cached_json(cache_key, _fetch, OPS_CACHE_TTL_SEC)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/dq/queue")
+async def get_dq_queue(
+    validation: Literal["PENDING_FIELD", "IN_CONFLICT"] | None = Query(default=None),
+    exception_status: str | None = Query(default="ALL", alias="status"),
+    severity: str | None = Query(default=None),
+    domain: str | None = Query(default=None),
+    duplicates_only: bool = Query(default=False),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    """Staging captures in the DQ inbox (PENDING_FIELD / IN_CONFLICT), with nested exceptions."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    status_val = None if exception_status in (None, "ALL") else exception_status
+    cache_key = dq_queue_key(
+        validation, status_val, severity, domain, limit, offset, duplicates_only,
+    )
+
+    def _fetch():
+        conn = pooled_connect(SUPABASE_DB_URI)
+        try:
+            total = count_dq_queue(
+                conn,
+                validation=validation,
+                exception_status=status_val,
+                severity=severity,
+                domain=domain,
+                duplicates_only=duplicates_only,
+            )
+            items = list_dq_queue(
+                conn,
+                validation=validation,
+                exception_status=status_val,
+                severity=severity,
+                domain=domain,
+                duplicates_only=duplicates_only,
+                limit=limit,
+                offset=offset,
+            )
+            return {
+                "items": items,
+                "count": len(items),
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+            }
         finally:
             conn.close()
 
@@ -3271,7 +3391,7 @@ async def run_dq_checks(mrid: str = Query(...), tier: str = Query(default="stagi
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     if tier not in ("staging", "master"):
         raise HTTPException(status_code=400, detail="tier must be staging or master")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         result = run_asset_checks(conn, mrid, tier)
         conn.commit()
@@ -3291,14 +3411,12 @@ async def get_topology_dq_summary(
     east: float | None = Query(default=None),
     north: float | None = Query(default=None),
     mode: Literal["snapshot", "live"] = Query(default="snapshot"),
+    tier: Literal["master", "staging"] = Query(default="master"),
 ):
-    """Master topology DQ summary.
+    """Topology DQ summary for master or staging.
 
-    By default (``mode=snapshot``) this serves the most recent completed scan's
-    persisted summary — a single indexed row read — so the portal never pays for
-    the national orphan/dangling scan on load. ``mode=live`` forces a fresh
-    (expensive) recompute, used by the explicit "Refresh live" action and as a
-    fallback when no scan has run yet.
+    Master ``mode=snapshot`` serves the last batch scan (fast). Staging is always
+    computed live from field-capture tables.
     """
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
@@ -3309,29 +3427,33 @@ async def get_topology_dq_summary(
         clip = {"west": west, "south": south, "east": east, "north": north}
 
     def _live():
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
-            return topology_dq_summary(conn, clip=clip)
+            return topology_dq_summary(conn, clip=clip, tier=tier)
         finally:
             conn.close()
 
     def _snapshot_or_live():
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
+            if tier == "staging":
+                return latest_staging_topology_live(conn, clip=clip)
             snap = latest_topology_snapshot(conn)
             if snap is not None:
                 return snap
-            # No scan yet — compute once so the panel isn't empty.
-            return topology_dq_summary(conn, clip=clip)
+            return topology_dq_summary(conn, clip=clip, tier="master")
         finally:
             conn.close()
 
     try:
         if mode == "live":
             return await asyncio.to_thread(_live)
-        # Snapshot path is cheap and shared across stewards — cache briefly.
         return await asyncio.to_thread(
-            lambda: cached_json(topology_dq_summary_key(), _snapshot_or_live, OPS_CACHE_TTL_SEC)
+            lambda: cached_json(
+                topology_dq_summary_key(tier, mode),
+                _snapshot_or_live,
+                OPS_CACHE_TTL_SEC,
+            )
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -3344,7 +3466,7 @@ async def get_nav_badges():
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
 
     def _fetch():
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             return {"badges": collect_badge_counts(conn)}
         finally:
@@ -3363,7 +3485,7 @@ async def run_topology_dq_scan(payload: TopologyDqScanPayload, background_tasks:
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     clip = payload.clip.model_dump() if payload.clip else None
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         run_id = create_topology_batch_run(
             conn,
@@ -3380,7 +3502,7 @@ async def run_topology_dq_scan(payload: TopologyDqScanPayload, background_tasks:
     def _execute() -> None:
         if not SUPABASE_DB_URI:
             return
-        bg = psycopg2.connect(SUPABASE_DB_URI)
+        bg = pooled_connect(SUPABASE_DB_URI)
         try:
             execute_topology_batch_scan(
                 bg,
@@ -3392,7 +3514,8 @@ async def run_topology_dq_scan(payload: TopologyDqScanPayload, background_tasks:
             invalidate_ops_cache()
             invalidate_topology_cache()
         except Exception:
-            bg.rollback()
+            # Scan already marked the run failed and committed; log for ops.
+            logging.getLogger(__name__).exception("Topology DQ scan %s failed", run_id)
         finally:
             bg.close()
 
@@ -3404,9 +3527,41 @@ async def run_topology_dq_scan(payload: TopologyDqScanPayload, background_tasks:
 async def list_topology_dq_runs(limit: int = Query(default=20, ge=1, le=100)):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         return {"runs": topology_dq_list_runs(conn, limit=limit)}
+    finally:
+        conn.close()
+
+
+class DqReleasePayload(BaseModel):
+    operator_id: str | None = None
+    run_checks: bool = True
+
+
+@app.post("/api/v1/dq/assets/{mrid}/release-to-operations")
+async def post_release_staging_to_operations(mrid: str, payload: DqReleasePayload | None = None):
+    """Release a DQ-cleared staging asset to the Operations inbox (validation → STAGED)."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    body = payload or DqReleasePayload()
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        result = release_staging_to_operations(
+            conn,
+            mrid,
+            operator=body.operator_id,
+            run_checks=body.run_checks,
+        )
+        conn.commit()
+        invalidate_after_staging_write()
+        return result
+    except ValueError as exc:
+        conn.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         conn.close()
 
@@ -3415,7 +3570,7 @@ async def list_topology_dq_runs(limit: int = Query(default=20, ge=1, le=100)):
 async def patch_dq_exception(exception_id: str, payload: DqResolvePayload):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         result = dq_resolve_exception(
             conn,
@@ -3455,7 +3610,7 @@ async def post_validation_run(
     )
 
     if async_run:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             run_id = repository.create_validation_run(
                 conn,
@@ -3487,7 +3642,7 @@ async def post_validation_run(
         asyncio.create_task(_background())
         return {"run_id": run_id, "status": "running", "async": True}
 
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         if req.mode == RunMode.AGENT:
             result = await asyncio.to_thread(run_agent_validation_cycle, conn, req)
@@ -3508,7 +3663,7 @@ async def post_validation_run(
 async def get_validation_run_progress(run_id: str):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         progress = repository.get_run_progress(conn, run_id)
         if not progress:
@@ -3544,7 +3699,7 @@ async def get_agents_status():
 async def get_validation_runs(limit: int = Query(default=20, ge=1, le=100)):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         return {"runs": repository.list_validation_runs(conn, limit=limit)}
     finally:
@@ -3555,7 +3710,7 @@ async def get_validation_runs(limit: int = Query(default=20, ge=1, le=100)):
 async def get_validation_run(run_id: str):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         run = repository.get_validation_run(conn, run_id)
         if not run:
@@ -3569,7 +3724,7 @@ async def get_validation_run(run_id: str):
 async def get_kpis_latest():
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         snap = repository.latest_kpi_snapshot(conn)
         if snap:
@@ -3584,7 +3739,7 @@ async def get_kpis_latest():
 async def get_kpis_for_run(run_id: str):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -3623,7 +3778,7 @@ async def portal_ai_chat(payload: PortalAiChatPayload):
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     from agents.llm.chat import run_steward_chat
 
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         result = await asyncio.to_thread(
             run_steward_chat,
@@ -3688,7 +3843,14 @@ async def portal_ai_transcribe(audio: UploadFile = File(...)):
             data,
             content_type=audio.content_type,
         )
-        return {"text": text}
+        from agents.voice_normalize import normalize_transcript
+
+        normalized, meta = normalize_transcript(text)
+        return {
+            "text": normalized,
+            "raw": meta.get("raw"),
+            "fixes": meta.get("fixes") or [],
+        }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -3703,7 +3865,7 @@ async def portal_voice_turn(payload: PortalVoiceTurnPayload):
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     from agents.voice import run_voice_turn
 
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         result = await asyncio.to_thread(
             run_voice_turn,
@@ -3747,7 +3909,7 @@ async def get_staging_summary():
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     from agents import staging_review
 
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         return staging_review.staging_summary(conn)
     finally:
@@ -3764,7 +3926,7 @@ async def get_staging_territory_counts(
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     from agents import staging_review
 
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         return {
             "group_by": group_by,
@@ -3782,7 +3944,7 @@ async def get_staging_review(mrid: str):
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     from agents import staging_review
 
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         return staging_review.review_staging_asset(conn, mrid)
     except ValueError as exc:
@@ -3800,7 +3962,7 @@ async def get_spatial_territory(
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     from agents import spatial
 
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         return spatial.resolve_territory(conn, district=district, region=region)
     except ValueError as exc:
@@ -3818,7 +3980,7 @@ async def get_spatial_territory_geojson(
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     from agents import spatial
 
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         return spatial.territory_geojson(conn, district=district, region=region)
     except ValueError as exc:
@@ -3845,7 +4007,7 @@ async def get_spatial_inventory(
     bbox = None
     if None not in (west, south, east, north):
         bbox = {"west": west, "south": south, "east": east, "north": north}
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         return spatial.asset_inventory_counts(
             conn,
@@ -3865,7 +4027,7 @@ async def get_spatial_inventory(
 async def get_pending_approvals(limit: int = Query(default=50, ge=1, le=200)):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         return {"approvals": approval_agent.list_pending(conn, limit=limit)}
     finally:
@@ -3876,7 +4038,7 @@ async def get_pending_approvals(limit: int = Query(default=50, ge=1, le=200)):
 async def post_approval_approve(approval_id: str, payload: ApprovalDecisionPayload):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         result = approval_agent.approve(
             conn,
@@ -3901,7 +4063,7 @@ async def post_approval_approve(approval_id: str, payload: ApprovalDecisionPaylo
 async def post_approval_reject(approval_id: str, payload: ApprovalDecisionPayload):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         result = approval_agent.reject(
             conn,
@@ -3924,7 +4086,7 @@ async def post_approval_reject(approval_id: str, payload: ApprovalDecisionPayloa
 async def post_cleanup_generate(exception_id: str, operator_id: str | None = Query(default=None)):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         result = proposal_agent.generate_topology_proposal(
             conn, exception_id, operator_id=operator_id, proposed_by="CleanupAgent"
@@ -3948,7 +4110,7 @@ async def post_proposal_generate(
 ):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         result = proposal_agent.generate_topology_proposal(
             conn, exception_id, operator_id=operator_id, proposed_by=proposed_by
@@ -3968,7 +4130,7 @@ async def post_proposal_generate(
 async def get_proposals_approved(limit: int = Query(default=50, ge=1, le=200)):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         return {"proposals": repository.list_approved_proposals(conn, limit=limit)}
     finally:
@@ -3979,7 +4141,7 @@ async def get_proposals_approved(limit: int = Query(default=50, ge=1, le=200)):
 async def get_proposal(proposal_id: str):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         proposal = repository.get_topology_proposal(conn, proposal_id)
         if not proposal:
@@ -3993,7 +4155,7 @@ async def get_proposal(proposal_id: str):
 async def post_proposal_publish(proposal_id: str, payload: CleanupExecutePayload):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         result = proposal_agent.publish_proposal_to_master(
             conn, proposal_id, operator_id=payload.operator_id
@@ -4015,7 +4177,7 @@ async def post_proposal_publish(proposal_id: str, payload: CleanupExecutePayload
 async def post_cleanup_execute(cleanup_id: str, payload: CleanupExecutePayload):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         result = cleanup_agent.execute_cleanup(
             conn,
@@ -4040,7 +4202,7 @@ async def post_cleanup_execute(cleanup_id: str, payload: CleanupExecutePayload):
 async def get_cleanup(cleanup_id: str):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         action = repository.get_cleanup_action(conn, cleanup_id)
         if not action:
@@ -4054,7 +4216,7 @@ async def get_cleanup(cleanup_id: str):
 async def get_exceptions_by_queue(queue_name: str, limit: int = Query(default=100, ge=1, le=500)):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -4096,7 +4258,7 @@ async def get_exceptions_by_queue(queue_name: str, limit: int = Query(default=10
 def _run_export_job(job_id: str, operator_id: str | None = None) -> None:
     if not SUPABASE_DB_URI:
         return
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         meta = get_export_job(conn, job_id)
         fmt = (meta or {}).get("format", "cim-json")
@@ -4142,7 +4304,7 @@ async def preview_cim_export(
     cache_key = cim_preview_key(limit, west, south, east, north)
 
     def _fetch():
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             return build_cim_payload(conn, clip=clip, limit=limit)
         finally:
@@ -4156,7 +4318,7 @@ async def start_cim_export(payload: CimExportPayload, background_tasks: Backgrou
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     clip = payload.clip.model_dump() if payload.clip else None
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         validate_export_scope(conn, clip)
         job = create_export_job(
@@ -4196,7 +4358,7 @@ async def preview_dxf_export(
         if west >= east or south >= north:
             raise HTTPException(status_code=400, detail="Invalid bbox")
         clip = {"west": west, "south": south, "east": east, "north": north}
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         _, meta = build_dxf_payload(
             conn,
@@ -4215,7 +4377,7 @@ async def start_dxf_export(payload: DxfExportPayload, background_tasks: Backgrou
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     clip = payload.clip.model_dump() if payload.clip else None
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         validate_export_scope(conn, clip)
         job = create_dxf_export_job(
@@ -4245,7 +4407,7 @@ def _start_gis_export(fmt: str, payload: GisExportPayload, background_tasks: Bac
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     clip = payload.clip.model_dump() if payload.clip else None
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         if fmt not in ("mdms-csv",):
             validate_export_scope(conn, clip)
@@ -4309,7 +4471,7 @@ async def list_exports(limit: int = Query(default=50, ge=1, le=200)):
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
 
     def _fetch():
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             return {"jobs": list_export_jobs(conn, limit=limit)}
         finally:
@@ -4322,7 +4484,7 @@ async def list_exports(limit: int = Query(default=50, ge=1, le=200)):
 async def get_export(job_id: str):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         job = get_export_job(conn, job_id)
     finally:
@@ -4336,7 +4498,7 @@ async def get_export(job_id: str):
 async def download_export(job_id: str):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         job = get_export_job(conn, job_id)
         if not job:
@@ -4358,7 +4520,7 @@ async def download_export(job_id: str):
 def _run_boundary_import_job(job_id: str) -> None:
     if not SUPABASE_DB_URI:
         return
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         process_boundary_import_job(conn, job_id)
         invalidate_ops_cache()
@@ -4375,7 +4537,7 @@ def _run_boundary_import_job(job_id: str) -> None:
 async def api_list_reference_layers():
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         try:
             with conn.cursor() as cur:
@@ -4396,7 +4558,7 @@ async def api_reference_map_config():
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     martin_url = os.getenv("MARTIN_URL", "http://127.0.0.1:3001")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         try:
             refresh_all_render_policies(conn)
@@ -4420,7 +4582,7 @@ async def api_reference_layer_geojson(
 ):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         return reference_layer_geojson(
             conn,
@@ -4441,7 +4603,7 @@ async def api_reference_layer_geojson(
 async def api_list_imports(limit: int = Query(default=50, ge=1, le=200)):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         jobs = list_import_jobs(conn, limit=limit)
     finally:
@@ -4453,7 +4615,7 @@ async def api_list_imports(limit: int = Query(default=50, ge=1, le=200)):
 async def api_get_import(job_id: str):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         job = get_import_job(conn, job_id)
     finally:
@@ -4478,7 +4640,7 @@ async def api_import_boundaries(
     if not body:
         raise HTTPException(status_code=422, detail="Empty upload")
 
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         job = create_boundary_import_job(
             conn,
@@ -4527,7 +4689,7 @@ async def api_import_boundaries_bundled(
     if path is None:
         raise HTTPException(status_code=400, detail=f"File not found: {payload.file_path}")
 
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         job = create_boundary_import_job(
             conn,
@@ -4615,7 +4777,7 @@ async def api_import_reference(
 ):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         job = create_reference_import_from_inspect(
             conn,
@@ -4663,7 +4825,7 @@ async def migrate_dxf(payload: DxfMigrationPayload):
     features = parse_dxf(text)
     if not features:
         raise HTTPException(status_code=422, detail="No POINT or LINE primitives found in DXF")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         result = run_migration(
             conn,
@@ -4699,7 +4861,7 @@ async def migrate_geopackage(payload: GpkgMigrationPayload):
         raise HTTPException(status_code=400, detail=f"Cannot read GeoPackage: {exc}") from exc
     if not features:
         raise HTTPException(status_code=422, detail="No features found in GeoPackage")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         result = run_migration(
             conn,
@@ -4726,7 +4888,7 @@ async def migrate_geopackage(payload: GpkgMigrationPayload):
 async def list_migration_runs_endpoint(limit: int = Query(default=50, ge=1, le=200)):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         return {"runs": list_migration_runs(conn, limit=limit)}
     finally:
@@ -4737,7 +4899,7 @@ async def list_migration_runs_endpoint(limit: int = Query(default=50, ge=1, le=2
 async def list_migration_failed_endpoint(run_id: str, limit: int = Query(default=200, ge=1, le=1000)):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = psycopg2.connect(SUPABASE_DB_URI)
+    conn = pooled_connect(SUPABASE_DB_URI)
     try:
         return {"failed": list_migration_failed(conn, run_id, limit=limit)}
     finally:
@@ -4750,7 +4912,7 @@ async def get_conflicts(limit: int = Query(default=100, ge=1, le=500)):
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
 
     def _fetch():
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             return {"conflicts": list_open_conflicts(conn, limit)}
         finally:
@@ -4767,7 +4929,7 @@ async def resolve_conflict_endpoint(conflict_id: str, payload: ConflictResolvePa
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             result = resolve_conflict(conn, conflict_id, payload.resolution)
             conn.commit()
@@ -4823,7 +4985,7 @@ async def api_sap_status():
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             return sap_integration_status(conn)
         finally:
@@ -4837,7 +4999,7 @@ async def api_sap_sync_customers():
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             result = sync_customers_from_sap(conn)
         finally:
@@ -4854,7 +5016,7 @@ async def get_dlq(status: str | None = Query(default="OPEN")):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             items = list_dlq(conn, status=status)
         finally:
@@ -4869,7 +5031,7 @@ async def patch_dlq_endpoint(dlq_id: str, payload: DlqPatchPayload):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             result = patch_dlq(conn, dlq_id, payload.status, payload.payload)
             if payload.status in ("RESOLVED", "DISCARDED"):
@@ -4895,7 +5057,7 @@ async def retry_dlq(dlq_id: str):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        conn = psycopg2.connect(SUPABASE_DB_URI)
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
             item = mark_retrying(conn, dlq_id)
             if item["source"] == "KAFKA" and TIMESCALE_URI:
@@ -5123,7 +5285,7 @@ class RegulatoryGeneratePayload(BaseModel):
 def _ops_conn():
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    return psycopg2.connect(SUPABASE_DB_URI)
+    return pooled_connect(SUPABASE_DB_URI)
 
 
 @app.get("/api/v1/cases")
@@ -5505,9 +5667,31 @@ async def api_list_regulatory_reports():
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.on_event("startup")
+def warm_voice_pipeline() -> None:
+    """Preload Whisper + boundary vocabulary off the request path."""
+
+    def _warm() -> None:
+        try:
+            from agents import voice_stt
+
+            voice_stt.warm_model()
+            if SUPABASE_DB_URI:
+                conn = pooled_connect(SUPABASE_DB_URI)
+                try:
+                    voice_stt.warm_boundary_prompt(conn)
+                finally:
+                    conn.close()
+        except Exception:
+            logging.getLogger(__name__).warning("voice warmup failed", exc_info=True)
+
+    threading.Thread(target=_warm, name="voice-warmup", daemon=True).start()
+
+
 @app.on_event("shutdown")
 def shutdown():
     graph_driver.close()
+    close_all_pools()
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
 
 import '../models/asset_node.dart';
+import '../models/sync_queue_item.dart';
 
 /// Local offline queue and map node cache.
 class OfflineDb {
@@ -15,7 +16,7 @@ class OfflineDb {
     final dbPath = await getDatabasesPath();
     _db = await openDatabase(
       join(dbPath, 'giop_field.db'),
-      version: 10,
+      version: 12,
         onCreate: (db, version) async {
         await _createV1Tables(db);
         await _createCacheTable(db);
@@ -23,7 +24,11 @@ class OfflineDb {
         await _createV5Tables(db);
         await _createV6Tables(db);
         await _createV9Columns(db);
+        await _createV10Columns(db);
         await _createV10Tables(db);
+        await _createV11Columns(db);
+        await _createV12Columns(db);
+        await _createV12Tables(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -52,6 +57,14 @@ class OfflineDb {
         }
         if (oldVersion < 10) {
           await _createV10Columns(db);
+          await _createV10Tables(db);
+        }
+        if (oldVersion < 11) {
+          await _createV11Columns(db);
+        }
+        if (oldVersion < 12) {
+          await _createV12Columns(db);
+          await _createV12Tables(db);
         }
       },
     );
@@ -225,6 +238,49 @@ class OfflineDb {
     }
   }
 
+  static Future<void> _createV12Columns(Database db) async {
+    for (final sql in [
+      "ALTER TABLE field_captured_assets ADD COLUMN operating_utility TEXT NOT NULL DEFAULT 'ECG_SOUTHERN'",
+      'ALTER TABLE field_captured_assets ADD COLUMN substation_name TEXT',
+      'ALTER TABLE field_captured_assets ADD COLUMN boundary_feeder_id TEXT',
+      'ALTER TABLE field_captured_assets ADD COLUMN h3_index TEXT',
+      'ALTER TABLE field_captured_assets ADD COLUMN enforce_hex_assignment INTEGER NOT NULL DEFAULT 0',
+    ]) {
+      try {
+        await db.execute(sql);
+      } catch (_) {}
+    }
+  }
+
+  static Future<void> _createV12Tables(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS local_meter_readings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        meter_mrid TEXT NOT NULL,
+        active_energy_kwh REAL NOT NULL,
+        serial_number TEXT,
+        photo_path TEXT,
+        is_dirty INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_meter_readings_dirty ON local_meter_readings (is_dirty)',
+    );
+  }
+
+  static Future<void> _createV11Columns(Database db) async {
+    for (final sql in [
+      'ALTER TABLE local_work_orders ADD COLUMN latitude REAL',
+      'ALTER TABLE local_work_orders ADD COLUMN longitude REAL',
+      "ALTER TABLE local_work_orders ADD COLUMN feeder_mrid TEXT",
+    ]) {
+      try {
+        await db.execute(sql);
+      } catch (_) {}
+    }
+  }
+
   static Future<void> _createV10Tables(Database db) async {
     await db.execute('''
       CREATE TABLE IF NOT EXISTS field_spans (
@@ -261,6 +317,11 @@ class OfflineDb {
     String assetKind = 'pole_lv',
     String? workOrderId,
     String? photoPath,
+    String operatingUtility = 'ECG_SOUTHERN',
+    String? substationName,
+    String? boundaryFeederId,
+    String? h3Index,
+    bool enforceHexAssignment = false,
   }) async {
     final db = await instance();
     final sessionAt = DateTime.now().toUtc().toIso8601String();
@@ -272,10 +333,53 @@ class OfflineDb {
       'asset_kind': assetKind,
       'work_order_id': workOrderId,
       'photo_path': photoPath,
+      'operating_utility': operatingUtility,
+      'substation_name': substationName,
+      'boundary_feeder_id': boundaryFeederId,
+      'h3_index': h3Index,
+      'enforce_hex_assignment': enforceHexAssignment ? 1 : 0,
       'is_dirty': 1,
       'offline_session_started_at': sessionAt,
       'sync_status': 'PENDING',
     });
+  }
+
+  static Future<Map<String, dynamic>?> getPendingCapture(int id) async {
+    final db = await instance();
+    final rows = await db.query(
+      'field_captured_assets',
+      where: 'id = ? AND is_dirty = ?',
+      whereArgs: [id, 1],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first;
+  }
+
+  /// Resolve a map marker mrid (`local:12`) to a pending capture row.
+  static Future<Map<String, dynamic>?> getPendingCaptureByMrid(String mrid) async {
+    final parsed = _parseLocalQueueId(mrid);
+    if (parsed != null) {
+      return getPendingCapture(parsed);
+    }
+    final db = await instance();
+    final rows = await db.query(
+      'field_captured_assets',
+      where: '(mrid = ? OR mrid IS NULL) AND is_dirty = ?',
+      whereArgs: [mrid, 1],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first;
+  }
+
+  static int? _parseLocalQueueId(String mrid) {
+    for (final prefix in ['local:', 'local-']) {
+      if (mrid.startsWith(prefix)) {
+        return int.tryParse(mrid.substring(prefix.length));
+      }
+    }
+    return null;
   }
 
   static Future<int> queueFieldSpan({
@@ -438,9 +542,9 @@ class OfflineDb {
           await db.rawQuery('SELECT COUNT(*) FROM offline_tiles_cache'),
         ) ??
         0;
-    if (count > 120) {
+    if (count > 500) {
       await db.rawDelete(
-        'DELETE FROM offline_tiles_cache WHERE id IN (SELECT id FROM offline_tiles_cache ORDER BY fetched_at ASC LIMIT 20)',
+        'DELETE FROM offline_tiles_cache WHERE id IN (SELECT id FROM offline_tiles_cache ORDER BY fetched_at ASC LIMIT 50)',
       );
     }
   }
@@ -577,6 +681,9 @@ class OfflineDb {
           'assigned_user': wo['assigned_user'],
           'summary': wo['summary'] ?? '',
           'notes': wo['notes'],
+          'latitude': wo['latitude'],
+          'longitude': wo['longitude'],
+          'feeder_mrid': wo['feeder_mrid'],
           'is_dirty': 0,
           'sync_status': 'SYNCED',
         },
@@ -589,6 +696,95 @@ class OfflineDb {
   static Future<List<Map<String, dynamic>>> listWorkOrders() async {
     final db = await instance();
     return db.query('local_work_orders', orderBy: 'fetched_at DESC');
+  }
+
+  static Future<List<AssetNode>> searchCachedNodes(String query) async {
+    if (query.length < 2) return const [];
+    final db = await instance();
+    final like = '%$query%';
+    final rows = await db.query(
+      'cached_map_nodes',
+      where: 'name LIKE ? OR mrid LIKE ?',
+      whereArgs: [like, like],
+      orderBy: 'name ASC',
+      limit: 40,
+    );
+    return rows.map(AssetNode.fromCacheRow).toList();
+  }
+
+  static Future<List<SyncQueueItem>> listSyncQueueItems() async {
+    final db = await instance();
+    final items = <SyncQueueItem>[];
+
+    final captures = await db.query(
+      'field_captured_assets',
+      where: "is_dirty = 1 OR sync_status = 'CONFLICTED'",
+      orderBy: 'captured_at DESC',
+    );
+    for (final row in captures) {
+      items.add(
+        SyncQueueItem(
+          kind: 'capture',
+          title: row['name'] as String? ?? 'Capture',
+          status: row['sync_status'] as String? ?? 'PENDING',
+          detail: row['mrid'] as String?,
+          createdAt: row['captured_at'] as String?,
+        ),
+      );
+    }
+
+    final spans = await pendingSpans();
+    for (final row in spans) {
+      items.add(
+        SyncQueueItem(
+          kind: 'span',
+          title: row['name'] as String? ?? 'Span',
+          status: 'PENDING',
+          detail: '${row['source_node_id']} → ${row['target_node_id']}',
+          createdAt: row['created_at'] as String?,
+        ),
+      );
+    }
+
+    final bills = await pendingSpotBills();
+    for (final row in bills) {
+      items.add(
+        SyncQueueItem(
+          kind: 'spot_bill',
+          title: row['account_mrid'] as String? ?? 'Spot bill',
+          status: 'PENDING',
+          createdAt: row['created_at'] as String?,
+        ),
+      );
+    }
+
+    final meters = await pendingMeterReadings();
+    for (final row in meters) {
+      items.add(
+        SyncQueueItem(
+          kind: 'meter',
+          title: row['meter_mrid'] as String? ?? 'Meter reading',
+          status: 'PENDING',
+          detail: row['serial_number'] as String?,
+          createdAt: row['created_at'] as String?,
+        ),
+      );
+    }
+
+    final woUpdates = await pendingWorkOrderStatusUpdates();
+    for (final row in woUpdates) {
+      items.add(
+        SyncQueueItem(
+          kind: 'work_order',
+          title: row['work_order_id'] as String? ?? 'Work order',
+          status: 'QUEUED',
+          detail: row['new_status'] as String?,
+          createdAt: row['created_at'] as String?,
+        ),
+      );
+    }
+
+    return items;
   }
 
   static Future<void> updateLocalWorkOrderStatus(String id, String status) async {
@@ -623,6 +819,42 @@ class OfflineDb {
       where: 'is_dirty = ?',
       whereArgs: [1],
       orderBy: 'id ASC',
+    );
+  }
+
+  static Future<int> queueMeterReading({
+    required String meterMrid,
+    required double activeEnergyKwh,
+    String? serialNumber,
+    String? photoPath,
+  }) async {
+    final db = await instance();
+    return db.insert('local_meter_readings', {
+      'meter_mrid': meterMrid,
+      'active_energy_kwh': activeEnergyKwh,
+      'serial_number': serialNumber,
+      'photo_path': photoPath,
+      'is_dirty': 1,
+    });
+  }
+
+  static Future<List<Map<String, dynamic>>> pendingMeterReadings() async {
+    final db = await instance();
+    return db.query(
+      'local_meter_readings',
+      where: 'is_dirty = ?',
+      whereArgs: [1],
+      orderBy: 'id ASC',
+    );
+  }
+
+  static Future<void> markMeterReadingSynced(int id) async {
+    final db = await instance();
+    await db.update(
+      'local_meter_readings',
+      {'is_dirty': 0},
+      where: 'id = ?',
+      whereArgs: [id],
     );
   }
 

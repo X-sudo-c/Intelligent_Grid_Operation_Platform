@@ -54,14 +54,14 @@ export function GiopOutagesTab({ isLightMode }: GiopOutagesTabProps) {
     }
   };
 
-  const card = isLightMode ? 'border-slate-200 bg-white' : 'border-slate-700 bg-slate-900/40';
+  const card = isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/70 bg-premium-card';
   const btnSecondary = `text-xs px-2 py-1 rounded text-white disabled:opacity-50 ${
     isLightMode ? 'bg-slate-600 hover:bg-slate-500' : 'bg-slate-700 hover:bg-slate-600'
   }`;
 
   return (
     <div className="h-full overflow-auto p-6">
-      <h3 className={`text-sm font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>
+      <h3 className={`text-sm font-semibold mb-4 ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>
         Outage Visibility
       </h3>
       <div className={`rounded-lg border p-4 mb-6 ${card}`}>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   approveCleanupRequest,
   generateCleanupPlan,
@@ -6,11 +6,12 @@ import {
   getDqSummary,
   getLatestKpis,
   getTopologyDqSummary,
-  listDqExceptions,
+  listDqQueue,
   listPendingApprovals,
   listApprovedProposals,
   publishTopologyProposal,
   rejectCleanupRequest,
+  releaseDqAssetToOperations,
   resolveDqException,
   runDqChecks,
   runTopologyDqScan,
@@ -21,12 +22,18 @@ import {
   type GiopApprovalRequest,
   type GiopTopologyProposal,
   type GiopDqException,
+  type GiopDqQueueItem,
   type GiopDqSummary,
   type GiopKpiSnapshot,
   type GiopTopologyDqSummary,
 } from '../api/giop-api';
 import { useGiopMapOverlay } from '../context/GiopMapOverlayContext';
-import { dqExceptionMapMrid } from '../lib/giopDqMapFocus';
+import {
+  formatDqCoordinates,
+  partitionDqQueueItems,
+  queueItemDuplicateDetected,
+  type DqQueueLocationCluster,
+} from '../lib/giopDqLocationClusters';
 import { clearSwCache, readSwCache, writeSwCache } from '../lib/giopSwCache';
 import { ValidationRunModal } from './ValidationRunModal';
 import { ValidationRunProgressContent } from './ValidationRunProgressContent';
@@ -35,9 +42,32 @@ import {
   useValidationRunProgress,
 } from '../hooks/useValidationRunProgress';
 import { isValidationTerminal } from './validationRunShared';
+import {
+  DqTierMetricsPanel,
+  type DqDataTier,
+} from './DqTierMetricsPanel';
+import { DqExceptionIssueRow } from './DqExceptionIssueRow';
+import { DqQueueRecordSummary } from './DqQueueRecordSummary';
+import { DqQueueToolbar } from './DqQueueToolbar';
+import { DqDuplicateDiffStrip } from './DqDuplicateDiffStrip';
+import { DqDuplicateTimeline } from './DqDuplicateTimeline';
+import { DqDuplicatePhotoCompare } from './DqDuplicatePhotoCompare';
+import {
+  buildDuplicateClusterOverlay,
+  buildSingletonNearDuplicateOverlay,
+  clusterDuplicateMode,
+  duplicateFlyCoordinatesForCluster,
+  duplicateFlyCoordinatesForMrid,
+} from '../lib/giopDuplicateFan';
+import {
+  buildDuplicateDiffFields,
+  buildDuplicateTimeline,
+  collectDuplicatePhotos,
+} from '../lib/giopDqDuplicateDiff';
+import { DUPLICATE_CLUSTER_ZOOM } from '../lib/giopMapLayers';
 
-function topoSummaryCacheKey(mode: 'snapshot' | 'live'): string {
-  return `dq-topology-summary:${mode}`;
+function topoSummaryCacheKey(tier: DqDataTier, mode: 'snapshot' | 'live'): string {
+  return `dq-topology-summary:${tier}:${mode}`;
 }
 
 /** Guard against stale/corrupt session cache or API shape drift (e.g. export_gate vs export_blocked). */
@@ -69,9 +99,9 @@ function normalizeTopoSummary(raw: unknown): GiopTopologyDqSummary | null {
   };
 }
 
-function readTopoSummaryCache(): GiopTopologyDqSummary | null {
-  const cached = normalizeTopoSummary(readSwCache(topoSummaryCacheKey('snapshot')));
-  if (!cached) clearSwCache(topoSummaryCacheKey('snapshot'));
+function readTopoSummaryCache(tier: DqDataTier = 'master'): GiopTopologyDqSummary | null {
+  const cached = normalizeTopoSummary(readSwCache(topoSummaryCacheKey(tier, 'snapshot')));
+  if (!cached) clearSwCache(topoSummaryCacheKey(tier, 'snapshot'));
   return cached;
 }
 
@@ -79,49 +109,63 @@ interface GiopDataQualityTabProps {
   isLightMode: boolean;
 }
 
-const SEVERITY_ORDER = ['critical', 'major', 'minor', 'warning'];
-
-function formatAgo(iso?: string | null): string {
-  if (!iso) return 'never scanned';
-  const ts = new Date(iso).getTime();
-  if (Number.isNaN(ts)) return 'unknown';
-  const secs = Math.max(0, Math.round((Date.now() - ts) / 1000));
-  if (secs < 60) return 'just now';
-  const mins = Math.round(secs / 60);
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.round(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  return `${Math.round(hrs / 24)}d ago`;
-}
-
-function severityBadge(severity: string): string {
+function severityBadge(severity: string, isLightMode: boolean): string {
+  if (isLightMode) {
+    switch (severity) {
+      case 'critical':
+        return 'bg-red-100 text-red-800';
+      case 'major':
+        return 'bg-amber-100 text-amber-900';
+      case 'minor':
+        return 'bg-blue-100 text-blue-900';
+      default:
+        return 'bg-slate-100 text-slate-700';
+    }
+  }
   switch (severity) {
     case 'critical':
-      return 'bg-red-900 text-red-200';
+      return 'bg-premium-danger-bg text-premium-danger-fg border border-premium-danger-border/40';
     case 'major':
-      return 'bg-amber-900 text-amber-200';
+      return 'bg-premium-warn-bg text-premium-warn-fg border border-premium-warn-border/40';
     case 'minor':
-      return 'bg-blue-900 text-blue-200';
+      return 'bg-premium-accent-subtle text-premium-accent border border-premium-accent/25';
     default:
-      return 'bg-slate-700 text-slate-200';
+      return 'bg-premium-hover text-premium-muted border border-premium-border/40';
   }
 }
 
 export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
-  const { focusOnMap, sideMap } = useGiopMapOverlay();
+  const {
+    focusOnMap,
+    sideMap,
+    bumpSidePanelFly,
+    setDuplicateClusterOverlay,
+    clearDuplicateClusterOverlay,
+  } = useGiopMapOverlay();
   const [mapBusyId, setMapBusyId] = useState<string | null>(null);
-  const [exceptions, setExceptions] = useState<GiopDqException[]>([]);
-  const [summary, setSummary] = useState<GiopDqSummary | null>(null);
-  const [topoSummary, setTopoSummary] = useState<GiopTopologyDqSummary | null>(readTopoSummaryCache);
-  const [topoLoading, setTopoLoading] = useState(() => readTopoSummaryCache() === null);
-  const [topoRevalidating, setTopoRevalidating] = useState(false);
+  const [queueItems, setQueueItems] = useState<GiopDqQueueItem[]>([]);
+  const [dqTier, setDqTier] = useState<DqDataTier>('master');
+  const [summaryByTier, setSummaryByTier] = useState<Partial<Record<DqDataTier, GiopDqSummary>>>({});
+  const [topoByTier, setTopoByTier] = useState<Partial<Record<DqDataTier, GiopTopologyDqSummary>>>(() => {
+    const master = readTopoSummaryCache('master');
+    return master ? { master } : {};
+  });
+  const [topoLoadingTier, setTopoLoadingTier] = useState<DqDataTier | null>(() =>
+    readTopoSummaryCache('master') ? null : 'master',
+  );
+  const [topoRevalidatingTier, setTopoRevalidatingTier] = useState<DqDataTier | null>(null);
   const [topoLiveBusy, setTopoLiveBusy] = useState(false);
-  const [statusFilter, setStatusFilter] = useState('OPEN');
+  const [statusFilter, setStatusFilter] = useState('ALL');
+  const [duplicatesOnly, setDuplicatesOnly] = useState(false);
   const [severityFilter, setSeverityFilter] = useState('');
   const [domainFilter, setDomainFilter] = useState('');
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(50);
+  const [totalQueueItems, setTotalQueueItems] = useState(0);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState('');
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [releaseBusyMrid, setReleaseBusyMrid] = useState<string | null>(null);
   const [scanBusy, setScanBusy] = useState(false);
   const [validationBusy, setValidationBusy] = useState(false);
   const [validationModalOpen, setValidationModalOpen] = useState(false);
@@ -135,80 +179,143 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
   const [approvals, setApprovals] = useState<GiopApprovalRequest[]>([]);
   const [approvedProposals, setApprovedProposals] = useState<GiopTopologyProposal[]>([]);
   const [kpis, setKpis] = useState<GiopKpiSnapshot | null>(null);
+  const [reviewMrid, setReviewMrid] = useState<string | null>(null);
   const activeMapCardRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    if (!sideMap.open) return;
+    if (!reviewMrid) return;
     activeMapCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }, [sideMap.open, sideMap.mrid]);
+  }, [reviewMrid]);
 
-  const card = isLightMode ? 'border-slate-200 bg-white' : 'border-slate-700 bg-slate-900/40';
-  const muted = isLightMode ? 'text-slate-500' : 'text-slate-400';
-  const inputClass = isLightMode
-    ? 'bg-white border-slate-300 text-slate-900'
-    : 'bg-slate-900 border-slate-700 text-slate-100';
+  const card = isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/45 bg-premium-card';
+  const muted = isLightMode ? 'text-slate-500' : 'text-premium-muted';
+
+  const topoSummary = topoByTier[dqTier] ?? null;
+  const summary = summaryByTier[dqTier] ?? null;
+  const topoLoading = topoLoadingTier === dqTier;
+  const topoRevalidating = topoRevalidatingTier === dqTier;
+
+  const loadSummaryForTier = useCallback(async (tier: DqDataTier) => {
+    try {
+      const sum = await getDqSummary({ tier });
+      setSummaryByTier((prev) => ({ ...prev, [tier]: sum }));
+    } catch {
+      setSummaryByTier((prev) => ({ ...prev, [tier]: undefined }));
+    }
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [rows, sum, pending, readyToPublish, kpiSnap] = await Promise.all([
-        listDqExceptions({
+      const [pageData, pending, readyToPublish, kpiSnap] = await Promise.all([
+        listDqQueue({
           status: statusFilter === 'ALL' ? undefined : statusFilter,
+          duplicatesOnly,
           severity: severityFilter || undefined,
           domain: domainFilter || undefined,
-          limit: 200,
+          limit: pageSize,
+          offset: page * pageSize,
         }),
-        getDqSummary().catch(() => null),
         listPendingApprovals().catch(() => []),
         listApprovedProposals().catch(() => []),
         getLatestKpis().catch(() => null),
       ]);
-      setExceptions(Array.isArray(rows) ? rows : []);
-      setSummary(sum);
+      setQueueItems(Array.isArray(pageData.items) ? pageData.items : []);
+      setTotalQueueItems(pageData.total ?? 0);
       setApprovals(pending);
       setApprovedProposals(readyToPublish);
       setKpis(kpiSnap);
     } catch (err) {
-      setStatus(err instanceof Error ? err.message : 'Failed to load exceptions');
-      setExceptions([]);
+      setStatus(err instanceof Error ? err.message : 'Failed to load staging queue');
+      setQueueItems([]);
+      setTotalQueueItems(0);
     } finally {
       setLoading(false);
     }
-  }, [statusFilter, severityFilter, domainFilter]);
+  }, [statusFilter, duplicatesOnly, severityFilter, domainFilter, page, pageSize]);
 
-  // The topology summary is served from the last scan snapshot by default (a
-  // cheap indexed read), so it never blocks the exception list. 'live' forces a
-  // fresh national recompute for the explicit "Refresh live" action.
-  const loadTopo = useCallback(async (mode: 'snapshot' | 'live' = 'snapshot') => {
-    const cacheKey = topoSummaryCacheKey(mode);
+  useEffect(() => {
+    setPage(0);
+  }, [statusFilter, duplicatesOnly, severityFilter, domainFilter, pageSize]);
+
+  const queueLookup = useMemo(
+    () => new Map(queueItems.map((item) => [item.mrid, item])),
+    [queueItems],
+  );
+
+  useEffect(() => {
+    if (!reviewMrid) {
+      clearDuplicateClusterOverlay();
+      return;
+    }
+    const { clusters, singletons } = partitionDqQueueItems(queueItems);
+    const cluster = clusters.find(
+      (entry) =>
+        entry.items.some((item) => item.mrid === reviewMrid) ||
+        entry.peers.some((peer) => peer.mrid === reviewMrid),
+    );
+    if (cluster) {
+      setDuplicateClusterOverlay(
+        buildDuplicateClusterOverlay(cluster, reviewMrid, queueLookup, isLightMode),
+      );
+      return;
+    }
+    const singleton = singletons.find((item) => item.mrid === reviewMrid);
+    if (singleton && queueItemDuplicateDetected(singleton)) {
+      const overlay = buildSingletonNearDuplicateOverlay(singleton, queueLookup, isLightMode);
+      if (overlay) {
+        setDuplicateClusterOverlay(overlay);
+        return;
+      }
+    }
+    clearDuplicateClusterOverlay();
+  }, [
+    reviewMrid,
+    queueItems,
+    queueLookup,
+    isLightMode,
+    setDuplicateClusterOverlay,
+    clearDuplicateClusterOverlay,
+  ]);
+
+  useEffect(() => {
+    return () => {
+      clearDuplicateClusterOverlay();
+    };
+  }, [clearDuplicateClusterOverlay]);
+
+  const loadTopo = useCallback(async (tier: DqDataTier, mode: 'snapshot' | 'live' = 'snapshot') => {
+    const cacheKey = topoSummaryCacheKey(tier, mode);
     const cached = mode === 'snapshot' ? normalizeTopoSummary(readSwCache(cacheKey)) : null;
     const hadCache = cached !== null;
 
     if (mode === 'live') {
       setTopoLiveBusy(true);
     } else if (cached) {
-      setTopoSummary(cached);
-      setTopoLoading(false);
-      setTopoRevalidating(true);
+      setTopoByTier((prev) => ({ ...prev, [tier]: cached }));
+      setTopoLoadingTier(null);
+      setTopoRevalidatingTier(tier);
     } else {
-      setTopoLoading(true);
+      setTopoLoadingTier(tier);
     }
 
     try {
-      const topo = normalizeTopoSummary(await getTopologyDqSummary({ mode }));
+      const topo = normalizeTopoSummary(await getTopologyDqSummary({ mode, tier }));
       if (topo) {
         writeSwCache(cacheKey, topo);
-        setTopoSummary(topo);
+        setTopoByTier((prev) => ({ ...prev, [tier]: topo }));
       } else if (!hadCache && mode === 'snapshot') {
-        setTopoSummary(null);
+        setTopoByTier((prev) => ({ ...prev, [tier]: undefined }));
       }
     } catch {
-      if (!hadCache && mode === 'snapshot') setTopoSummary(null);
+      if (!hadCache && mode === 'snapshot') {
+        setTopoByTier((prev) => ({ ...prev, [tier]: undefined }));
+      }
     } finally {
       if (mode === 'live') setTopoLiveBusy(false);
       else {
-        setTopoLoading(false);
-        setTopoRevalidating(false);
+        setTopoLoadingTier(null);
+        setTopoRevalidatingTier(null);
       }
     }
   }, []);
@@ -218,8 +325,9 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
   }, [load]);
 
   useEffect(() => {
-    void loadTopo();
-  }, [loadTopo]);
+    void loadTopo(dqTier);
+    void loadSummaryForTier(dqTier);
+  }, [dqTier, loadTopo, loadSummaryForTier]);
 
   useEffect(() => {
     getAgentsStatus()
@@ -322,6 +430,20 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
     }
   };
 
+  const handleReleaseToOperations = async (mrid: string) => {
+    setReleaseBusyMrid(mrid);
+    setStatus('');
+    try {
+      await releaseDqAssetToOperations(mrid);
+      setStatus(`Released ${mrid.slice(0, 8)}… to Operations`);
+      await load();
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : 'Release to Operations failed');
+    } finally {
+      setReleaseBusyMrid(null);
+    }
+  };
+
   const handleResolve = async (
     item: GiopDqException,
     action: 'RESOLVED' | 'DEFERRED' | 'QUARANTINED' | 'REJECTED',
@@ -338,39 +460,62 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
     }
   };
 
-  const handleRecheck = async (item: GiopDqException) => {
-    setBusyId(item.id);
-    try {
-      await runDqChecks(item.record_mrid, item.record_type === 'connectivity_node' ? 'staging' : 'master');
-      await load();
-    } catch (err) {
-      setStatus(err instanceof Error ? err.message : 'Re-check failed');
-    } finally {
-      setBusyId(null);
-    }
-  };
-
-  const handleShowOnMap = useCallback(
-    async (item: GiopDqException) => {
-      const mrid = dqExceptionMapMrid(item);
-      if (!mrid?.trim()) {
-        setStatus('No map location available for this exception');
+  const focusQueueReview = useCallback(
+    async (item: GiopDqQueueItem) => {
+      if (!item.mrid?.trim()) {
+        setStatus('No map location available for this capture');
         return;
       }
-      setMapBusyId(item.id);
+      setReviewMrid(item.mrid);
       setStatus('');
+      const duplicateCluster = queueItemDuplicateDetected(item);
+      const flyCoordinates = duplicateCluster
+        ? duplicateFlyCoordinatesForMrid(queueItems, item.mrid, queueLookup)
+        : null;
       try {
-        await focusOnMap(mrid, {
-          name: item.asset_name ?? undefined,
+        await focusOnMap(item.mrid, {
+          name: item.name ?? undefined,
+          coordinates:
+            item.longitude != null && item.latitude != null
+              ? [item.longitude, item.latitude]
+              : null,
+          sidePanel: true,
+          source: 'table',
+          duplicateCluster,
+          flyCoordinates,
         });
       } catch (err) {
-        setStatus(err instanceof Error ? err.message : 'Could not open map preview');
+        setStatus(err instanceof Error ? err.message : 'Could not focus map on record');
+      }
+    },
+    [focusOnMap, queueItems, queueLookup],
+  );
+
+  const handleShowQueueOnMap = useCallback(
+    async (item: GiopDqQueueItem) => {
+      setMapBusyId(item.mrid);
+      try {
+        await focusQueueReview(item);
       } finally {
         setMapBusyId(null);
       }
     },
-    [focusOnMap],
+    [focusQueueReview],
   );
+
+  useEffect(() => {
+    if (loading || queueItems.length === 0) return;
+    if (reviewMrid && queueItems.some((q) => q.mrid === reviewMrid)) return;
+    const first = queueItems.find((q) => q.mrid) ?? queueItems[0];
+    if (first) void focusQueueReview(first);
+  }, [queueItems, loading, reviewMrid, focusQueueReview]);
+
+  useEffect(() => {
+    if (!sideMap.mrid) return;
+    if (queueItems.some((q) => q.mrid === sideMap.mrid)) {
+      setReviewMrid(sideMap.mrid);
+    }
+  }, [sideMap.mrid, queueItems]);
 
   const handleSuggestFix = async (item: GiopDqException) => {
     setBusyId(item.id);
@@ -411,7 +556,7 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
       await publishTopologyProposal(proposalId);
       setStatus('Topology change published to master');
       await load();
-      await loadTopo('live');
+      await loadTopo('master', 'live');
     } catch (err) {
       setStatus(err instanceof Error ? err.message : 'Publish failed');
     } finally {
@@ -453,8 +598,8 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
             `${run.dangling_found.toLocaleString()} dangling, ` +
             `${run.auto_cleared.toLocaleString()} auto-cleared`,
         );
-        clearSwCache(topoSummaryCacheKey('snapshot'));
-        await Promise.all([load(), loadTopo()]);
+        clearSwCache(topoSummaryCacheKey('master', 'snapshot'));
+        await Promise.all([load(), loadTopo('master'), loadSummaryForTier('master')]);
         break;
       }
     } catch (err) {
@@ -464,8 +609,428 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
     }
   };
 
+  const validationBadgeClass = (validation?: string): string => {
+    if (isLightMode) {
+      if (validation === 'IN_CONFLICT') return 'bg-red-100 text-red-800';
+      if (validation === 'PENDING_FIELD') return 'bg-amber-100 text-amber-900';
+      return 'bg-slate-100 text-slate-700';
+    }
+    if (validation === 'IN_CONFLICT') return 'bg-red-950/35 text-red-300/90 border border-red-900/25';
+    if (validation === 'PENDING_FIELD') {
+      return 'bg-premium-warn-bg text-premium-warn-fg border border-premium-warn-border/40';
+    }
+    return 'bg-premium-hover text-premium-muted border border-premium-border/40';
+  };
+
+  const reviewSelectionClass = isLightMode
+    ? 'border-cyan-500 bg-cyan-50 ring-1 ring-cyan-400/40 shadow-sm'
+    : 'border-premium-accent/35 bg-premium-accent/[0.07] ring-1 ring-premium-accent/15';
+
+  const reviewTabActiveClass = isLightMode
+    ? 'border-cyan-500 bg-cyan-50 text-cyan-950 ring-1 ring-cyan-400/50 font-medium'
+    : 'border-premium-accent/40 bg-premium-accent/[0.1] text-premium-text ring-1 ring-premium-accent/20 font-medium';
+
+  const renderQueueCard = (
+    item: GiopDqQueueItem,
+    nested = false,
+    options?: { inspector?: boolean },
+  ) => {
+    const inspector = options?.inspector ?? false;
+    const isReviewing = reviewMrid === item.mrid;
+    const duplicateDetected = queueItemDuplicateDetected(item);
+    return (
+      <div
+        key={item.mrid}
+        ref={isReviewing && (!nested || inspector) ? activeMapCardRef : undefined}
+        role={inspector ? undefined : 'button'}
+        tabIndex={inspector ? undefined : 0}
+        onClick={inspector ? undefined : () => void focusQueueReview(item)}
+        onKeyDown={
+          inspector
+            ? undefined
+            : (e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  void focusQueueReview(item);
+                }
+              }
+        }
+        className={`rounded-lg border text-sm transition-colors ${
+          inspector ? '' : 'cursor-pointer'
+        } ${nested ? 'p-2.5' : 'p-3'} ${
+          isReviewing
+            ? reviewSelectionClass
+            : nested
+              ? isLightMode
+                ? 'border-slate-200 bg-white hover:border-slate-300'
+                : 'border-premium-border/45 bg-premium-card/90 hover:border-premium-border-subtle/60'
+              : `${card} hover:border-premium-accent/25`
+        }`}
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className={`px-2 py-0.5 rounded text-xs ${validationBadgeClass(item.validation)}`}>
+              {item.validation}
+            </span>
+            {duplicateDetected && (
+              <span className="text-xs px-2 py-0.5 rounded bg-premium-warn-bg text-premium-warn-fg border border-premium-warn-border/40">
+                Duplicate detected
+              </span>
+            )}
+            {item.open_exception_count > 0 ? (
+              <span className={`px-2 py-0.5 rounded text-xs ${severityBadge('major', isLightMode)}`}>
+                {item.open_exception_count} issue{item.open_exception_count === 1 ? '' : 's'}
+              </span>
+            ) : !duplicateDetected ? (
+              <span
+                className={`text-xs px-2 py-0.5 rounded ${
+                  isLightMode
+                    ? 'bg-emerald-100 text-emerald-800'
+                    : 'bg-emerald-950/30 text-emerald-300/90 border border-emerald-900/25'
+                }`}
+              >
+                Clean
+              </span>
+            ) : null}
+            {isReviewing && (
+              <span
+                className={`px-2 py-0.5 rounded text-xs font-medium ${
+                  isLightMode ? 'bg-cyan-600 text-white' : 'bg-premium-accent/20 text-premium-accent border border-premium-accent/25'
+                }`}
+              >
+                On map
+              </span>
+            )}
+          </div>
+          <span className={`text-xs font-semibold ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>
+            {item.name || 'Unnamed capture'}
+          </span>
+        </div>
+
+        <DqQueueRecordSummary item={item} isLightMode={isLightMode} compact={nested} />
+
+        {item.exceptions.length > 0 && (
+          <div className="mt-2">
+            <p className={`text-xs font-medium mb-1.5 ${muted}`}>
+              Validation issues ({item.open_exception_count || item.exceptions.length})
+            </p>
+            <ul className="space-y-1.5">
+              {item.exceptions.map((ex) => (
+                <DqExceptionIssueRow
+                  key={ex.id}
+                  item={ex}
+                  isLightMode={isLightMode}
+                  busy={busyId === ex.id}
+                  onSuggestFix={
+                    ex.status === 'OPEN' ? () => void handleSuggestFix(ex) : undefined
+                  }
+                  onResolve={
+                    ex.status === 'OPEN'
+                      ? (action) => void handleResolve(ex, action)
+                      : undefined
+                  }
+                />
+              ))}
+            </ul>
+          </div>
+        )}
+
+        <div className="flex flex-wrap gap-2 mt-2" onClick={(e) => e.stopPropagation()}>
+          <button
+            type="button"
+            disabled={mapBusyId === item.mrid}
+            className={`text-xs px-2 py-1 rounded disabled:opacity-50 ${
+              isLightMode
+                ? 'bg-slate-700 text-white'
+                : 'border border-premium-border/50 bg-premium-hover text-premium-text-secondary hover:bg-premium-hover-strong'
+            }`}
+            onClick={() => void handleShowQueueOnMap(item)}
+          >
+            {mapBusyId === item.mrid ? 'Panning…' : 'Show on map'}
+          </button>
+          <button
+            type="button"
+            disabled={busyId === item.mrid}
+            className={`text-xs px-2 py-1 rounded disabled:opacity-50 giop-btn-primary ${
+              isLightMode ? 'giop-btn-primary--light' : 'giop-btn-primary--dark'
+            }`}
+            onClick={async () => {
+              setBusyId(item.mrid);
+              try {
+                await runDqChecks(item.mrid, 'staging');
+                await load();
+              } catch (err) {
+                setStatus(err instanceof Error ? err.message : 'Re-check failed');
+              } finally {
+                setBusyId(null);
+              }
+            }}
+          >
+            Re-check
+          </button>
+          {item.can_release_to_operations && (
+            <button
+              type="button"
+              disabled={releaseBusyMrid === item.mrid}
+              className="text-xs px-2 py-1 bg-blue-800 rounded text-white disabled:opacity-50"
+              onClick={() => void handleReleaseToOperations(item.mrid)}
+            >
+              {releaseBusyMrid === item.mrid ? 'Releasing…' : 'Release to Operations'}
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const { clusters, singletons } = useMemo(
+    () => partitionDqQueueItems(queueItems),
+    [queueItems],
+  );
+
+  const focusDuplicateClusterPeer = useCallback(
+    async (cluster: DqQueueLocationCluster, mrid: string) => {
+      if (!mrid.trim()) return;
+      const peer = cluster.peers.find((p) => p.mrid === mrid);
+      const queueItem = queueLookup.get(mrid);
+      const center: [number, number] | null =
+        cluster.longitude != null && cluster.latitude != null
+          ? [cluster.longitude, cluster.latitude]
+          : null;
+      const flyCoordinates =
+        duplicateFlyCoordinatesForCluster(cluster, mrid, queueLookup) ?? center;
+
+      setReviewMrid(mrid);
+      setStatus('');
+
+      const overlay = buildDuplicateClusterOverlay(cluster, mrid, queueLookup, isLightMode);
+      if (overlay) setDuplicateClusterOverlay(overlay);
+
+      if (flyCoordinates) {
+        bumpSidePanelFly(flyCoordinates, true, DUPLICATE_CLUSTER_ZOOM);
+      }
+
+      try {
+        await focusOnMap(mrid, {
+          name: peer?.name ?? queueItem?.name ?? undefined,
+          coordinates: center,
+          sidePanel: true,
+          source: 'table',
+          duplicateCluster: true,
+          flyCoordinates,
+        });
+      } catch (err) {
+        setStatus(err instanceof Error ? err.message : 'Could not focus map on record');
+      }
+    },
+    [bumpSidePanelFly, focusOnMap, isLightMode, queueLookup, setDuplicateClusterOverlay],
+  );
+
+  const selectClusterPeer = useCallback(
+    (cluster: DqQueueLocationCluster, mrid: string) => {
+      void focusDuplicateClusterPeer(cluster, mrid);
+    },
+    [focusDuplicateClusterPeer],
+  );
+
+  const renderQueueCluster = (cluster: DqQueueLocationCluster) => {
+    const coords = formatDqCoordinates(cluster.longitude, cluster.latitude);
+    const openIssues = cluster.items.reduce((sum, item) => sum + item.open_exception_count, 0);
+    const itemsByMrid = new Map(cluster.items.map((item) => [item.mrid, item]));
+    const uniquePeers = cluster.peers.filter(
+      (peer, index, peers) => peers.findIndex((p) => p.mrid === peer.mrid) === index,
+    );
+    const peerMrids = new Set(uniquePeers.map((p) => p.mrid));
+    const activeMrid =
+      reviewMrid && peerMrids.has(reviewMrid)
+        ? reviewMrid
+        : uniquePeers[0]?.mrid ?? cluster.items[0]?.mrid ?? null;
+    const activeItem = activeMrid ? itemsByMrid.get(activeMrid) : undefined;
+    const activePeer = uniquePeers.find((p) => p.mrid === activeMrid);
+    const loadedPeers = cluster.items;
+    const diffFields =
+      activeMrid && loadedPeers.length > 1
+        ? buildDuplicateDiffFields(loadedPeers, activeMrid)
+        : [];
+    const timeline =
+      activeMrid && loadedPeers.length > 1
+        ? buildDuplicateTimeline(loadedPeers, activeMrid)
+        : [];
+    const photos =
+      activeMrid && loadedPeers.length > 1
+        ? collectDuplicatePhotos(loadedPeers, activeMrid)
+        : [];
+    const duplicateMode = clusterDuplicateMode(cluster);
+
+    return (
+      <div
+        key={cluster.locationKey}
+        className={`rounded-lg border overflow-hidden ${
+          isLightMode
+            ? 'border-amber-300 bg-amber-50/60'
+            : 'border-premium-warn-border/35 bg-premium-warn-bg-subtle'
+        }`}
+      >
+        <div
+          className={`px-3 py-2.5 border-b flex flex-wrap items-start justify-between gap-2 ${
+            isLightMode
+              ? 'border-amber-200 bg-amber-100/80'
+              : 'border-premium-warn-border/25 bg-premium-warn-bg/60'
+          }`}
+        >
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span
+                className={`inline-flex items-center justify-center min-w-[1.75rem] h-7 px-2 rounded-full text-xs font-semibold ${
+                  isLightMode
+                    ? 'bg-amber-500 text-white'
+                    : 'bg-premium-warn-bg text-premium-warn-fg border border-premium-warn-border/50'
+                }`}
+                title="Records at this coordinate"
+              >
+                {cluster.colocatedCount}
+              </span>
+              <p className="text-sm font-semibold">
+                {duplicateMode === 'near'
+                  ? `${cluster.colocatedCount} near-duplicate capture${cluster.colocatedCount === 1 ? '' : 's'}`
+                  : `${cluster.colocatedCount} staging captures share one map pin`}
+              </p>
+              <span
+                className={`text-xs px-2 py-0.5 rounded ${
+                  isLightMode
+                    ? 'bg-amber-200 text-amber-950'
+                    : 'bg-premium-hover text-premium-warn-fg-muted border border-premium-warn-border/30'
+                }`}
+              >
+                {duplicateMode === 'exact'
+                  ? 'Exact pin stack'
+                  : duplicateMode === 'near'
+                    ? 'Near duplicate'
+                    : 'Exact + near'}
+              </span>
+            </div>
+            <p className={`text-xs mt-1 ${muted}`}>
+              {coords ? `${coords} · ` : ''}
+              {openIssues} open issue{openIssues === 1 ? '' : 's'} in this stack
+              {duplicateMode !== 'exact' ? ' · fan map shows offset pins + distance line' : ' · fan map shows offset pins'}
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={!activeMrid || mapBusyId === activeMrid}
+            className={`text-xs px-2 py-1 rounded disabled:opacity-50 shrink-0 ${
+              isLightMode
+                ? 'bg-slate-700 text-white'
+                : 'border border-premium-border/50 bg-premium-hover text-premium-text-secondary hover:bg-premium-hover-strong'
+            }`}
+            onClick={() => {
+              if (activeMrid) {
+                setMapBusyId(activeMrid);
+                void focusDuplicateClusterPeer(cluster, activeMrid).finally(() =>
+                  setMapBusyId(null),
+                );
+              }
+            }}
+          >
+            {mapBusyId === activeMrid ? 'Panning…' : 'Show pin on map'}
+          </button>
+        </div>
+        <div className="px-3 py-2">
+          <p className={`text-xs font-medium mb-1.5 ${muted}`}>
+            Select a record to inspect ({uniquePeers.length})
+          </p>
+          <ul className="flex flex-wrap gap-1.5 mb-3" role="tablist" aria-label="Records at this location">
+            {uniquePeers.map((peer) => {
+              const isActive = peer.mrid === activeMrid;
+              const queueItem = itemsByMrid.get(peer.mrid);
+              return (
+                <li key={peer.mrid} role="presentation">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={isActive}
+                    className={`text-xs px-2 py-1 rounded border transition-colors ${
+                      isActive
+                        ? reviewTabActiveClass
+                        : queueItem
+                          ? isLightMode
+                            ? 'border-amber-400 bg-white text-amber-950 hover:bg-amber-50'
+                            : 'border-premium-warn-border/40 bg-premium-warn-bg/50 text-premium-warn-fg hover:bg-premium-warn-bg'
+                          : isLightMode
+                            ? 'border-slate-200 bg-white text-slate-600 hover:border-cyan-400'
+                            : 'border-premium-border/45 bg-premium-card/80 text-premium-text-secondary hover:border-premium-accent/30 hover:bg-premium-hover/60'
+                    }`}
+                    title={peer.mrid}
+                    onClick={() => selectClusterPeer(cluster, peer.mrid)}
+                  >
+                    {peer.name || peer.mrid.slice(0, 8)}
+                    {peer.validation ? ` · ${peer.validation}` : ''}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+          {loadedPeers.length > 1 ? (
+            <div className="space-y-2 mb-3">
+              <DqDuplicateDiffStrip
+                fields={diffFields}
+                isLightMode={isLightMode}
+                peerCount={uniquePeers.length}
+              />
+              <DqDuplicateTimeline
+                entries={timeline}
+                isLightMode={isLightMode}
+                onSelect={(mrid) => selectClusterPeer(cluster, mrid)}
+              />
+              <DqDuplicatePhotoCompare
+                photos={photos}
+                isLightMode={isLightMode}
+                onSelect={(mrid) => selectClusterPeer(cluster, mrid)}
+              />
+            </div>
+          ) : null}
+          {activeItem ? (
+            renderQueueCard(activeItem, true, { inspector: true })
+          ) : activeMrid && activePeer ? (
+            <div
+              className={`rounded-lg border p-3 text-sm ${
+                isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/45 bg-premium-card/90'
+              }`}
+            >
+              <p className="font-medium">{activePeer.name || 'Unnamed capture'}</p>
+              <p className={`text-xs mt-1 ${muted}`}>
+                Full capture details are not on this page. Increase per-page size or refresh.
+              </p>
+              <button
+                type="button"
+                className={`text-xs px-2 py-1 mt-2 rounded ${
+                  isLightMode
+                    ? 'bg-slate-700 text-white'
+                    : 'border border-premium-border/50 bg-premium-hover text-premium-text-secondary hover:bg-premium-hover-strong'
+                }`}
+                onClick={() =>
+                  void focusOnMap(activeMrid, {
+                    name: activePeer.name ?? undefined,
+                    coordinates:
+                      cluster.longitude != null && cluster.latitude != null
+                        ? [cluster.longitude, cluster.latitude]
+                        : null,
+                    sidePanel: true,
+                    source: 'table',
+                  })
+                }
+              >
+                Show on map
+              </button>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    );
+  };
+
   return (
-    <div className="h-full overflow-auto p-6 space-y-6">
+    <div className="h-full min-h-0 flex flex-col overflow-hidden">
       <ValidationRunModal
         open={validationModalOpen}
         runId={validationRunId ?? 'pending'}
@@ -478,120 +1043,58 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
         onClose={handleValidationModalClose}
         onRunInBackground={handleValidationRunInBackground}
       />
-      {!topoSummary && topoLoading && (
-        <div className={`rounded-lg border p-4 ${card}`}>
-          <div className="flex items-center justify-between gap-2">
-            <h3 className="text-sm font-semibold">Master topology DQ (Ghana bbox)</h3>
-            <span className={`text-xs ${muted}`}>Loading last scan…</span>
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mt-3">
-            {Array.from({ length: 5 }).map((_, i) => (
-              <div key={i} className={`h-10 rounded animate-pulse ${isLightMode ? 'bg-slate-100' : 'bg-slate-800/60'}`} />
-            ))}
-          </div>
-        </div>
-      )}
-      {topoSummary && (
-        <div className={`rounded-lg border p-4 space-y-3 ${card}`}>
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <h3 className="text-sm font-semibold">Master topology DQ (Ghana bbox)</h3>
-              <p className={`text-xs ${muted}`}>
-                {topoRevalidating
-                  ? 'Updating…'
-                  : topoSummary.source === 'live'
-                    ? 'Live · just computed'
-                    : `As of last scan · ${formatAgo(topoSummary.scanned_at)}`}
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                disabled={topoLiveBusy || scanBusy}
-                onClick={() => void loadTopo('live')}
-                className={`rounded border text-sm py-1.5 px-3 disabled:opacity-50 ${
-                  isLightMode
-                    ? 'border-slate-300 text-slate-700 hover:bg-slate-100'
-                    : 'border-slate-600 text-slate-200 hover:bg-slate-800'
-                }`}
-                title="Recompute live counts now (slower)"
-              >
-                {topoLiveBusy ? 'Computing…' : 'Refresh live'}
-              </button>
-              <button
-                type="button"
-                disabled={scanBusy}
-                onClick={() => void handleTopologyScan()}
-                className="rounded bg-cyan-700 hover:bg-cyan-600 disabled:opacity-50 text-white text-sm py-1.5 px-3"
-              >
-                {scanBusy ? 'Scanning…' : 'Run topology scan → queue'}
-              </button>
-            </div>
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-sm">
-            <div>
-              <p className={`text-xs ${muted}`}>Approved nodes</p>
-              <p className="font-semibold">{topoSummary.live.approved_nodes.toLocaleString()}</p>
-            </div>
-            <div>
-              <p className={`text-xs ${muted}`}>Orphan nodes</p>
-              <p className="font-semibold text-amber-600">{topoSummary.live.orphan_nodes.toLocaleString()}</p>
-            </div>
-            <div>
-              <p className={`text-xs ${muted}`}>Orphan ratio</p>
-              <p className="font-semibold">{(topoSummary.live.orphan_ratio * 100).toFixed(1)}%</p>
-            </div>
-            <div>
-              <p className={`text-xs ${muted}`}>Dangling lines</p>
-              <p className="font-semibold text-red-600">{topoSummary.live.dangling_lines.toLocaleString()}</p>
-            </div>
-            <div>
-              <p className={`text-xs ${muted}`}>Open topo exceptions</p>
-              <p className="font-semibold">
-                {(topoSummary.exception_queue?.open_topology_total ?? 0).toLocaleString()}
-              </p>
-            </div>
-          </div>
-          {topoSummary.export_blocked?.blocked && (
-            <p className="text-xs text-amber-700 dark:text-amber-300">
-              Exports in this bbox are blocked:{' '}
-              {(topoSummary.export_blocked.reasons ?? []).join('; ')}
-            </p>
-          )}
-        </div>
-      )}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-        <div className={`rounded-lg border p-3 ${card}`}>
-          <p className={`text-xs ${muted}`}>Open total</p>
-          <p className="text-2xl font-semibold">{summary?.open_total ?? '—'}</p>
-        </div>
-        {SEVERITY_ORDER.map((sev) => (
-          <div key={sev} className={`rounded-lg border p-3 ${card}`}>
-            <p className={`text-xs capitalize ${muted}`}>{sev}</p>
-            <p className="text-2xl font-semibold">{summary?.open_by_severity?.[sev] ?? 0}</p>
-          </div>
-        ))}
-      </div>
+
+      <div className="shrink-0 px-3 pt-3 pb-2 space-y-2 border-b border-slate-200/70 dark:border-premium-border/45">
+      <DqTierMetricsPanel
+        tier={dqTier}
+        onTierChange={setDqTier}
+        isLightMode={isLightMode}
+        topoSummary={topoSummary}
+        summary={summary}
+        topoLoading={topoLoading}
+        topoRevalidating={topoRevalidating}
+        topoLiveBusy={topoLiveBusy}
+        scanBusy={scanBusy}
+        onRefreshLive={() => void loadTopo(dqTier, 'live')}
+        onRunTopologyScan={() => void handleTopologyScan()}
+      />
 
       {(kpis || approvals.length > 0 || approvedProposals.length > 0 || validationBusy) && (
-        <div className={`rounded-lg border p-4 space-y-3 ${card}`}>
+        <details
+          className={`rounded-xl border text-sm group ${card} ${
+            isLightMode ? 'open:bg-white' : 'open:bg-premium-card/80'
+          }`}
+        >
+          <summary
+            className={`cursor-pointer list-none px-3 py-2 font-medium flex items-center justify-between gap-2 ${
+              isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'
+            }`}
+          >
+            <span>Agent KPIs &amp; approvals</span>
+            <span className={`text-xs font-normal ${muted}`}>Expand</span>
+          </summary>
+          <div className="px-3 pb-3 space-y-3 border-t border-slate-200/80 dark:border-premium-border/70/80 pt-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <h3 className="text-sm font-semibold">Agent KPIs &amp; approvals</h3>
-              {agentsStatus && (
-                <p className={`text-xs mt-0.5 ${muted}`}>
-                  Engine: {agentsStatus.engine}
-                  {' · '}
-                  LLM: {agentsStatus.llm_configured ? `connected (${agentsStatus.llm_model})` : 'rules-only (no API key)'}
-                </p>
-              )}
-            </div>
-            <div className="flex gap-2">
+            {agentsStatus && (
+              <p className={`text-xs ${muted}`}>
+                Engine: {agentsStatus.engine}
+                {' · '}
+                LLM:{' '}
+                {agentsStatus.llm_configured
+                  ? `connected (${agentsStatus.llm_model})`
+                  : 'rules-only (no API key)'}
+              </p>
+            )}
+            <div className="flex gap-2 ml-auto">
               <button
                 type="button"
                 disabled={validationBusy}
                 onClick={() => void handleValidationRun('deterministic')}
-                className="rounded border border-cyan-700 text-cyan-700 dark:text-cyan-300 text-xs py-1 px-2 disabled:opacity-50"
+                className={`rounded border text-xs py-1 px-2 disabled:opacity-50 ${
+                  isLightMode
+                    ? 'border-slate-300 text-slate-700 hover:bg-slate-100'
+                    : 'border-premium-border/50 text-premium-text-secondary hover:bg-premium-hover'
+                }`}
               >
                 {validationBusy ? 'Running…' : 'Run validation cycle'}
               </button>
@@ -599,7 +1102,9 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
                 type="button"
                 disabled={validationBusy}
                 onClick={() => void handleValidationRun('agent')}
-                className="rounded bg-cyan-700 text-white text-xs py-1 px-2 disabled:opacity-50"
+                className={`rounded text-xs py-1 px-2 disabled:opacity-50 giop-btn-primary ${
+                  isLightMode ? 'giop-btn-primary--light' : 'giop-btn-primary--dark'
+                }`}
               >
                 Run agent cycle
               </button>
@@ -608,16 +1113,24 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
           {validationBusy && validationRunId && validationRunId !== 'pending' && !validationModalOpen && (
             <div
               className={`rounded-lg border p-3 ${
-                isLightMode ? 'border-cyan-200 bg-cyan-50/80' : 'border-cyan-800/50 bg-cyan-950/30'
+                isLightMode
+                  ? 'border-cyan-200 bg-cyan-50/80'
+                  : 'border-premium-accent/25 bg-premium-accent/[0.06]'
               }`}
             >
               <div className="flex items-center justify-between gap-2 mb-2">
-                <p className="text-xs font-semibold text-cyan-800 dark:text-cyan-200">
+                <p
+                  className={`text-xs font-semibold ${
+                    isLightMode ? 'text-cyan-800' : 'text-premium-text'
+                  }`}
+                >
                   Validation cycle in progress
                 </p>
                 <button
                   type="button"
-                  className="text-xs text-cyan-700 dark:text-cyan-300 underline"
+                  className={`text-xs underline ${
+                    isLightMode ? 'text-cyan-700' : 'text-premium-accent'
+                  }`}
                   onClick={() => setValidationModalOpen(true)}
                 >
                   Show details
@@ -656,7 +1169,7 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
             </div>
           )}
           {kpis?.escalation && kpis.escalation.length > 0 && (
-            <ul className="text-xs text-amber-700 dark:text-amber-300 space-y-1">
+            <ul className={`text-xs space-y-1 ${isLightMode ? 'text-amber-700' : 'text-premium-warn-fg'}`}>
               {kpis.escalation.map((e) => (
                 <li key={e.code}>{e.message}</li>
               ))}
@@ -668,14 +1181,14 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
               {approvals.map((a) => (
                 <div
                   key={a.id}
-                  className={`rounded border p-2 text-xs ${isLightMode ? 'border-slate-200' : 'border-slate-700'}`}
+                  className={`rounded border p-2 text-xs ${isLightMode ? 'border-slate-200' : 'border-premium-border/70'}`}
                 >
                   <p className="font-medium">
                     {a.rule_code ?? 'Cleanup'} · {a.severity ?? a.cleanup_mode}
                   </p>
                   <p className={muted}>{a.rationale ?? a.error_message}</p>
                   {formatChangeSummary(a.change_summary as Record<string, unknown> | null) && (
-                    <p className="text-cyan-700 dark:text-cyan-300 mt-1">
+                    <p className={`mt-1 ${isLightMode ? 'text-cyan-700' : 'text-premium-accent'}`}>
                       Dry-run: {formatChangeSummary(a.change_summary as Record<string, unknown> | null)}
                     </p>
                   )}
@@ -712,14 +1225,14 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
               {approvedProposals.map((p) => (
                 <div
                   key={p.id}
-                  className={`rounded border p-2 text-xs ${isLightMode ? 'border-emerald-200 bg-emerald-50/50' : 'border-emerald-900/50 bg-emerald-950/20'}`}
+                  className={`rounded border p-2 text-xs ${isLightMode ? 'border-emerald-200 bg-emerald-50/50' : 'border-premium-success-border/50 bg-premium-success-bg/80'}`}
                 >
                   <p className="font-medium">
                     {p.rule_code ?? 'Topology repair'} · {p.severity ?? 'approved'}
                   </p>
                   <p className={muted}>{p.ai_rationale ?? p.exception_message}</p>
                   {formatChangeSummary(p.change_summary as Record<string, unknown> | null) && (
-                    <p className="text-emerald-700 dark:text-emerald-300 mt-1">
+                    <p className={`mt-1 ${isLightMode ? 'text-emerald-700' : 'text-premium-success-fg'}`}>
                       Dry-run: {formatChangeSummary(p.change_summary as Record<string, unknown> | null)}
                     </p>
                   )}
@@ -728,7 +1241,7 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
                       type="button"
                       disabled={busyId === p.id}
                       onClick={() => void handlePublishProposal(p.id)}
-                      className="px-2 py-0.5 rounded bg-cyan-700 text-white disabled:opacity-50"
+                      className="px-2 py-0.5 rounded bg-premium-hover-strong border border-premium-border/50 text-premium-text-secondary hover:bg-premium-hover disabled:opacity-50"
                     >
                       Publish to master
                     </button>
@@ -737,185 +1250,45 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
               ))}
             </div>
           )}
-        </div>
+          </div>
+        </details>
       )}
 
-      <div className={`rounded-lg border p-4 ${card}`}>
-        <div className="flex flex-wrap items-end gap-3">
-          <label className="text-xs space-y-1">
-            <span className={muted}>Status</span>
-            <select
-              value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value)}
-              className={`block rounded border px-2 py-1.5 text-sm ${inputClass}`}
-            >
-              {['OPEN', 'DEFERRED', 'QUARANTINED', 'RESOLVED', 'REJECTED', 'ALL'].map((s) => (
-                <option key={s} value={s}>
-                  {s}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="text-xs space-y-1">
-            <span className={muted}>Severity</span>
-            <select
-              value={severityFilter}
-              onChange={(e) => setSeverityFilter(e.target.value)}
-              className={`block rounded border px-2 py-1.5 text-sm ${inputClass}`}
-            >
-              <option value="">All</option>
-              {SEVERITY_ORDER.map((s) => (
-                <option key={s} value={s}>
-                  {s}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="text-xs space-y-1">
-            <span className={muted}>Domain</span>
-            <select
-              value={domainFilter}
-              onChange={(e) => setDomainFilter(e.target.value)}
-              className={`block rounded border px-2 py-1.5 text-sm ${inputClass}`}
-            >
-              <option value="">All</option>
-              <option value="topology">topology</option>
-              <option value="spatial">spatial</option>
-              <option value="asset">asset</option>
-              <option value="voltage">voltage</option>
-            </select>
-          </label>
-          <button
-            type="button"
-            onClick={() => void load()}
-            className="rounded bg-cyan-700 hover:bg-cyan-600 text-white text-sm py-1.5 px-3"
-          >
-            Refresh
-          </button>
-          {status && <span className="text-xs text-slate-500">{status}</span>}
-        </div>
+      <DqQueueToolbar
+        isLightMode={isLightMode}
+        statusFilter={statusFilter}
+        duplicatesOnly={duplicatesOnly}
+        severityFilter={severityFilter}
+        domainFilter={domainFilter}
+        onStatusFilterChange={setStatusFilter}
+        onDuplicatesOnlyChange={setDuplicatesOnly}
+        onSeverityFilterChange={setSeverityFilter}
+        onDomainFilterChange={setDomainFilter}
+        onRefresh={() => void load()}
+        loading={loading}
+        statusMessage={status || undefined}
+        page={page}
+        pageSize={pageSize}
+        total={totalQueueItems}
+        onPageChange={setPage}
+        onPageSizeChange={setPageSize}
+      />
       </div>
 
-      {loading && <p className="text-sm text-slate-500">Loading exceptions…</p>}
-      {!loading && exceptions.length === 0 && (
-        <p className="text-sm text-slate-500">No exceptions match the current filters.</p>
+      <div className="flex-1 min-h-0 overflow-y-auto px-3 pb-3 pt-2 space-y-2">
+      {loading && (
+        <p className="text-sm text-slate-500 py-2">Loading staging queue…</p>
+      )}
+      {!loading && queueItems.length === 0 && (
+        <p className="text-sm text-slate-500">
+          No staging captures in the DQ queue. Field submissions appear here as PENDING_FIELD.
+        </p>
       )}
 
-      <div className="space-y-3">
-        {exceptions.map((item) => {
-          const isBusy = busyId === item.id;
-          const isOpen = item.status === 'OPEN';
-          const mapMrid = dqExceptionMapMrid(item);
-          const isOnMap = sideMap.open && sideMap.mrid === mapMrid;
-          return (
-            <div
-              key={item.id}
-              ref={isOnMap ? activeMapCardRef : undefined}
-              className={`rounded-lg border p-3 text-sm transition-colors ${
-                isOnMap
-                  ? isLightMode
-                    ? 'border-cyan-500 bg-cyan-50 ring-2 ring-cyan-400/50 shadow-sm'
-                    : 'border-cyan-500 bg-cyan-950/35 ring-2 ring-cyan-500/35 shadow-md'
-                  : card
-              }`}
-            >
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className={`px-2 py-0.5 rounded text-xs ${severityBadge(item.severity)}`}>
-                    {item.severity}
-                  </span>
-                  <span className="font-mono text-xs">{item.rule_code}</span>
-                  <span className={`text-xs ${muted}`}>· {item.domain}</span>
-                  {isOnMap && (
-                    <span
-                      className={`px-2 py-0.5 rounded text-xs font-medium ${
-                        isLightMode ? 'bg-cyan-600 text-white' : 'bg-cyan-500 text-slate-900'
-                      }`}
-                    >
-                      On map
-                    </span>
-                  )}
-                  {!isOpen && (
-                    <span className={`text-xs ${muted}`}>· {item.status}</span>
-                  )}
-                </div>
-                <span className={`text-xs ${muted}`}>
-                  {item.asset_name || item.record_mrid?.slice(0, 8) || '—'}
-                </span>
-              </div>
-              <p className="mt-1">{item.error_message}</p>
-              {item.details && (
-                <pre className={`text-xs mt-2 overflow-auto max-h-24 ${muted}`}>
-                  {JSON.stringify(item.details, null, 2)}
-                </pre>
-              )}
-              <div className="flex flex-wrap gap-2 mt-2">
-                <button
-                  type="button"
-                  disabled={mapBusyId === item.id}
-                  className="text-xs px-2 py-1 bg-slate-700 rounded text-white disabled:opacity-50"
-                  onClick={() => void handleShowOnMap(item)}
-                >
-                  {mapBusyId === item.id ? 'Opening…' : 'Show on map'}
-                </button>
-                <button
-                  type="button"
-                  disabled={isBusy}
-                  className="text-xs px-2 py-1 bg-cyan-800 rounded text-white disabled:opacity-50"
-                  onClick={() => void handleRecheck(item)}
-                >
-                  Re-check
-                </button>
-                {isOpen && (
-                  <button
-                    type="button"
-                    disabled={isBusy}
-                    className="text-xs px-2 py-1 bg-indigo-800 rounded text-white disabled:opacity-50"
-                    onClick={() => void handleSuggestFix(item)}
-                  >
-                    Suggest fix
-                  </button>
-                )}
-                {isOpen && (
-                  <>
-                    <button
-                      type="button"
-                      disabled={isBusy}
-                      className="text-xs px-2 py-1 bg-emerald-800 rounded text-white disabled:opacity-50"
-                      onClick={() => void handleResolve(item, 'RESOLVED')}
-                    >
-                      Resolve
-                    </button>
-                    <button
-                      type="button"
-                      disabled={isBusy}
-                      className="text-xs px-2 py-1 bg-amber-800 rounded text-white disabled:opacity-50"
-                      onClick={() => void handleResolve(item, 'DEFERRED')}
-                    >
-                      Defer
-                    </button>
-                    <button
-                      type="button"
-                      disabled={isBusy}
-                      className="text-xs px-2 py-1 bg-purple-800 rounded text-white disabled:opacity-50"
-                      onClick={() => void handleResolve(item, 'QUARANTINED')}
-                    >
-                      Quarantine
-                    </button>
-                    <button
-                      type="button"
-                      disabled={isBusy}
-                      className="text-xs px-2 py-1 bg-red-900 rounded text-white disabled:opacity-50"
-                      onClick={() => void handleResolve(item, 'REJECTED')}
-                    >
-                      Reject
-                    </button>
-                  </>
-                )}
-              </div>
-            </div>
-          );
-        })}
+      <div className="space-y-2">
+        {clusters.map((cluster) => renderQueueCluster(cluster))}
+        {singletons.map((item) => renderQueueCard(item))}
+      </div>
       </div>
     </div>
   );

@@ -1,4 +1,5 @@
 import type { GeoJSONSource, Map as MaplibreMap } from 'maplibre-gl';
+import { GIOP_MAP_LABEL_FONT_BOLD } from './giopMapLayers';
 
 export interface TerritoryGeoJson {
   type: 'FeatureCollection';
@@ -80,7 +81,7 @@ export function applyTerritoryHighlight(
       layout: {
         'text-field': highlight.label,
         'text-size': 15,
-        'text-font': ['Noto Sans Bold'],
+        'text-font': GIOP_MAP_LABEL_FONT_BOLD,
         'text-anchor': 'center',
         'text-allow-overlap': true,
         'text-ignore-placement': true,

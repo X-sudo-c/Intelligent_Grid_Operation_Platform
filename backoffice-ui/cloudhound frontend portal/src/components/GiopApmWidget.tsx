@@ -30,15 +30,15 @@ export function GiopApmWidget({ isLightMode }: GiopApmWidgetProps) {
   return (
     <div
       className={`flex items-center gap-3 text-xs rounded-lg px-2 py-1 border ${
-        isLightMode ? 'border-slate-200 bg-white' : 'border-slate-700 bg-slate-900/60'
+        isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/70 bg-premium-surface/90'
       }`}
       title="Sync-service APM"
     >
       <span className={`h-2 w-2 rounded-full ${STATUS_COLOR[metrics.status]}`} />
-      <span className={isLightMode ? 'text-slate-600' : 'text-slate-300'}>
+      <span className={isLightMode ? 'text-slate-600' : 'text-premium-text-secondary'}>
         p95 {metrics.latency_p95_ms.toFixed(0)}ms
       </span>
-      <span className={isLightMode ? 'text-slate-500' : 'text-slate-400'}>
+      <span className={isLightMode ? 'text-slate-500' : 'text-premium-muted'}>
         err {metrics.error_rate_pct.toFixed(1)}%
       </span>
     </div>

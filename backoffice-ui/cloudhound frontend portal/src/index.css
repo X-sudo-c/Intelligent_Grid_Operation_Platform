@@ -2,6 +2,45 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── Premium theme (Cursor-inspired) ───────────────────────────────────── */
+:root,
+[data-theme='light'] {
+  color-scheme: light;
+  --giop-theme-transition-ms: 650ms;
+  --giop-bg: #f8fafc;
+  --giop-surface: #ffffff;
+  --giop-sidebar: #ffffff;
+  --giop-card: #ffffff;
+  --giop-hover: #f1f5f9;
+  --giop-border: #e2e8f0;
+  --giop-text: #0f172a;
+  --giop-text-secondary: #334155;
+  --giop-muted: #64748b;
+  --giop-accent: #0891b2;
+  --giop-scrollbar: #cbd5e1;
+  --giop-scrollbar-hover: #94a3b8;
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+  --giop-bg: #121212;
+  --giop-surface: #161616;
+  --giop-sidebar: #1a1a1a;
+  --giop-card: #1c1c1c;
+  --giop-hover: #222222;
+  --giop-border: #2e2e2e;
+  --giop-text: #bcbcbc;
+  --giop-text-secondary: #a8a8a8;
+  --giop-muted: #858585;
+  --giop-accent: #8fa4b8;
+  --giop-accent-subtle: rgba(143, 164, 184, 0.12);
+  --giop-warn-fg: #a39e98;
+  --giop-warn-bg: #1a1918;
+  --giop-warn-border: #32302e;
+  --giop-scrollbar: #383838;
+  --giop-scrollbar-hover: #484848;
+}
+
 * {
   margin: 0;
   padding: 0;
@@ -13,10 +52,285 @@ html {
 }
 
 body {
-  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    'Inter',
+    sans-serif;
   height: 100%;
   margin: 0;
   padding: 0;
+  background-color: var(--giop-bg);
+  color: var(--giop-text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition:
+    background-color var(--giop-theme-transition-ms) ease-out,
+    color var(--giop-theme-transition-ms) ease-out;
+}
+
+/* Cross-fade Tailwind + CSS-variable colors during theme toggle */
+html.giop-theme-transition,
+html.giop-theme-transition *,
+html.giop-theme-transition *::before,
+html.giop-theme-transition *::after {
+  transition-property:
+    background-color,
+    color,
+    border-color,
+    outline-color,
+    fill,
+    stroke,
+    box-shadow,
+    text-decoration-color;
+  transition-duration: var(--giop-theme-transition-ms);
+  transition-timing-function: ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body {
+    transition: none;
+  }
+
+  html.giop-theme-transition,
+  html.giop-theme-transition *,
+  html.giop-theme-transition *::before,
+  html.giop-theme-transition *::after {
+    transition: none !important;
+  }
+}
+
+[data-theme='dark'] ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+[data-theme='dark'] ::-webkit-scrollbar-track {
+  background: var(--giop-bg);
+}
+
+[data-theme='dark'] ::-webkit-scrollbar-thumb {
+  background: var(--giop-scrollbar);
+  border-radius: 5px;
+  border: 2px solid var(--giop-bg);
+}
+
+[data-theme='dark'] ::-webkit-scrollbar-thumb:hover {
+  background: var(--giop-scrollbar-hover);
+}
+
+@layer components {
+  .giop-premium-card {
+    @apply rounded-xl border border-premium-border/50 bg-premium-card shadow-premium-sm;
+  }
+
+  .giop-premium-input {
+    @apply rounded-lg border border-premium-border/80 bg-premium-surface text-premium-text placeholder:text-premium-muted-dim;
+  }
+
+  .giop-premium-muted {
+    @apply text-premium-muted;
+  }
+
+  .giop-btn-primary {
+    @apply rounded-lg border text-xs font-medium transition-colors disabled:opacity-50;
+  }
+
+  .giop-btn-primary--dark {
+    @apply border-premium-accent/30 bg-premium-accent-subtle text-premium-text-secondary hover:border-premium-accent/45 hover:bg-premium-accent/15 hover:text-premium-text;
+  }
+
+  .giop-btn-primary--light {
+    @apply border-cyan-700/20 bg-cyan-600 text-white hover:bg-cyan-500;
+  }
+
+  .giop-chip-warn--dark {
+    @apply border-premium-warn-border/50 bg-premium-warn-bg text-premium-warn-fg;
+  }
+}
+
+
+/* ── Premium metallic theme toggle ─────────────────────────────────────── */
+.giop-theme-toggle {
+  cursor: pointer;
+  isolation: isolate;
+  transition:
+    background-color var(--giop-theme-transition-ms) ease-out,
+    border-color var(--giop-theme-transition-ms) ease-out,
+    box-shadow var(--giop-theme-transition-ms) ease-out;
+}
+
+.giop-theme-toggle--light {
+  background: linear-gradient(180deg, #f8f6f1 0%, #ebe6dc 52%, #e2ddd2 100%);
+  border-color: rgba(180, 170, 155, 0.42);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.72),
+    inset 0 -2px 4px rgba(148, 138, 122, 0.14),
+    0 2px 6px rgba(15, 23, 42, 0.08);
+}
+
+.giop-theme-toggle--dark {
+  background: linear-gradient(180deg, #343434 0%, #262626 48%, #1e1e1e 100%);
+  border-color: rgba(255, 255, 255, 0.05);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    inset 0 -3px 6px rgba(0, 0, 0, 0.55),
+    0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+.giop-theme-toggle__well {
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.08) 0%, rgba(0, 0, 0, 0.02) 42%, rgba(255, 255, 255, 0.04) 100%);
+  box-shadow:
+    inset 0 2px 5px rgba(0, 0, 0, 0.22),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.giop-theme-toggle--light .giop-theme-toggle__well {
+  background: linear-gradient(180deg, rgba(120, 110, 95, 0.1) 0%, rgba(255, 255, 255, 0.08) 55%, rgba(255, 255, 255, 0.18) 100%);
+  box-shadow:
+    inset 0 2px 4px rgba(120, 110, 95, 0.16),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.55);
+}
+
+.giop-theme-toggle__ambient {
+  opacity: 0;
+  transition: opacity 0.48s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.giop-theme-toggle__ambient--dark {
+  opacity: 1;
+  background: radial-gradient(
+    circle at 22% 50%,
+    rgba(143, 164, 184, 0.28) 0%,
+    rgba(143, 164, 184, 0.08) 34%,
+    transparent 62%
+  );
+}
+
+.giop-theme-toggle__ambient--light {
+  opacity: 1;
+  background: radial-gradient(
+    circle at 78% 50%,
+    rgba(251, 191, 36, 0.22) 0%,
+    rgba(251, 191, 36, 0.07) 34%,
+    transparent 62%
+  );
+}
+
+.giop-theme-toggle__led {
+  width: 3px;
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.22);
+  box-shadow: none;
+  transition:
+    background-color 0.42s ease,
+    box-shadow 0.42s ease;
+}
+
+.giop-theme-toggle--dark .giop-theme-toggle__led {
+  background: rgba(100, 116, 139, 0.28);
+}
+
+.giop-theme-toggle__led--on.giop-theme-toggle__led--left {
+  background: #8fa4b8;
+  box-shadow: 0 0 5px rgba(143, 164, 184, 0.75);
+}
+
+.giop-theme-toggle--light .giop-theme-toggle__led--on.giop-theme-toggle__led--right {
+  background: #d4a24a;
+  box-shadow: 0 0 5px rgba(212, 162, 74, 0.65);
+}
+
+.giop-theme-toggle__fill--warm {
+  background: linear-gradient(
+    90deg,
+    rgba(212, 162, 74, 0.2) 0%,
+    rgba(212, 162, 74, 0.07) 72%,
+    rgba(212, 162, 74, 0) 100%
+  );
+}
+
+.giop-theme-toggle__fill--cool {
+  background: linear-gradient(
+    90deg,
+    rgba(143, 164, 184, 0.18) 0%,
+    rgba(143, 164, 184, 0.06) 72%,
+    rgba(143, 164, 184, 0) 100%
+  );
+}
+
+.giop-theme-toggle__knob {
+  z-index: 3;
+  will-change: transform;
+  overflow: hidden;
+}
+
+.giop-theme-toggle__knob--light {
+  background:
+    radial-gradient(circle at 32% 28%, #ffffff 0%, #f4f1ea 18%, #d8d2c6 52%, #b8b0a2 100%);
+  border: 1px solid rgba(255, 255, 255, 0.82);
+  box-shadow:
+    0 3px 7px rgba(15, 23, 42, 0.16),
+    0 1px 2px rgba(15, 23, 42, 0.08),
+    inset 0 -2px 4px rgba(120, 110, 95, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95);
+}
+
+.giop-theme-toggle__knob--dark {
+  background:
+    radial-gradient(circle at 34% 30%, #ffffff 0%, #eef2f7 16%, #c8d0db 48%, #8e98a8 100%);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  box-shadow:
+    0 4px 10px rgba(0, 0, 0, 0.42),
+    0 1px 2px rgba(0, 0, 0, 0.28),
+    inset 0 -2px 5px rgba(60, 70, 85, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.82);
+}
+
+.giop-theme-toggle__knob-shine {
+  background: radial-gradient(
+    circle at 30% 24%,
+    rgba(255, 255, 255, 0.92) 0%,
+    rgba(255, 255, 255, 0.28) 28%,
+    transparent 56%
+  );
+}
+
+.giop-theme-toggle__knob-rim {
+  box-shadow: inset 0 -3px 5px rgba(0, 0, 0, 0.12);
+}
+
+html.giop-theme-transition .giop-theme-toggle__knob {
+  transition:
+    box-shadow var(--giop-theme-transition-ms) ease-out,
+    border-color var(--giop-theme-transition-ms) ease-out,
+    background var(--giop-theme-transition-ms) ease-out;
+}
+
+.giop-theme-toggle__label--light {
+  color: #8a7d68;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.45);
+}
+
+.giop-theme-toggle__label--dark {
+  color: #a8b4c4;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+
+.giop-theme-toggle--dark .giop-theme-toggle__label--dark {
+  color: #b8c4d4;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .giop-theme-toggle__knob {
+    will-change: auto;
+  }
+
+  .giop-theme-toggle__ambient {
+    transition-duration: 0.01ms;
+  }
 }
 
 #root {
@@ -25,18 +339,31 @@ body {
   min-height: 100vh;
 }
 
+
 /* MapLibre needs an explicit sized parent */
 .giop-map-host {
   position: relative;
   width: 100%;
   height: 100%;
   min-height: 300px;
+  transition: background-color var(--giop-theme-transition-ms) ease-out;
 }
 
 .giop-map-host .maplibregl-map,
 .giop-map-host .maplibregl-canvas-container {
   width: 100%;
   height: 100%;
+}
+
+/* Ripple halos — sibling to the WebGL canvas inside MapLibre's container */
+.giop-map-pulse-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+  z-index: 1;
 }
 
 /* Apple-style map spotlight search (top-center) */
@@ -79,11 +406,11 @@ body {
 }
 
 .giop-map-spotlight--dark .giop-map-spotlight__bar {
-  background: rgba(22, 27, 38, 0.78);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(30, 30, 30, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.08);
   box-shadow:
-    0 8px 32px rgba(0, 0, 0, 0.45),
-    0 1px 2px rgba(0, 0, 0, 0.25);
+    0 8px 32px rgba(0, 0, 0, 0.5),
+    0 1px 2px rgba(0, 0, 0, 0.3);
   backdrop-filter: blur(20px) saturate(160%);
   -webkit-backdrop-filter: blur(20px) saturate(160%);
 }
@@ -136,11 +463,11 @@ body {
 }
 
 .giop-map-spotlight--dark .giop-map-spotlight__input {
-  color: #f1f5f9;
+  color: #bcbcbc;
 }
 
 .giop-map-spotlight--dark .giop-map-spotlight__input::placeholder {
-  color: #64748b;
+  color: #6e6e6e;
 }
 
 .giop-map-spotlight__input::-webkit-search-cancel-button {
@@ -398,10 +725,23 @@ body {
 /* Field crews / Territory panel — mode transitions */
 .giop-field-panel {
   --giop-panel-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  isolation: isolate;
   transition:
     border-color 0.48s var(--giop-panel-ease),
     box-shadow 0.48s var(--giop-panel-ease),
     max-height 0.48s var(--giop-panel-ease);
+}
+
+.giop-field-panel--dark {
+  background-color: #1c1c1c;
+  border-color: rgba(46, 46, 46, 0.72);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55);
+}
+
+.giop-field-panel--light {
+  background-color: #ffffff;
+  border-color: rgba(226, 232, 240, 0.95);
+  box-shadow: 0 8px 22px rgba(15, 23, 42, 0.1);
 }
 
 .giop-field-panel--crews {
@@ -418,17 +758,17 @@ body {
 }
 
 .giop-field-panel--dark.giop-field-panel--territory {
-  border-color: rgba(245, 158, 11, 0.42) !important;
+  border-color: rgba(163, 158, 152, 0.38) !important;
   box-shadow:
-    0 14px 44px rgba(245, 158, 11, 0.14),
-    0 0 0 1px rgba(245, 158, 11, 0.22);
+    0 14px 40px rgba(0, 0, 0, 0.5),
+    0 0 0 1px rgba(163, 158, 152, 0.16);
 }
 
 .giop-field-panel--light.giop-field-panel--territory {
-  border-color: rgba(217, 119, 6, 0.38) !important;
+  border-color: rgba(203, 213, 225, 0.95) !important;
   box-shadow:
-    0 14px 40px rgba(217, 119, 6, 0.12),
-    0 0 0 1px rgba(251, 191, 36, 0.28);
+    0 12px 32px rgba(15, 23, 42, 0.1),
+    0 0 0 1px rgba(226, 232, 240, 0.9);
 }
 
 .giop-field-panel-heading {
@@ -639,7 +979,7 @@ body {
 }
 
 .giop-map-hover--dark {
-  color: #e2e8f0;
+  color: #bcbcbc;
 }
 
 .giop-map-hover--light {
@@ -653,7 +993,7 @@ body {
 }
 
 .giop-map-hover--dark .giop-map-hover__title {
-  color: #f8fafc;
+  color: #e8e8e8;
 }
 
 .giop-map-hover--light .giop-map-hover__title {

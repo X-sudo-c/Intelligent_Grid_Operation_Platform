@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { beginGiopThemeTransition } from '../lib/giopThemeTransition';
 import { EnhancedPortalShell } from './EnhancedPortalShell';
 import { GiopTopologyTab } from './GiopTopologyTab';
 import { GiopMapView } from './GiopMapView';
 import { GiopSplitView } from './GiopSplitView';
-import { GiopOperationsTab } from './GiopOperationsTab';
+import { GiopOperationsDesk } from './GiopOperationsDesk';
 import { GiopMeterOcr } from './GiopMeterOcr';
 import { GiopInsightsTab } from './GiopInsightsTab';
 import { GiopSchematicTab } from './GiopSchematicTab';
@@ -27,7 +28,7 @@ import { GiopMapOverlayProvider, useGiopMapOverlay } from '../context/GiopMapOve
 import { useGiopTopology } from '../hooks/useGiopTopology';
 import { useGiopRealtime } from '../hooks/useGiopRealtime';
 import { useGiopFieldTechnicians } from '../hooks/useGiopFieldTechnicians';
-import { DEFAULT_START_MRID, getSpatialTerritoryGeojson, listWorkOrders, type GiopWorkOrder } from '../api/giop-api';
+import { DEFAULT_START_MRID, getAssetLocation, getSpatialTerritoryGeojson, getStagingAssets, listWorkOrders, type GiopStagingAsset, type GiopWorkOrder } from '../api/giop-api';
 import {
   readGiopRouteFromLocation,
   subscribeToGiopRouteChanges,
@@ -35,7 +36,11 @@ import {
   type GiopPortalTab,
 } from '../lib/giopPortalRouting';
 import type { GiopGraphQueryKey } from '../lib/giopGraphTypes';
-import { normalizeMapCoordinates } from '../lib/giopMapCoordinates';
+import { GIOP_GRAPH_QUERY_OPTIONS } from '../lib/giopGraphTypes';
+import { normalizeMapCoordinates, extractStagingGeomCoordinates } from '../lib/giopMapCoordinates';
+import type { GiopMapFlyRequest } from '../lib/giopMapFlyRequest';
+import { resolveTopologyStartMrid, isStagingOnlySeed } from '../lib/resolveTopologyStartMrid';
+import { giopLog } from '../lib/giopDebugLog';
 import { useGiopNavBadges } from '../hooks/useGiopNavBadges';
 import type { PortalNavGroup } from './EnhancedPortalShell';
 import { EnhancedCopilotPanel } from './EnhancedCopilotPanel';
@@ -46,6 +51,10 @@ import type {
   MapViewportContext,
 } from '../lib/giopCopilotTypes';
 import type { MapBbox } from '../hooks/useGiopGraphChunk';
+
+const OPS_TOPOLOGY_GRAPH_QUERY_OPTIONS = GIOP_GRAPH_QUERY_OPTIONS.filter(
+  (o) => o.key === 'traced_subgraph' || o.key === 'network_topology',
+);
 
 const NAV_GROUPS: PortalNavGroup[] = [
   {
@@ -86,7 +95,7 @@ const NAV_GROUPS: PortalNavGroup[] = [
 const TAB_META: Record<GiopPortalTab, { title: string; subtitle: string }> = {
   operations: {
     title: 'Grid Operations',
-    subtitle: 'Staging assets, validation, and topology repair',
+    subtitle: 'Map, topology, and asset verification — FR-010 steward desk',
   },
   map: {
     title: 'Network Map',
@@ -179,19 +188,22 @@ function GiopPortalInner() {
   const [opsRefreshToken, setOpsRefreshToken] = useState(0);
   const [liveStatus, setLiveStatus] = useState<'idle' | 'loading' | 'live'>('idle');
   const [mapViewport, setMapViewport] = useState<MapViewportContext | null>(null);
+  const mapViewportRef = useRef<MapViewportContext | null>(null);
   const [selectedTerritory, setSelectedTerritory] = useState<{
     district?: string;
     region?: string;
   } | null>(null);
   const stagingTopologyTimerRef = useRef<number | undefined>(undefined);
+  /** Guards against an older async territory-geojson fetch overwriting a newer one. */
+  const territoryHighlightSeqRef = useRef(0);
 
-  const startMrid = route.startMrid || DEFAULT_START_MRID;
   const { selection, setSelection } = useGiopSelection();
   const {
     impactOverlay,
     sideMap,
     closeSideMap,
     focusOnMap,
+    sidePanelFlyRequest,
     mapIdentifyFocusMrid,
     clearMapIdentifyFocus,
     queueMapViewportCommand,
@@ -199,10 +211,28 @@ function GiopPortalInner() {
   } = useGiopMapOverlay();
   const navBadges = useGiopNavBadges(opsRefreshToken);
   const [workOrders, setWorkOrders] = useState<GiopWorkOrder[]>([]);
+  const [opsTopologyFocus, setOpsTopologyFocus] = useState<string | null>(null);
+  const [opsTableStaging, setOpsTableStaging] = useState<GiopStagingAsset[]>([]);
+  const [opsFlyRequest, setOpsFlyRequest] = useState<GiopMapFlyRequest | null>(null);
 
-  // Only the graph views actually need the (expensive) Memgraph trace. The map
-  // renders from Martin tiles + the staging overlay, so it doesn't.
-  const needsTrace = route.tab === 'topology' || route.tab === 'combined';
+  const routeStartMrid = route.startMrid || DEFAULT_START_MRID;
+  const startMrid = routeStartMrid;
+
+  // Operations topology panel uses master Memgraph trace; map uses tiles + staging overlay.
+  const needsTrace =
+    route.tab === 'topology' || route.tab === 'combined' || route.tab === 'operations';
+
+  const [stagingSeedRows, setStagingSeedRows] = useState<GiopStagingAsset[]>([]);
+  useEffect(() => {
+    void getStagingAssets()
+      .then(setStagingSeedRows)
+      .catch(() => setStagingSeedRows([]));
+  }, [opsRefreshToken]);
+
+  const topologyStartMrid = useMemo(
+    () => resolveTopologyStartMrid(route.tab, route.startMrid, stagingSeedRows),
+    [route.tab, route.startMrid, stagingSeedRows],
+  );
 
   const {
     graph,
@@ -214,9 +244,14 @@ function GiopPortalInner() {
     refresh,
     refreshStaging,
     applyQuery,
-  } = useGiopTopology(startMrid, {
+  } = useGiopTopology(topologyStartMrid, {
     traceActive: needsTrace,
-    initialGraphQuery: route.tab === 'combined' ? 'viewport_subgraph' : 'traced_subgraph',
+    initialGraphQuery:
+      route.tab === 'combined'
+        ? 'viewport_subgraph'
+        : route.tab === 'operations'
+          ? 'traced_subgraph'
+          : 'traced_subgraph',
   });
 
   useEffect(() => {
@@ -241,21 +276,56 @@ function GiopPortalInner() {
     if (route.tab === 'combined' && graphQuery !== 'viewport_subgraph' && graphQuery !== 'traced_subgraph') {
       applyQuery('viewport_subgraph');
     }
+    if (route.tab === 'operations' && graphQuery !== 'traced_subgraph' && graphQuery !== 'network_topology') {
+      applyQuery('traced_subgraph');
+    }
   }, [route.tab, graphQuery, applyQuery]);
 
   useEffect(() => {
-    if (route.graphQuery && route.graphQuery !== graphQuery) {
-      applyQuery(route.graphQuery as GiopGraphQueryKey);
-    }
-  }, [route.graphQuery, graphQuery, applyQuery]);
+    if (route.tab !== 'operations' || !route.startMrid) return;
+    if (!isStagingOnlySeed(route.startMrid, stagingSeedRows)) return;
+    writeGiopRouteToLocation(
+      {
+        tab: 'operations',
+        graphQuery,
+        focusMrid: route.focusMrid,
+      },
+      true,
+    );
+  }, [route.tab, route.startMrid, route.focusMrid, graphQuery, stagingSeedRows]);
 
   useEffect(() => {
+    if (route.tab !== 'operations') {
+      setOpsTopologyFocus(null);
+    }
+  }, [route.tab]);
+
+  useEffect(() => {
+    if (route.graphQuery && route.graphQuery !== graphQuery) {
+      if (route.tab === 'operations') return;
+      applyQuery(route.graphQuery as GiopGraphQueryKey);
+    }
+  }, [route.graphQuery, graphQuery, applyQuery, route.tab]);
+
+  useEffect(() => {
+    const theme = isLightMode ? 'light' : 'dark';
     try {
-      localStorage.setItem(THEME_STORAGE_KEY, isLightMode ? 'light' : 'dark');
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
     } catch {
       /* ignore */
     }
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.classList.toggle('dark', !isLightMode);
   }, [isLightMode]);
+
+  const setTheme = useCallback(
+    (isLight: boolean) => {
+      if (isLight === isLightMode) return;
+      beginGiopThemeTransition();
+      setIsLightMode(isLight);
+    },
+    [isLightMode],
+  );
 
   const goToTab = useCallback(
     (tab: GiopPortalTab) => {
@@ -302,7 +372,7 @@ function GiopPortalInner() {
       focus_mrid: selection.mrid ?? route.focusMrid ?? null,
       selection_name: selection.name ?? null,
       staging_pending_count: pending,
-      viewport: mapViewport,
+      viewport: mapViewport ?? mapViewportRef.current,
       selected_district: selectedTerritory?.district ?? null,
       selected_region: selectedTerritory?.region ?? null,
     };
@@ -318,8 +388,8 @@ function GiopPortalInner() {
 
   const ensureMapVisible = useCallback(
     (tab?: string) => {
-      const target: GiopPortalTab =
-        tab === 'combined' ? 'combined' : tab === 'map' || !tab ? 'map' : 'map';
+      if (route.tab === 'operations') return;
+      const target: GiopPortalTab = tab === 'combined' ? 'combined' : 'map';
       if (route.tab !== target) goToTab(target);
     },
     [goToTab, route.tab],
@@ -327,7 +397,9 @@ function GiopPortalInner() {
 
   const handleMapViewportChange = useCallback(
     (bbox: MapBbox, zoom: number, center: { lon: number; lat: number }) => {
-      setMapViewport({ bbox, zoom, center });
+      const next = { bbox, zoom, center };
+      mapViewportRef.current = next;
+      setMapViewport(next);
     },
     [],
   );
@@ -346,12 +418,28 @@ function GiopPortalInner() {
         const tab: GiopPortalTab = isGiopPortalTab(tabRaw) ? tabRaw : 'operations';
         if (action.focus_mrid) {
           setSelection(action.focus_mrid, { source: 'table' });
-          writeGiopRouteToLocation(
-            { tab, startMrid, graphQuery, focusMrid: action.focus_mrid },
-            true,
-          );
+          if (tab === 'topology') {
+            // Re-root the trace on the focused asset so the graph actually
+            // shows it instead of keeping the previous start node.
+            writeGiopRouteToLocation(
+              {
+                tab,
+                startMrid: action.focus_mrid,
+                graphQuery: 'traced_subgraph',
+                focusMrid: action.focus_mrid,
+              },
+              true,
+            );
+          } else {
+            writeGiopRouteToLocation(
+              { tab, startMrid, graphQuery, focusMrid: action.focus_mrid },
+              true,
+            );
+          }
           if (tab === 'map' || tab === 'combined') {
             void focusOnMap(action.focus_mrid, { navigateTab: true, tab });
+          } else if (tab === 'operations') {
+            void focusOnMap(action.focus_mrid, { navigateTab: false, sidePanel: false });
           }
         } else {
           goToTab(tab);
@@ -360,7 +448,7 @@ function GiopPortalInner() {
           setSelectedTerritory({ district: action.district, region: action.region });
         }
         if (tab === 'operations') setOpsRefreshToken((t) => t + 1);
-        if (tab === 'map' || tab === 'combined') refreshMap();
+        if (tab === 'map' || tab === 'combined' || tab === 'operations') refreshMap();
         return;
       }
 
@@ -392,6 +480,7 @@ function GiopPortalInner() {
         }
         const label =
           action.label ?? action.district ?? action.region ?? 'Territory';
+        const seq = ++territoryHighlightSeqRef.current;
         void (async () => {
           try {
             const geojson =
@@ -400,6 +489,7 @@ function GiopPortalInner() {
                 district: action.district,
                 region: action.region,
               }));
+            if (seq !== territoryHighlightSeqRef.current) return;
             setTerritoryHighlight({
               geojson,
               label,
@@ -407,7 +497,7 @@ function GiopPortalInner() {
               region: action.region,
             });
           } catch (err) {
-            console.warn('[GiopPortal] territory highlight failed:', err);
+            giopLog.portal.warn('territory highlight failed', err);
           }
         })();
         queueMapViewportCommand({ type: 'fit_bounds', bbox: action.bbox });
@@ -436,7 +526,7 @@ function GiopPortalInner() {
     selectTechnician,
     clearSelection: clearTechnicianSelection,
   } = useGiopFieldTechnicians({
-    enabled: route.tab === 'map' || route.tab === 'combined',
+    enabled: route.tab === 'map' || route.tab === 'combined' || route.tab === 'operations',
   });
 
   const fieldCrewsPanel = {
@@ -481,7 +571,7 @@ function GiopPortalInner() {
 
   // Belt-and-suspenders: poll staging while map is open (realtime can lag).
   useEffect(() => {
-    if (route.tab !== 'map' && route.tab !== 'combined') return;
+    if (route.tab !== 'map' && route.tab !== 'combined' && route.tab !== 'operations') return;
     const id = window.setInterval(() => void refreshStaging(), 10000);
     return () => window.clearInterval(id);
   }, [route.tab, refreshStaging]);
@@ -493,6 +583,63 @@ function GiopPortalInner() {
     return normalizeMapCoordinates(asset?.geom?.coordinates) ?? null;
   }, [selection.coordinates, selection.mrid, staging]);
 
+  const opsMapStagingAssets = opsTableStaging.length > 0 ? opsTableStaging : staging;
+
+  const opsDeskFocusCoordinates = useMemo((): [number, number] | null => {
+    const fromSelection = normalizeMapCoordinates(selection.coordinates);
+    if (fromSelection) return fromSelection;
+    const asset = opsMapStagingAssets.find((a) => a.mrid === selection.mrid);
+    return extractStagingGeomCoordinates(asset?.geom);
+  }, [selection.coordinates, selection.mrid, opsMapStagingAssets]);
+
+  const bumpOpsFly = useCallback((coordinates: [number, number] | null) => {
+    if (!coordinates) {
+      giopLog.ops.warn('fly request skipped — no coordinates');
+      return;
+    }
+    setOpsFlyRequest((prev) => {
+      const next = { id: (prev?.id ?? 0) + 1, coordinates };
+      giopLog.ops.info('fly request queued', next);
+      return next;
+    });
+  }, []);
+
+  // Ops desk "View on map" / row click: drive selection (label + pulse) and an
+  // imperative camera pan. Coordinates come from the staging row; falls back to the
+  // asset-location API only when the row has no geometry.
+  const handleOpsAssetFocus = useCallback(
+    async (asset: GiopStagingAsset) => {
+      let coords = extractStagingGeomCoordinates(asset.geom);
+      let name = asset.name?.trim() || undefined;
+      giopLog.ops.info('View on map', { mrid: asset.mrid, geom: asset.geom, coords, name });
+
+      setSelection(asset.mrid, { name, coordinates: coords, source: 'table' });
+      if (coords) {
+        bumpOpsFly(coords);
+        return;
+      }
+
+      giopLog.ops.info('row geom missing — fetching asset location', { mrid: asset.mrid });
+      try {
+        const loc = await getAssetLocation(asset.mrid);
+        if (loc.longitude != null && loc.latitude != null) {
+          coords = normalizeMapCoordinates([loc.longitude, loc.latitude]);
+        }
+        name = name ?? loc.name?.trim() ?? undefined;
+        giopLog.ops.info('asset location resolved', { mrid: asset.mrid, coords, name });
+      } catch (err) {
+        giopLog.ops.error('asset location fetch failed — pan skipped', { mrid: asset.mrid, err });
+      }
+      if (coords) {
+        setSelection(asset.mrid, { name, coordinates: coords, source: 'table' });
+        bumpOpsFly(coords);
+      } else {
+        giopLog.ops.warn('View on map failed — no coordinates for asset', { mrid: asset.mrid });
+      }
+    },
+    [bumpOpsFly, setSelection],
+  );
+
   const handleGraphNodeSelect = useCallback(
     (mrid: string, label?: string) => {
       setSelection(mrid, { name: label, source: 'graph' });
@@ -503,6 +650,27 @@ function GiopPortalInner() {
     },
     [graphQuery, route.tab, setSelection, startMrid],
   );
+
+  const handleOperationsMapNodeClick = useCallback(
+    (mrid: string, coordinates?: [number, number]) => {
+      clearMapIdentifyFocus();
+      const asset = opsMapStagingAssets.find((a) => a.mrid === mrid);
+      const coords =
+        normalizeMapCoordinates(coordinates) ?? extractStagingGeomCoordinates(asset?.geom);
+      giopLog.ops.info('map node click', { mrid, coordinates, resolved: coords });
+      setSelection(mrid, { name: asset?.name, coordinates: coords, source: 'map' });
+      bumpOpsFly(coords);
+    },
+    [bumpOpsFly, clearMapIdentifyFocus, opsMapStagingAssets, setSelection],
+  );
+
+  const handleOperationsGraphNodeSelect = useCallback((mrid: string, _label?: string) => {
+    setOpsTopologyFocus(mrid);
+  }, []);
+
+  const clearOpsTopologyFocus = useCallback(() => {
+    setOpsTopologyFocus(null);
+  }, []);
 
   const clearFocus = useCallback(() => {
     writeGiopRouteToLocation(
@@ -517,19 +685,19 @@ function GiopPortalInner() {
       <div className="flex items-center gap-2 text-xs">
         <span
           className={`inline-block h-2.5 w-2.5 rounded-full ${
-            liveStatus === 'live' ? 'bg-cyan-400' : liveStatus === 'loading' ? 'bg-yellow-400 animate-pulse' : 'bg-slate-500'
+            liveStatus === 'live' ? 'bg-premium-success-fg/80' : liveStatus === 'loading' ? 'bg-premium-warn-fg/80 animate-pulse' : 'bg-premium-muted-dim'
           }`}
         />
-        <span className={isLightMode ? 'text-slate-600' : 'text-slate-400'}>
+        <span className={isLightMode ? 'text-slate-600' : 'text-premium-muted'}>
           {liveStatus === 'live' ? 'Live' : liveStatus === 'loading' ? 'Updating…' : 'Idle'}
         </span>
       </div>
     </div>
   );
 
-  // Side panel is redundant on full-screen map tabs.
+  // Side panel is redundant on full-screen map tabs and the operations desk.
   useEffect(() => {
-    if (sideMap.open && (route.tab === 'map' || route.tab === 'combined')) {
+    if (sideMap.open && (route.tab === 'map' || route.tab === 'combined' || route.tab === 'operations')) {
       closeSideMap();
     }
   }, [route.tab, sideMap.open, closeSideMap]);
@@ -586,15 +754,19 @@ function GiopPortalInner() {
       onReset={() => setSideMapEpoch((n) => n + 1)}
     >
       <GiopSideMapPanel
-        key={`${sideMap.mrid ?? 'none'}-${sideMapEpoch}`}
+        key={`side-map-${sideMapEpoch}`}
         mrid={sideMap.mrid}
         name={sideMap.name}
         coordinates={sideMapCoordinates}
         isLightMode={isLightMode}
         stagingAssets={staging}
-        startMrid={sideMap.mrid ?? startMrid}
+        startMrid={
+          route.tab === 'data-quality' ? topologyStartMrid : (sideMap.mrid ?? topologyStartMrid)
+        }
         mapRefreshToken={mapRefreshToken}
+        flyRequest={sidePanelFlyRequest}
         impactOverlay={impactOverlay}
+        persistent={route.tab === 'data-quality'}
         onClose={closeSideMap}
         onOpenFullMap={openSideMapFullTab}
         onNodeClick={(mrid, coordinates) =>
@@ -604,14 +776,43 @@ function GiopPortalInner() {
     </GiopMapErrorBoundary>
   );
 
+  const dqMapPinned = route.tab === 'data-quality';
+
   const tabContent = (
     <>
       {route.tab === 'operations' && (
-        <GiopOperationsTab
+        <GiopOperationsDesk
           isLightMode={isLightMode}
+          graph={graph}
+          loading={loading}
+          revalidating={revalidating}
+          error={error}
+          graphQuery={graphQuery}
+          onQueryChange={onQueryChange}
+          focusMrid={selection.mrid}
+          focusCoordinates={opsDeskFocusCoordinates}
+          focusLabel={selection.name ?? null}
+          topologyFocusMrid={opsTopologyFocus}
+          flyRequest={opsFlyRequest}
+          topologyGraphQueryOptions={OPS_TOPOLOGY_GRAPH_QUERY_OPTIONS}
+          onFocusHandled={clearOpsTopologyFocus}
+          onGraphNodeSelect={handleOperationsGraphNodeSelect}
+          stagingAssets={opsMapStagingAssets}
+          onMapNodeClick={handleOperationsMapNodeClick}
+          onMapViewportChange={handleMapViewportChange}
+          onTerritorySelect={handleTerritorySelect}
+          mapRefreshToken={mapRefreshToken}
+          startMrid={topologyStartMrid}
+          impactOverlay={impactOverlay}
+          opsRefreshToken={opsRefreshToken}
           onRefreshTopology={() => void refreshTopology()}
           onMapRefresh={refreshMap}
-          refreshToken={opsRefreshToken}
+          onAssetFocus={handleOpsAssetFocus}
+          onTableAssetsLoaded={setOpsTableStaging}
+          fieldTechnicians={technicians}
+          fieldCrews={fieldCrewsPanel}
+          onTechnicianClick={selectTechnician}
+          workOrders={workOrders}
         />
       )}
 
@@ -627,7 +828,7 @@ function GiopPortalInner() {
             fieldTechnicians={technicians}
             fieldCrews={fieldCrewsPanel}
             refreshToken={mapRefreshToken}
-            startMrid={startMrid}
+            startMrid={topologyStartMrid}
             onNodeClick={handleMapNodeClick}
             onTechnicianClick={selectTechnician}
             onViewportChange={handleMapViewportChange}
@@ -668,7 +869,7 @@ function GiopPortalInner() {
           focusCoordinates={focusCoordinates}
           stagingAssets={staging}
           mapRefreshToken={mapRefreshToken}
-          startMrid={startMrid}
+          startMrid={topologyStartMrid}
           onMapNodeClick={(mrid, coordinates) =>
             setSelection(mrid, { coordinates: coordinates ?? null, source: 'map' })
           }
@@ -734,14 +935,17 @@ function GiopPortalInner() {
       activeTab={route.tab}
       onTabChange={goToTab}
       isLightMode={isLightMode}
-      onToggleTheme={() => setIsLightMode((m) => !m)}
+      onThemeChange={setTheme}
       title={meta.title}
       subtitle={meta.subtitle}
       statusSlot={statusSlot}
       navGroups={navGroups}
       footerLink={{ href: 'http://localhost:8080', label: 'Legacy UI ↗' }}
     >
-      <GiopWorkspaceLayout sideOpen={sideMap.open} sidePanel={sideMapPanel}>
+      <GiopWorkspaceLayout
+        sideOpen={dqMapPinned || sideMap.open}
+        sidePanel={sideMapPanel}
+      >
         {tabContent}
       </GiopWorkspaceLayout>
       <EnhancedCopilotPanel

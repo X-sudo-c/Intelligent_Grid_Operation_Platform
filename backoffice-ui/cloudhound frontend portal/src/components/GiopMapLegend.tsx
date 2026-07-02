@@ -87,7 +87,7 @@ export function GiopMapLegend({
 
   const shell = isLightMode
     ? 'border-slate-200 bg-white/92 text-slate-700'
-    : 'border-slate-700 bg-slate-900/92 text-slate-200';
+    : 'border-premium-border/50 bg-premium-card/95 text-premium-text backdrop-blur-xl shadow-premium';
 
   useEffect(() => {
     setVisibility(createDefaultGiopLegendVisibility(groups));
@@ -137,7 +137,7 @@ export function GiopMapLegend({
                 className={`giop-map-legend-row flex w-full items-center gap-2 rounded px-1 py-1 text-left transition-colors ${
                   on ? 'giop-map-legend-row--on' : 'giop-map-legend-row--off'
                 } ${available ? '' : 'giop-map-legend-row--unavailable'} ${
-                  isLightMode ? 'hover:bg-slate-100' : 'hover:bg-slate-800/60'
+                  isLightMode ? 'hover:bg-slate-100' : 'hover:bg-premium-hover/60'
                 }`}
                 onDoubleClick={() => handleRowDoubleClick(group)}
                 title={

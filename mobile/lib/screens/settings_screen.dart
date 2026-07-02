@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../config/api_config.dart';
 import '../services/capture_preferences.dart';
+import '../services/field_user_preferences.dart';
 import '../services/giop_api.dart';
 import '../services/settings_service.dart';
 
@@ -32,12 +33,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String? _testResult;
   bool _testing = false;
   bool _enforceHex = true;
+  bool _headingUp = false;
+  bool _showWorkOrders = true;
+  bool _autoSync = true;
+  bool _showAssignments = true;
 
   @override
   void initState() {
     super.initState();
     CapturePreferences.enforceHexAssignment().then((v) {
       if (mounted) setState(() => _enforceHex = v);
+    });
+    FieldUserPreferences.headingUpDefault().then((v) {
+      if (mounted) setState(() => _headingUp = v);
+    });
+    FieldUserPreferences.showWorkOrdersOnMap().then((v) {
+      if (mounted) setState(() => _showWorkOrders = v);
+    });
+    FieldUserPreferences.autoSyncOnConnect().then((v) {
+      if (mounted) setState(() => _autoSync = v);
+    });
+    FieldUserPreferences.showAssignmentsDefault().then((v) {
+      if (mounted) setState(() => _showAssignments = v);
     });
     _syncController = TextEditingController(text: widget.config.syncBaseUrl);
     _ocrController = TextEditingController(text: widget.config.ocrBaseUrl);
@@ -51,12 +68,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   String _hostFromConfig(ApiConfig config) {
+    final syncHost = Uri.tryParse(config.syncBaseUrl)?.host;
+    if (syncHost != null &&
+        syncHost.isNotEmpty &&
+        syncHost != '10.0.2.2' &&
+        syncHost != '127.0.0.1' &&
+        syncHost != 'localhost') {
+      return syncHost;
+    }
     final uri = Uri.tryParse(config.supabaseUrl);
     final host = uri?.host;
-    if (host == null || host.isEmpty || host == '10.0.2.2' || host == '127.0.0.1') {
-      return '192.168.100.6';
+    if (host != null &&
+        host.isNotEmpty &&
+        host != '10.0.2.2' &&
+        host != '127.0.0.1') {
+      return host;
     }
-    return host;
+    return '';
   }
 
   @override
@@ -121,6 +149,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final config = _configFromForm();
     await _settings.save(config);
     widget.onSaved(config);
+    if (!mounted) return;
     setState(() => _message = 'Settings saved');
   }
 
@@ -153,6 +182,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   controller: _lanHostController,
                   decoration: const InputDecoration(
                     labelText: 'PC LAN IP (physical phone)',
+                    hintText: 'e.g. 197.255.75.211',
+                    helperText: 'Must match your dev PC IP on this Wi‑Fi',
                     border: OutlineInputBorder(),
                   ),
                   keyboardType: TextInputType.number,
@@ -244,7 +275,43 @@ class _SettingsScreenState extends State<SettingsScreen> {
             value: _enforceHex,
             onChanged: (v) async {
               await CapturePreferences.setEnforceHexAssignment(v);
-              setState(() => _enforceHex = v);
+              if (mounted) setState(() => _enforceHex = v);
+            },
+          ),
+          const Divider(height: 24),
+          const Text('Map & field', style: TextStyle(fontWeight: FontWeight.w600)),
+          SwitchListTile(
+            title: const Text('Heading-up by default'),
+            subtitle: const Text('Rotate map with device compass when GPS is on'),
+            value: _headingUp,
+            onChanged: (v) async {
+              await FieldUserPreferences.setHeadingUpDefault(v);
+              if (mounted) setState(() => _headingUp = v);
+            },
+          ),
+          SwitchListTile(
+            title: const Text('Show work orders on map'),
+            value: _showWorkOrders,
+            onChanged: (v) async {
+              await FieldUserPreferences.setShowWorkOrdersOnMap(v);
+              if (mounted) setState(() => _showWorkOrders = v);
+            },
+          ),
+          SwitchListTile(
+            title: const Text('Show assignment hexes'),
+            value: _showAssignments,
+            onChanged: (v) async {
+              await FieldUserPreferences.setShowAssignmentsDefault(v);
+              if (mounted) setState(() => _showAssignments = v);
+            },
+          ),
+          SwitchListTile(
+            title: const Text('Auto-sync when online'),
+            subtitle: const Text('Upload locally saved work when connection returns'),
+            value: _autoSync,
+            onChanged: (v) async {
+              await FieldUserPreferences.setAutoSyncOnConnect(v);
+              if (mounted) setState(() => _autoSync = v);
             },
           ),
           const SizedBox(height: 8),

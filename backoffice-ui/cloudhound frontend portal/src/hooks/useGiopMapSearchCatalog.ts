@@ -6,7 +6,7 @@ import {
   type GiopStagingAsset,
   type GiopWorkOrder,
 } from '../api/giop-api';
-import { buildLocalMapSearchCatalog } from '../lib/giopMapLocalSearch';
+import { buildOpsSearchCatalog } from '../lib/giopMapLocalSearch';
 
 let cachedPlaces: GiopMapSearchResult[] | null = null;
 let placesPromise: Promise<GiopMapSearchResult[]> | null = null;
@@ -33,7 +33,7 @@ export function useGiopMapSearchCatalog(options: {
   stagingAssets?: GiopStagingAsset[];
 }) {
   const [places, setPlaces] = useState<GiopMapSearchResult[]>(cachedPlaces ?? []);
-  const [placesReady, setPlacesReady] = useState(Boolean(cachedPlaces?.length));
+  const [placesReady, setPlacesReady] = useState(cachedPlaces !== null);
 
   useEffect(() => {
     let cancelled = false;
@@ -47,16 +47,15 @@ export function useGiopMapSearchCatalog(options: {
     };
   }, []);
 
-  const catalog = useMemo(
+  const opsCatalog = useMemo(
     () =>
-      buildLocalMapSearchCatalog({
-        places,
+      buildOpsSearchCatalog({
         workOrders: options.workOrders,
         fieldTechnicians: options.fieldTechnicians,
         stagingAssets: options.stagingAssets,
       }),
-    [places, options.workOrders, options.fieldTechnicians, options.stagingAssets],
+    [options.workOrders, options.fieldTechnicians, options.stagingAssets],
   );
 
-  return { catalog, placesReady };
+  return { placeCatalog: places, opsCatalog, placesReady };
 }

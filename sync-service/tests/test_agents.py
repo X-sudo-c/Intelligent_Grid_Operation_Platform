@@ -259,7 +259,7 @@ class SpatialTests(unittest.TestCase):
 
         where, params = _territory_where_clause(district="Accra", region=None)
         self.assertIn("ILIKE", where)
-        self.assertEqual(params, ["%Accra%", "%Accra%", "%Accra%"])
+        self.assertEqual(params, ["%Accra%"])
 
     def test_highlight_district_ui_action(self):
         from agents.llm import react
@@ -299,6 +299,198 @@ class VoiceSttTests(unittest.TestCase):
 
 
 class VoiceRouterTests(unittest.TestCase):
+    def test_normalize_akra_to_accra(self):
+        from agents.voice_normalize import normalize_transcript
+
+        text, meta = normalize_transcript("how many staging elements are in Akra")
+        self.assertIn("Accra", text)
+        self.assertNotIn("Akra", text)
+        self.assertTrue(meta.get("fixes"))
+
+    def test_highlight_accra_survives_boundary_warmup(self):
+        from agents import voice_stt
+        from agents.voice_normalize import normalize_transcript
+        from agents.voice_router import parse_intent
+        from agents.voice import run_voice_turn
+        from unittest.mock import MagicMock
+
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        cur.fetchall.return_value = [("Accra",), ("Koforidua",), ("Agona",), ("Bortianor",)]
+        voice_stt.warm_boundary_prompt(conn)
+
+        text, _ = normalize_transcript("highlight accra on the map")
+        self.assertIn("Accra", text)
+        self.assertNotIn("Koforidua", text)
+        intent = parse_intent(text, session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "highlight")
+
+    def test_parse_count_staging_elements_in_place(self):
+        from agents.voice_normalize import normalize_transcript
+        from agents.voice_router import parse_intent
+
+        text, _ = normalize_transcript("how many staging elements are in Akra")
+        intent = parse_intent(text, session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "count")
+        self.assertEqual(intent.tier, "staging")
+        self.assertEqual(intent.district, "accra")
+        self.assertFalse(intent.use_viewport)
+
+    def test_portal_nested_viewport_bbox(self):
+        from agents.portal_context import portal_viewport_bbox
+
+        bbox = portal_viewport_bbox(
+            {
+                "viewport": {
+                    "bbox": {
+                        "west": -0.3,
+                        "south": 5.5,
+                        "east": -0.1,
+                        "north": 5.7,
+                    },
+                    "zoom": 12,
+                    "center": {"lon": -0.2, "lat": 5.6},
+                }
+            }
+        )
+        self.assertEqual(bbox, {"west": -0.3, "south": 5.5, "east": -0.1, "north": 5.7})
+
+    def test_count_this_area_uses_selected_territory(self):
+        from agents.voice_router import execute_fast_path, parse_intent
+
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        cur.fetchall.return_value = [("connectivity_node", 4)]
+        cur.fetchone.return_value = (4,)
+
+        intent = parse_intent(
+            "how many staging elements are in this area",
+            session={},
+            context={},
+        )
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "count")
+        self.assertEqual(intent.tier, "staging")
+        self.assertTrue(intent.use_viewport)
+
+        result = execute_fast_path(
+            conn,
+            intent,
+            context={"selected_region": "Accra"},
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("4", result["content"])
+        self.assertIn("Accra", result["content"])
+
+    def test_parse_count_poles_in_viewport_with_question_mark(self):
+        from agents.voice_router import parse_intent
+
+        for text in (
+            "How many poles are in the current map view?",
+            "how many poles in this map view",
+            "count poles in the visible area",
+        ):
+            with self.subTest(text=text):
+                intent = parse_intent(text, session={}, context={})
+                self.assertIsNotNone(intent, text)
+                assert intent is not None
+                self.assertEqual(intent.kind, "count")
+                self.assertEqual(intent.asset_kind, "pole")
+                self.assertTrue(intent.use_viewport)
+
+    def test_count_viewport_uses_portal_bbox(self):
+        from agents.voice_router import execute_fast_path, parse_intent
+
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        cur.fetchall.return_value = [("pole_11kv", 12), ("pole_33kv", 3)]
+        cur.fetchone.return_value = (15,)
+
+        intent = parse_intent(
+            "How many poles are in the current map view?",
+            session={},
+            context={},
+        )
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertTrue(intent.use_viewport)
+
+        result = execute_fast_path(
+            conn,
+            intent,
+            context={
+                "viewport": {
+                    "bbox": {
+                        "west": -0.895,
+                        "south": 5.283,
+                        "east": 0.433,
+                        "north": 6.123,
+                    }
+                }
+            },
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(result.get("fast_path"))
+        self.assertIn("15", result["content"])
+        self.assertIn("this area", result["content"].lower())
+
+    def test_my_view_parses_as_viewport_count(self):
+        from agents.voice_router import parse_intent
+
+        for text in (
+            "how many staging captures are in my view",
+            "how many staging captures are in my view?",
+            "count staging captures in my area",
+        ):
+            with self.subTest(text=text):
+                intent = parse_intent(text, session={}, context={})
+                self.assertIsNotNone(intent)
+                assert intent is not None
+                self.assertEqual(intent.kind, "count")
+                self.assertEqual(intent.tier, "staging")
+                self.assertTrue(intent.use_viewport)
+                self.assertIsNone(intent.district)
+
+    def test_staging_count_speech_includes_distinct_locations(self):
+        from agents.voice_router import VoiceIntent, _format_count_speech
+
+        intent = VoiceIntent(kind="count", tier="staging")
+        msg = _format_count_speech(
+            {"total": 12, "distinct_locations": 5},
+            intent,
+            "this area",
+        )
+        self.assertIn("12", msg)
+        self.assertIn("5", msg)
+        self.assertIn("locations", msg)
+
+    def test_parse_count_staging_assets_in_viewport(self):
+        from agents.voice_router import parse_intent
+
+        intent = parse_intent(
+            "how many staging assets are in the current map view?",
+            session={},
+            context={},
+        )
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "count")
+        self.assertEqual(intent.tier, "staging")
+        self.assertTrue(intent.use_viewport)
+
     def test_parse_count_poles_in_district(self):
         from agents.voice_router import parse_intent
 
@@ -321,6 +513,27 @@ class VoiceRouterTests(unittest.TestCase):
         assert intent is not None
         self.assertEqual(intent.kind, "highlight")
 
+    def test_show_me_accra_parses_accra_not_me_accra(self):
+        from agents.voice_router import parse_intent
+
+        for text in ("show me accra", "Show me Accra", "show me Accra on the map"):
+            with self.subTest(text=text):
+                intent = parse_intent(text, session={}, context={})
+                self.assertIsNotNone(intent)
+                assert intent is not None
+                self.assertEqual(intent.kind, "highlight")
+                self.assertEqual(intent.district, "accra")
+                self.assertIsNone(intent.region)
+
+    def test_show_map_to_accra_parses_pan(self):
+        from agents.voice_router import parse_intent
+
+        intent = parse_intent("show me the map to Kumasi", session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "pan")
+        self.assertEqual(intent.district, "kumasi")
+
     def test_follow_up_and_in(self):
         from agents.voice_router import parse_intent
 
@@ -333,6 +546,32 @@ class VoiceRouterTests(unittest.TestCase):
         assert intent is not None
         self.assertEqual(intent.district, "kumasi")
         self.assertEqual(intent.asset_kind, "pole")
+
+
+class StewardChatTests(unittest.TestCase):
+    def test_typed_highlight_accra_skips_llm(self):
+        from unittest.mock import patch
+
+        from agents.llm.chat import run_steward_chat
+
+        conn = MagicMock()
+        fast = {
+            "content": "Highlighting Accra on the map.",
+            "ui_actions": [
+                {
+                    "type": "highlight_territory",
+                    "label": "Accra",
+                    "district": None,
+                    "region": "Accra",
+                    "bbox": {"west": -0.5, "south": 5.5, "east": 0.0, "north": 6.0},
+                }
+            ],
+        }
+        with patch("agents.llm.chat.try_copilot_fast_path", return_value=(MagicMock(kind="highlight"), fast)):
+            resp = run_steward_chat(conn, message="highlight accra on the map", context={})
+        self.assertTrue(resp.agent.get("fast_path"))
+        self.assertIn("Highlighting Accra", resp.content)
+        self.assertEqual(resp.ui_actions[0]["type"], "highlight_territory")
 
 
 class StagingReviewTests(unittest.TestCase):

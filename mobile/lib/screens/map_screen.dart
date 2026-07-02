@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter_compass/flutter_compass.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
@@ -20,20 +21,25 @@ import '../services/field_map_refresh_bus.dart';
 import '../services/field_location_service.dart';
 import '../services/giop_api.dart';
 import '../services/heading_fusion_service.dart';
+import '../services/navigation_camera.dart';
 import '../services/navigation_location_settings.dart';
 import '../services/offline_db.dart';
 import '../services/tile_cache_service.dart';
 import '../utils/geo.dart';
 import '../models/capture_prefill.dart';
 import '../services/capture_preferences.dart';
-import '../utils/polygon.dart';
+import '../services/connectivity_service.dart';
+import '../services/field_map_fly_bus.dart';
+import '../services/field_user_preferences.dart';
+import '../screens/sync_queue_screen.dart';
 import '../widgets/field_capture_sheet.dart';
+import '../widgets/field_search_sheet.dart';
 import '../widgets/giop_map_legend.dart';
 import '../widgets/layer_panel_sheet.dart';
 import '../widgets/map_crosshair.dart';
 import '../widgets/user_location_marker.dart';
 
-enum MapTool { pan, addPoint, drawSpan }
+enum MapTool { pan, addPoint, drawSpan, measure }
 
 class MapScreen extends StatefulWidget {
   const MapScreen({
@@ -53,7 +59,8 @@ class MapScreen extends StatefulWidget {
   State<MapScreen> createState() => _MapScreenState();
 }
 
-class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
+class _MapScreenState extends State<MapScreen>
+    with WidgetsBindingObserver, TickerProviderStateMixin {
   final MapController _mapController = MapController();
   final LayerVisibility _layerVisibility = LayerVisibility();
   final Distance _distance = const Distance();
@@ -66,26 +73,40 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   bool _loading = false;
   bool _usingCache = false;
   bool _followMe = true;
-  bool _headingUp = false;
+  bool _headingUp = true;
+  bool _userGesturing = false;
+  int _activeMapPointers = 0;
   bool _syncing = false;
   int _pendingCount = 0;
   MapTool _tool = MapTool.pan;
   String? _spanSourceMrid;
   List<StagingSpan> _stagingSpans = const [];
+  List<Map<String, dynamic>> _workOrders = const [];
+  bool _showWorkOrders = true;
+  bool _isOnline = true;
+  bool _serverReachable = false;
+  bool _linkUp = true;
+  List<LatLng> _measurePoints = const [];
+  LatLng? _stakeoutTarget;
+  String? _stakeoutLabel;
   CapturePrefill? _pendingPrefill;
   Position? _position;
   double? _heading;
   double _headingConfidence = 0;
   double _mapRotationDeg = 0;
   final HeadingFusionService _headingFusion = HeadingFusionService();
+  final NavigationCamera _navigationCamera = NavigationCamera();
   final DisplayLocation _displayLocation = DisplayLocation();
   StreamSubscription<Position>? _positionSub;
   StreamSubscription<CompassEvent>? _compassSub;
   StreamSubscription<MapEvent>? _mapEventSub;
-  Timer? _displayTimer;
+  Ticker? _cameraTicker;
+  Duration? _lastCameraElapsed;
+  AnimationController? _toolCameraAnim;
+  DateTime? _lastStatusBarHeadingUpdate;
   late final CaptureService _captureService;
   late final TileCacheService _tileCacheService;
-  late final FieldLocationService _fieldLocationService;
+  late FieldLocationService _fieldLocationService;
   static const _nodesRefetchMeters = 400.0;
 
   // --- H3 node streaming -----------------------------------------------------
@@ -118,16 +139,27 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   bool _hasFittedToGrid = false;
   Future<void>? _nodesLoadFuture;
   StreamSubscription<FieldMapDeltaRequest>? _mapDeltaSub;
+  StreamSubscription<FieldMapFlyRequest>? _flySub;
+  StreamSubscription<bool>? _connectivitySub;
+  StreamSubscription<bool>? _linkSub;
 
   static const _defaultCenter = LatLng(5.6037, -0.1870);
   static const _snapMeters = 15.0;
   static const _identifyMeters = 30.0;
   static const _minZoom = 11.0;
   static const _maxZoom = 19.0;
+  static const _followPanThresholdM = 3.0;
+  static const _navPanThresholdM = 1.2;
+  static const _addModeZoom = 17.0;
+  static const _addModeFlyDuration = Duration(milliseconds: 550);
 
   bool get _hasValidPosition =>
       _position != null &&
       isFiniteLatLng(_position!.latitude, _position!.longitude);
+
+  /// Uber/Bolt-style navigation: follow GPS + rotate map, puck fixed on screen.
+  bool get _navigationMode =>
+      _followMe && _headingUp && _tool == MapTool.pan;
 
   double _safeZoom([double? zoom]) {
     final z = zoom ?? _mapController.camera.zoom;
@@ -135,7 +167,119 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     return z.clamp(_minZoom, _maxZoom);
   }
 
+  /// Vsync camera loop — navigation bearing smoothing + follow.
+  void _onCameraTick(Duration elapsed) {
+    if (!_hasValidPosition || !mounted) return;
+
+    final dtSeconds = _lastCameraElapsed == null
+        ? 1 / 60.0
+        : (elapsed - _lastCameraElapsed!).inMicroseconds / 1e6;
+    _lastCameraElapsed = elapsed;
+
+    _displayLocation.setGpsTarget(
+      LatLng(_position!.latitude, _position!.longitude),
+      speedMps: _position!.speed,
+      courseDeg: _headingFusion.heading ?? _position!.heading,
+    );
+    final moved = _displayLocation.tick();
+
+    if (_navigationMode && !_userGesturing) {
+      final bearing = _headingFusion.heading;
+      if (bearing != null) {
+        _navigationCamera.setBearingTarget(bearing);
+        _navigationCamera.tick(dtSeconds: dtSeconds);
+        _applyNavigationCameraFrame();
+      }
+      final now = DateTime.now();
+      if (_lastStatusBarHeadingUpdate == null ||
+          now.difference(_lastStatusBarHeadingUpdate!) >
+              const Duration(milliseconds: 250)) {
+        _lastStatusBarHeadingUpdate = now;
+        setState(() {
+          _heading = _headingFusion.heading;
+          _headingConfidence = _headingFusion.confidence;
+          _mapRotationDeg =
+              _navigationCamera.displayRotationDeg ?? _mapRotationDeg;
+        });
+      }
+    } else {
+      if (_followMe && _tool == MapTool.pan && !_userGesturing) {
+        _applyFollowCamera(center: _displayLocation.point);
+      }
+      if (moved) setState(() {});
+    }
+  }
+
+  /// Apply smoothed navigation rotation + center (no feedback from camera.rotation).
+  void _applyNavigationCameraFrame({double? zoom, bool snap = false}) {
+    if (!_hasValidPosition || !_navigationMode || _userGesturing) return;
+
+    if (snap) {
+      final bearing = _headingFusion.heading;
+      if (bearing != null) {
+        _navigationCamera.setBearingTarget(bearing);
+        _navigationCamera.snapToTarget();
+      }
+    }
+
+    final rotation = _navigationCamera.displayRotationDeg;
+    if (rotation == null || !rotation.isFinite) return;
+
+    final mapCenter = _displayLocation.point ??
+        LatLng(_position!.latitude, _position!.longitude);
+    if (!isValidLatLng(mapCenter)) return;
+
+    final current = _mapController.camera.center;
+    final movedM = isValidLatLng(current)
+        ? _distance.as(LengthUnit.Meter, current, mapCenter)
+        : double.infinity;
+    final speed = _position?.speed ?? 0;
+    final panThreshold = speed > 1.2 ? 0.6 : _navPanThresholdM;
+    final shouldMove = snap || movedM >= panThreshold;
+
+    _programmaticCamera = true;
+    try {
+      final z = _safeZoom(zoom);
+      if (shouldMove) {
+        _mapController.moveAndRotate(mapCenter, z, rotation);
+      } else {
+        _mapController.rotate(rotation);
+      }
+    } finally {
+      _programmaticCamera = false;
+    }
+  }
+
+  void _cancelToolCameraAnim() {
+    final anim = _toolCameraAnim;
+    if (anim == null) return;
+    _toolCameraAnim = null;
+    anim.stop();
+    anim.dispose();
+    _programmaticCamera = false;
+  }
+
+  void _onMapPointerDown(PointerDownEvent event) {
+    _cancelToolCameraAnim();
+    _activeMapPointers++;
+    if (_activeMapPointers == 1) {
+      _userGesturing = true;
+    }
+  }
+
+  void _onMapPointerUp(PointerEvent event) {
+    _activeMapPointers = math.max(0, _activeMapPointers - 1);
+    if (_activeMapPointers == 0) {
+      // Let fling / inertia finish before resuming follow camera.
+      Future<void>.delayed(const Duration(milliseconds: 120), () {
+        if (!mounted || _activeMapPointers > 0) return;
+        _userGesturing = false;
+      });
+    }
+  }
+
   void _recoverMapCameraIfNeeded() {
+    if (_userGesturing) return;
     final center = _mapController.camera.center;
     if (isValidLatLng(center)) return;
     final fallback = latLngIfValid(_position?.latitude, _position?.longitude) ??
@@ -158,19 +302,8 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     _tileCacheService = TileCacheService(widget.api.config);
     _mapEventSub = _mapController.mapEventStream.listen(_onMapUserEvent);
     _headingFusion.start();
-    _displayTimer = Timer.periodic(const Duration(milliseconds: 50), (_) {
-      if (!_hasValidPosition || !mounted) return;
-      _displayLocation.setGpsTarget(
-        LatLng(_position!.latitude, _position!.longitude),
-        speedMps: _position!.speed,
-        courseDeg: _headingFusion.heading ?? _position!.heading,
-      );
-      final moved = _displayLocation.tick();
-      if (_followMe && _tool == MapTool.pan) {
-        _applyFollowCamera(center: _displayLocation.point);
-      }
-      if (moved) setState(() {});
-    });
+    _headingFusion.setNavigationMode(true);
+    _cameraTicker = createTicker(_onCameraTick)..start();
     _loadNodesFromCache();
     _scheduleGpsFallbackLoad();
     _probeMartinGrid();
@@ -187,7 +320,74 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     _mapDeltaSub = FieldMapRefreshBus.instance.stream.listen((request) {
       unawaited(_refreshH3Delta(request));
     });
+    _flySub = FieldMapFlyBus.instance.stream.listen((request) {
+      _programmaticCamera = true;
+      try {
+        _mapController.move(
+          LatLng(request.latitude, request.longitude),
+          request.zoom.clamp(_minZoom, _maxZoom),
+        );
+        setState(() {
+          _followMe = false;
+          _stakeoutTarget = LatLng(request.latitude, request.longitude);
+          _stakeoutLabel = request.label;
+        });
+      } finally {
+        _programmaticCamera = false;
+      }
+    });
+    unawaited(_bootstrapFieldPrefs());
+    unawaited(_loadWorkOrders());
+    void syncConnectivityState() {
+      if (!mounted) return;
+      setState(() {
+        _linkUp = ConnectivityService.instance.lastLinkUp;
+        _serverReachable = ConnectivityService.instance.lastApiReachable;
+        _isOnline = ConnectivityService.instance.lastOnline;
+      });
+    }
+
+    unawaited(ConnectivityService.instance.start(
+      syncBaseUrl: widget.api.config.syncBaseUrl,
+    ));
+    syncConnectivityState();
+    _linkSub = ConnectivityService.instance.linkStream.listen((_) {
+      syncConnectivityState();
+      if (ConnectivityService.instance.lastOnline) {
+        final prefs = FieldUserPreferences.autoSyncOnConnect();
+        prefs.then((auto) {
+          if (auto && mounted) _syncPending();
+        });
+      }
+    });
+    _connectivitySub = ConnectivityService.instance.apiReachableStream.listen((_) {
+      syncConnectivityState();
+      if (ConnectivityService.instance.lastOnline) {
+        final prefs = FieldUserPreferences.autoSyncOnConnect();
+        prefs.then((auto) {
+          if (auto && mounted) _syncPending();
+        });
+      }
+    });
     unawaited(_loadStagingSpans());
+  }
+
+  Future<void> _bootstrapFieldPrefs() async {
+    final showWo = await FieldUserPreferences.showWorkOrdersOnMap();
+    final showAssign = await FieldUserPreferences.showAssignmentsDefault();
+    if (!mounted) return;
+    setState(() {
+      _showWorkOrders = showWo;
+      _showAssignments = showAssign;
+    });
+  }
+
+  Future<void> _loadWorkOrders() async {
+    try {
+      await widget.api.syncWorkOrders();
+    } catch (_) {}
+    final rows = await OfflineDb.listWorkOrders();
+    if (mounted) setState(() => _workOrders = rows);
   }
 
   Future<void> _loadStagingSpans() async {
@@ -256,6 +456,9 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       unawaited(_loadAssignments(force: true));
+      if (_position != null) {
+        unawaited(_fieldLocationService.reportNow(_position!));
+      }
     }
   }
 
@@ -299,6 +502,8 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     if (oldWidget.api.config.martinBaseUrl != widget.api.config.martinBaseUrl ||
         oldWidget.api.config.syncBaseUrl != widget.api.config.syncBaseUrl ||
         oldWidget.api.config.technicianId != widget.api.config.technicianId) {
+      ConnectivityService.instance.configureSyncProbe(widget.api.config.syncBaseUrl);
+      _fieldLocationService = FieldLocationService(widget.api);
       _martinGridLatched = false;
       _probeMartinGrid();
       _loadNodes(anchor: _defaultCenter);
@@ -330,13 +535,17 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _assignmentsPollTimer?.cancel();
-    _displayTimer?.cancel();
+    _cameraTicker?.dispose();
     _gpsFallbackTimer?.cancel();
     _headingFusion.dispose();
     _positionSub?.cancel();
     _compassSub?.cancel();
     _mapEventSub?.cancel();
     _mapDeltaSub?.cancel();
+    _flySub?.cancel();
+    _connectivitySub?.cancel();
+    _linkSub?.cancel();
+    _cancelToolCameraAnim();
     _mapController.dispose();
     super.dispose();
   }
@@ -433,14 +642,16 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _refreshPendingCount() async {
-    final captures = await OfflineDb.pendingCaptures();
-    final bills = await OfflineDb.pendingSpotBills();
-    if (mounted) setState(() => _pendingCount = captures.length + bills.length);
+    final items = await OfflineDb.listSyncQueueItems();
+    if (mounted) {
+      setState(() => _pendingCount = items.where((i) => i.isPending).length);
+    }
   }
 
   Future<void> _syncPending() async {
     setState(() => _syncing = true);
     await _captureService.syncAllPending();
+    await _loadWorkOrders();
     await _refreshPendingCount();
     if (mounted) setState(() => _syncing = false);
   }
@@ -455,9 +666,10 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         final mrid = row['mrid'] as String?;
         if (mrid != null && seen.contains(mrid)) continue;
         final localId = row['id'] as int;
+        final displayMrid = mrid ?? 'local:$localId';
         merged.add(
           AssetNode(
-            mrid: mrid ?? 'local-$localId',
+            mrid: displayMrid,
             name: row['name'] as String,
             validation: 'PENDING_FIELD',
             latitude: (row['latitude'] as num).toDouble(),
@@ -465,9 +677,12 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
             tier: 'staging',
             layer: MapNodeLayer.queuedLocal,
             assetKind: assetKindFromString(row['asset_kind'] as String?),
+            boundaryFeederId: row['boundary_feeder_id'] as String?,
+            operatingUtility: row['operating_utility'] as String?,
+            substationName: row['substation_name'] as String?,
           ),
         );
-        seen.add(mrid ?? 'local-$localId');
+        seen.add(displayMrid);
       }
     } catch (_) {
       // ignore corrupt local queue
@@ -530,6 +745,23 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     );
   }
 
+  void _applyGpsPosition(Position pos) {
+    if (!mounted || !isFiniteLatLng(pos.latitude, pos.longitude)) return;
+    _gpsFixAt = DateTime.now();
+    _gpsFallbackTimer?.cancel();
+    setState(() => _position = pos);
+    _displayLocation.snapTo(pos.latitude, pos.longitude);
+    _displayLocation.setGpsTarget(
+      LatLng(pos.latitude, pos.longitude),
+      speedMps: pos.speed,
+      courseDeg: pos.heading,
+    );
+    _headingFusion.penalizeForPoorAccuracy(pos.accuracy);
+    if (_followMe) {
+      unawaited(_activateFollowMe());
+    }
+  }
+
   Future<void> _startGps() async {
     try {
       var permission = await Geolocator.checkPermission();
@@ -538,7 +770,20 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       }
       if (permission == LocationPermission.denied ||
           permission == LocationPermission.deniedForever) {
+        agentLog(
+          location: 'map_screen.dart:_startGps',
+          message: 'location permission denied',
+          hypothesisId: 'H-field',
+          runId: 'field-1',
+          data: {'permission': permission.toString()},
+        );
         return;
+      }
+
+      final lastKnown = await Geolocator.getLastKnownPosition();
+      if (lastKnown != null &&
+          isFiniteLatLng(lastKnown.latitude, lastKnown.longitude)) {
+        _applyGpsPosition(lastKnown);
       }
 
       final current = await Geolocator.getCurrentPosition(
@@ -546,19 +791,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       );
       if (!mounted) return;
       if (!isFiniteLatLng(current.latitude, current.longitude)) return;
-      _gpsFixAt = DateTime.now();
-      _gpsFallbackTimer?.cancel();
-      setState(() => _position = current);
-      _displayLocation.snapTo(current.latitude, current.longitude);
-      _displayLocation.setGpsTarget(
-        LatLng(current.latitude, current.longitude),
-        speedMps: current.speed,
-        courseDeg: current.heading,
-      );
-      _headingFusion.penalizeForPoorAccuracy(current.accuracy);
-      if (_followMe) {
-        _applyFollowCamera(zoom: 16);
-      }
+      _applyGpsPosition(current);
       agentLog(
         location: 'map_screen.dart:_startGps',
         message: 'gps first fix',
@@ -570,6 +803,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
           'accuracyM': current.accuracy,
         },
       );
+      unawaited(_fieldLocationService.reportNow(current));
       _reloadNodesAtUser(LatLng(current.latitude, current.longitude));
 
       _positionSub = Geolocator.getPositionStream(
@@ -588,71 +822,76 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
           speedMps: pos.speed,
           courseDeg: _headingFusion.heading ?? pos.heading,
         );
-        setState(() {
-          _position = pos;
-          _heading = _headingFusion.heading;
-          _headingConfidence = _headingFusion.confidence;
-        });
+        _position = pos;
+        if (!_navigationMode) {
+          setState(() {
+            _heading = _headingFusion.heading;
+            _headingConfidence = _headingFusion.confidence;
+          });
+        }
         _maybeReloadNodesNear(pos);
         void reportLocation() => _fieldLocationService.maybeReport(pos);
         reportLocation();
         // Camera smoothing handled by 60fps display timer.
       });
-    } catch (_) {}
+    } catch (e) {
+      agentLog(
+        location: 'map_screen.dart:_startGps',
+        message: 'gps start failed',
+        hypothesisId: 'H-field',
+        runId: 'field-1',
+        data: {'error': e.toString()},
+      );
+    }
   }
 
   void _startCompass() {
     _compassSub = FlutterCompass.events?.listen((event) {
-      if (!mounted || event.heading == null || !event.heading!.isFinite) return;
+      final raw = event.heading;
+      if (!mounted || raw == null || !raw.isFinite) return;
       final speed = _position?.speed ?? 0;
-      if (speed < 1.5) {
-        _headingFusion.updateCompass(event.heading);
+      if (!_navigationMode && speed >= 2.5) return;
+
+      if (_navigationMode) {
+        _headingFusion.updateNavigationBearing(raw);
+      } else {
+        _headingFusion.updateCompass(raw);
         setState(() {
           _heading = _headingFusion.heading;
           _headingConfidence = _headingFusion.confidence;
         });
-        if (_followMe && _headingUp && _tool == MapTool.pan) {
-          _applyFollowCamera(rotateOnly: true);
-        }
       }
     });
   }
 
   void _applyFollowCamera({
     double? zoom,
-    bool rotateOnly = false,
     LatLng? center,
   }) {
     if (!_hasValidPosition || !_followMe || _tool != MapTool.pan) return;
-    if (_displayTimer?.isActive != true) return;
+    if (_userGesturing || _navigationMode) return;
+
     final mapCenter = center ??
         _displayLocation.point ??
         LatLng(_position!.latitude, _position!.longitude);
     if (!isValidLatLng(mapCenter)) return;
+
     final current = _mapController.camera.center;
-    final movedM = _distance.as(LengthUnit.Meter, current, mapCenter);
-    if (movedM < 1.5) return;
+    final movedM = isValidLatLng(current)
+        ? _distance.as(LengthUnit.Meter, current, mapCenter)
+        : double.infinity;
+    if (movedM < _followPanThresholdM) return;
 
     _programmaticCamera = true;
     try {
-      if (!rotateOnly) {
-        _mapController.move(
-          mapCenter,
-          _safeZoom(zoom),
-        );
-      }
-      if (_headingUp && _heading != null && _heading!.isFinite) {
-        // Heading-up mode: rotate map opposite to bearing so user-facing
-        // direction stays at the top, as in navigation apps.
-        _mapController.rotate(-_heading!);
-      }
-      _syncMapRotation();
+      _mapController.move(mapCenter, _safeZoom(zoom));
     } finally {
       _programmaticCamera = false;
     }
   }
 
   void _syncMapRotation() {
+    if (_navigationMode) return;
     final r = _mapController.camera.rotation;
     if (!r.isFinite) {
       _programmaticCamera = true;
@@ -679,17 +918,35 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
             event is MapEventScrollWheelZoom ||
             event is MapEventDoubleTapZoomStart ||
             event is MapEventFlingAnimationStart ||
+            event.source == MapEventSource.dragStart ||
             event.source == MapEventSource.onDrag ||
+            event.source == MapEventSource.multiFingerGestureStart ||
             event.source == MapEventSource.onMultiFinger ||
             event.source == MapEventSource.scrollWheel ||
             event.source == MapEventSource.doubleTapZoomAnimationController;
 
         if (userMovedMap) {
+          _userGesturing = true;
           final isRotate = event is MapEventRotateStart ||
-              event.source == MapEventSource.onMultiFinger;
+              event.source == MapEventSource.onMultiFinger ||
+              event.source == MapEventSource.multiFingerGestureStart;
           _exitFollowMode(keepRotation: isRotate);
         }
       }
+    }
+
+    if (event is MapEventMoveEnd ||
+        event is MapEventFlingAnimationEnd ||
+        event is MapEventRotateEnd ||
+        event.source == MapEventSource.dragEnd ||
+        event.source == MapEventSource.multiFingerEnd) {
+      if (_activeMapPointers == 0) {
+        _userGesturing = false;
+      }
+      Future<void>.delayed(const Duration(milliseconds: 150), () {
+        if (!mounted || _activeMapPointers > 0) return;
+        _userGesturing = false;
+      });
     }
 
     if (event is MapEventRotate ||
@@ -698,8 +955,12 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         event is MapEventMoveEnd ||
         event is MapEventFlingAnimation ||
         event is MapEventScrollWheelZoom) {
-      _recoverMapCameraIfNeeded();
-      _syncMapRotation();
+      if (!_navigationMode && !_programmaticCamera) {
+        _recoverMapCameraIfNeeded();
+      }
+      if (!_navigationMode) {
+        _syncMapRotation();
+      }
     }
 
     if (event is MapEventMoveEnd || event is MapEventFlingAnimationEnd) {
@@ -758,6 +1019,8 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   /// Stop map follow/rotation; keep map position, show heading wedge only.
   void _exitFollowMode({bool keepRotation = false}) {
     if (!_followMe && !_headingUp) return;
+    _headingFusion.setNavigationMode(false);
+    _navigationCamera.reset();
     setState(() {
       _followMe = false;
       _headingUp = false;
@@ -773,6 +1036,8 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   }
 
   void _resetMapNorth() {
+    _headingFusion.setNavigationMode(false);
+    _navigationCamera.reset();
     setState(() => _headingUp = false);
     _programmaticCamera = true;
     try {
@@ -1049,33 +1314,133 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     }
   }
 
+  void _animateCameraTo({
+    required LatLng center,
+    required double zoom,
+    double rotationDeg = 0,
+    Duration duration = _addModeFlyDuration,
+  }) {
+    _toolCameraAnim?.stop();
+    _toolCameraAnim?.dispose();
+
+    final camera = _mapController.camera;
+    final targetZoom = _safeZoom(zoom);
+    final startRot = camera.rotation;
+    if (!isValidLatLng(center)) return;
+
+    final distM = isValidLatLng(camera.center)
+        ? _distance.as(LengthUnit.Meter, camera.center, center)
+        : double.infinity;
+    final zoomDelta = (targetZoom - camera.zoom).abs();
+    final rotDelta = (startRot - rotationDeg).abs();
+    if (distM < 8 && zoomDelta < 0.15 && rotDelta < 0.5) {
+      _programmaticCamera = true;
+      try {
+        _mapController.moveAndRotate(center, targetZoom, rotationDeg);
+        _mapRotationDeg = rotationDeg;
+      } finally {
+        _programmaticCamera = false;
+      }
+      return;
+    }
+
+    final controller = AnimationController(duration: duration, vsync: this);
+    _toolCameraAnim = controller;
+    final animation = CurvedAnimation(parent: controller, curve: Curves.easeInOutCubic);
+
+    final latTween = Tween<double>(
+      begin: camera.center.latitude,
+      end: center.latitude,
+    );
+    final lngTween = Tween<double>(
+      begin: camera.center.longitude,
+      end: center.longitude,
+    );
+    final zoomTween = Tween<double>(begin: camera.zoom, end: targetZoom);
+    final rotTween = Tween<double>(begin: startRot, end: rotationDeg);
+
+    _programmaticCamera = true;
+    controller.addListener(() {
+      if (!mounted) return;
+      _mapController.moveAndRotate(
+        LatLng(latTween.evaluate(animation), lngTween.evaluate(animation)),
+        zoomTween.evaluate(animation),
+        rotTween.evaluate(animation),
+      );
+      _mapRotationDeg = rotTween.evaluate(animation);
+    });
+    controller.addStatusListener((status) {
+      if (status == AnimationStatus.completed ||
+          status == AnimationStatus.dismissed) {
+        _programmaticCamera = false;
+        controller.dispose();
+        if (_toolCameraAnim == controller) _toolCameraAnim = null;
+      }
+    });
+    _toolCameraAnim = controller;
+    controller.forward();
+  }
+
   void _setTool(MapTool tool) {
     setState(() {
       _tool = tool;
       if (tool != MapTool.drawSpan) _spanSourceMrid = null;
+      if (tool != MapTool.measure) _measurePoints = const [];
       if (tool == MapTool.addPoint) {
         _followMe = false;
         _headingUp = false;
+        _headingFusion.setNavigationMode(false);
       }
     });
     if (tool == MapTool.addPoint) {
-      _programmaticCamera = true;
-      try {
-        _mapController.rotate(0);
-        _mapRotationDeg = 0;
-      } finally {
-        _programmaticCamera = false;
+      if (_hasValidPosition) {
+        final target = _displayLocation.point ??
+            LatLng(_position!.latitude, _position!.longitude);
+        _animateCameraTo(
+          center: target,
+          zoom: _addModeZoom,
+          rotationDeg: 0,
+        );
+      } else {
+        _animateCameraTo(
+          center: _mapController.camera.center,
+          zoom: _safeZoom(_addModeZoom),
+          rotationDeg: 0,
+        );
       }
+    } else {
+      _cancelToolCameraAnim();
     }
   }
 
   void _centerOnMe() {
     if (!_hasValidPosition) return;
+    if (_navigationMode) {
+      setState(() {
+        _followMe = false;
+        _headingUp = false;
+      });
+      _headingFusion.setNavigationMode(false);
+      _resetMapNorth();
+      return;
+    }
+    unawaited(_activateFollowMe());
+  }
+
+  Future<void> _activateFollowMe() async {
+    if (!mounted || !_hasValidPosition) return;
     setState(() {
       _followMe = true;
       _headingUp = true;
+      _userGesturing = false;
     });
-    _applyFollowCamera(zoom: 17);
+    _headingFusion.setNavigationMode(true);
+    final bearing = _headingFusion.heading;
+    if (bearing != null) {
+      _navigationCamera.setBearingTarget(bearing);
+      _navigationCamera.snapToTarget();
+    }
+    _applyNavigationCameraFrame(zoom: 17, snap: true);
   }
 
   LatLng get _mapCenter {
@@ -1087,11 +1452,13 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
 
   Future<(LatLng point, String? snappedName)> _resolvePlacement(LatLng raw) async {
     try {
-      final snap = await widget.api.fetchSnapPoint(
-        latitude: raw.latitude,
-        longitude: raw.longitude,
-        snapM: _snapMeters,
-      );
+      final snap = await widget.api
+          .fetchSnapPoint(
+            latitude: raw.latitude,
+            longitude: raw.longitude,
+            snapM: _snapMeters,
+          )
+          .timeout(const Duration(milliseconds: 1500));
       if (snap.snapped) {
         return (
           LatLng(snap.latitude, snap.longitude),
@@ -1099,7 +1466,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         );
       }
     } catch (_) {
-      // fall back to local node snap
+      // offline or slow — local snap
     }
     final (placed, snappedName) = _placementPoint(raw);
     return (placed, snappedName);
@@ -1145,6 +1512,10 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
 
   void _onMapTap(TapPosition tap, LatLng point) {
     if (!isValidLatLng(point)) return;
+    if (_tool == MapTool.measure) {
+      setState(() => _measurePoints = [..._measurePoints, point]);
+      return;
+    }
     if (_tool == MapTool.addPoint) {
       _openCaptureForm(point);
       return;
@@ -1198,10 +1569,20 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       _highlightLines = const [];
     });
 
-    final cached = await OfflineDb.getCachedNodeTopology(node.mrid);
+    final isLocal = node.isLocalQueued;
+    final localCapture = isLocal
+        ? await OfflineDb.getPendingCaptureByMrid(node.mrid)
+        : null;
+
+    final cached = isLocal
+        ? null
+        : await OfflineDb.getCachedNodeTopology(node.mrid);
+    if (!mounted) return;
     late final Future<Map<String, dynamic>?> topologyFuture;
 
-    if (cached != null) {
+    if (isLocal) {
+      topologyFuture = Future.value(null);
+    } else if (cached != null) {
       setState(
         () => _highlightLines = highlightLinesFromTopology(
           cached,
@@ -1211,7 +1592,6 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       );
       topologyFuture = Future.value(cached);
     } else {
-      // Draw lines as soon as the network response arrives (sheet already open).
       topologyFuture = widget.api.fetchNodeConnections(node.mrid);
       unawaited(
         topologyFuture.then((topology) {
@@ -1223,11 +1603,8 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
               neighborPositionsByMrid: _neighborPositionIndex,
             ),
           );
-        }).catchError((Object err) {
-          if (!mounted) return;
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(err.toString())),
-          );
+        }).catchError((Object _) {
+          // Network errors are shown in the sheet only for server-backed nodes.
         }),
       );
     }
@@ -1240,6 +1617,15 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       builder: (ctx) => _NodeDetailSheet(
         node: node,
         topologyFuture: topologyFuture,
+        localCapture: localCapture,
+        onNavigate: () {
+          Navigator.pop(ctx);
+          setState(() {
+            _stakeoutTarget = origin;
+            _stakeoutLabel = node.name;
+            _followMe = true;
+          });
+        },
       ),
     );
   }
@@ -1268,7 +1654,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
             color: fill,
             shape: BoxShape.circle,
             border: Border.all(
-              color: selected ? Colors.black : Colors.white,
+              color: selected ? GiopSldColors.lv : Colors.white,
               width: selected ? 1.5 : 0.75,
             ),
           ),
@@ -1293,7 +1679,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
               color: Colors.white.withValues(alpha: 0.94),
               shape: BoxShape.circle,
               border: Border.all(
-                color: selected ? Colors.black : color.withValues(alpha: 0.9),
+                color: selected ? GiopSldColors.lv : color.withValues(alpha: 0.9),
                 width: selected ? 2 : 1,
               ),
               boxShadow: const [
@@ -1332,7 +1718,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
 
   Future<void> _submitSpan(String sourceId, String targetId) async {
     final workOrderId = await CapturePreferences.activeWorkOrderId();
-    final ok = await _captureService.submitSpan(
+    await _captureService.submitSpan(
       sourceNodeId: sourceId,
       targetNodeId: targetId,
       workOrderId: workOrderId,
@@ -1344,10 +1730,9 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       _selectedNodeMrid = null;
     });
     await _loadStagingSpans();
+    unawaited(_captureService.syncAllPending());
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(ok ? 'Span saved to staging' : 'Span queued offline'),
-      ),
+      const SnackBar(content: Text('Span saved')),
     );
   }
 
@@ -1373,19 +1758,20 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     );
     if (result != null && mounted) {
       await _refreshPendingCount();
+      if (!mounted) return;
+      unawaited(_rebuildNodesFromCellCache());
       unawaited(_loadStagingSpans());
-      unawaited(
-        _refreshH3Delta(
-          FieldMapDeltaRequest(
-            latitude: placed.latitude,
-            longitude: placed.longitude,
-            ringK: _h3RingK,
-          ),
-        ),
-      );
-      if (result.synced) {
+      unawaited(_captureService.syncAllPending());
+      if (result.saved) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Saved — ${result.mrid}')),
+          SnackBar(
+            content: Text(
+              result.synced
+                  ? 'Saved — ${result.mrid}'
+                  : 'Saved — ${result.mrid ?? 'pending sync'}',
+            ),
+            duration: const Duration(seconds: 2),
+          ),
         );
       }
       setState(() => _tool = MapTool.pan);
@@ -1433,6 +1819,20 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
           visibility: _layerVisibility,
           pendingCount: _pendingCount,
           syncing: _syncing,
+          showWorkOrders: _showWorkOrders,
+          onShowWorkOrdersChanged: (v) {
+            setState(() => _showWorkOrders = v);
+            FieldUserPreferences.setShowWorkOrdersOnMap(v);
+            setSheetState(() {});
+          },
+          onOpenSyncQueue: () {
+            Navigator.pop(ctx);
+            Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => SyncQueueScreen(api: widget.api),
+              ),
+            );
+          },
           onSync: () {
             Navigator.pop(ctx);
             _syncPending();
@@ -1446,6 +1846,58 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     );
   }
 
+  double? get _measureTotalMeters {
+    if (_measurePoints.length < 2) return null;
+    var total = 0.0;
+    for (var i = 1; i < _measurePoints.length; i++) {
+      total += _distance.as(
+        LengthUnit.Meter,
+        _measurePoints[i - 1],
+        _measurePoints[i],
+      );
+    }
+    return total;
+  }
+
+  double? get _stakeoutDistanceM {
+    if (_stakeoutTarget == null || !_hasValidPosition) return null;
+    return _distance.as(
+      LengthUnit.Meter,
+      LatLng(_position!.latitude, _position!.longitude),
+      _stakeoutTarget!,
+    );
+  }
+
+  List<Marker> get _workOrderMarkers {
+    if (!_showWorkOrders) return const [];
+    final markers = <Marker>[];
+    for (final wo in _workOrders) {
+      final lat = (wo['latitude'] as num?)?.toDouble();
+      final lon = (wo['longitude'] as num?)?.toDouble();
+      if (lat == null || lon == null || !lat.isFinite || !lon.isFinite) continue;
+      final ref = wo['reference'] as String? ?? wo['id'] as String? ?? 'WO';
+      markers.add(
+        Marker(
+          point: LatLng(lat, lon),
+          width: 34,
+          height: 34,
+          child: Tooltip(
+            message: ref,
+            child: Container(
+              decoration: BoxDecoration(
+                color: Colors.indigo.shade600,
+                shape: BoxShape.circle,
+                border: Border.all(color: Colors.white, width: 1.5),
+              ),
+              child: const Icon(Icons.assignment, color: Colors.white, size: 18),
+            ),
+          ),
+        ),
+      );
+    }
+    return markers;
+  }
+
   @override
   Widget build(BuildContext context) {
     final initialCenter =
@@ -1455,22 +1907,32 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         latLngIfValid(_position?.latitude, _position?.longitude);
 
     return Scaffold(
+      backgroundColor: GiopSldColors.mapBackground,
       body: Stack(
         children: [
-          FlutterMap(
+          Listener(
+            onPointerDown: _onMapPointerDown,
+            onPointerUp: _onMapPointerUp,
+            onPointerCancel: _onMapPointerUp,
+            child: FlutterMap(
             mapController: _mapController,
             options: MapOptions(
               initialCenter: initialCenter,
               initialZoom: 16,
               minZoom: _minZoom,
               maxZoom: _maxZoom,
+              backgroundColor: GiopSldColors.mapBackground,
               onTap: _onMapTap,
             ),
             children: [
               TileLayer(
                 urlTemplate:
-                    'https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png',
+                    'https://basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}.png',
                 userAgentPackageName: 'com.giop.field',
+                tileBuilder: (context, tileWidget, tile) => Opacity(
+                  opacity: GiopSldColors.basemapTileOpacity,
+                  child: tileWidget,
+                ),
               ),
               if (_showAssignments && _assignments.isNotEmpty)
                 PolygonLayer(
@@ -1521,15 +1983,41 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
                         ),
                   ],
                 ),
+              if (_measurePoints.length >= 2)
+                PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: _measurePoints,
+                      color: const Color(0xFF0EA5E9),
+                      strokeWidth: 4,
+                      borderStrokeWidth: 1.5,
+                      borderColor: Colors.white,
+                    ),
+                  ],
+                ),
+              if (_stakeoutTarget != null && userPoint != null)
+                PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: [userPoint, _stakeoutTarget!],
+                      color: Colors.teal.withValues(alpha: 0.85),
+                      strokeWidth: 3,
+                      borderStrokeWidth: 1,
+                      borderColor: Colors.white,
+                    ),
+                  ],
+                ),
               MarkerLayer(
                 key: ValueKey(
                   '${_layerVisibility.onGrid}'
                   '${_layerVisibility.ownStaging}'
                   '${_layerVisibility.otherStaging}'
                   '${_layerVisibility.queuedLocal}'
-                  '$_selectedNodeMrid',
+                  '$_selectedNodeMrid'
+                  '$_showWorkOrders',
                 ),
                 markers: [
+                  ..._workOrderMarkers,
                   for (final node in _markerNodes)
                     Marker(
                       point: LatLng(node.latitude!, node.longitude!),
@@ -1541,7 +2029,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
                           : (_selectedNodeMrid == node.mrid ? 32 : 26),
                       child: _assetMarker(node),
                     ),
-                  if (userPoint != null)
+                  if (userPoint != null && !_navigationMode)
                     Marker(
                       point: userPoint,
                       width: 72,
@@ -1557,6 +2045,22 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
               ),
             ],
           ),
+          ),
+
+          // Navigation puck: screen-fixed (Uber/Bolt); map rotates underneath.
+          if (_navigationMode && _position != null)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: Center(
+                  child: UserLocationMarker(
+                    heading: _heading,
+                    headingConfidence: _headingConfidence,
+                    accuracyMeters: _position!.accuracy,
+                    navigationMode: true,
+                  ),
+                ),
+              ),
+            ),
 
           if (_tool == MapTool.addPoint) const MapCrosshair(),
 
@@ -1574,9 +2078,55 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
               nodeCount: _allVisibleNodes.length,
               vectorGrid: _showMartinGrid,
               usingCache: _usingCache,
+              isOnline: _isOnline,
+              linkUp: _linkUp,
+              serverReachable: _serverReachable,
               tool: _tool,
               pendingCount: _pendingCount,
               onResetNorth: _resetMapNorth,
+              onPendingTap: () => Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => SyncQueueScreen(api: widget.api),
+                ),
+              ),
+            ),
+          ),
+
+          Positioned(
+            top: MediaQuery.of(context).padding.top + 52,
+            left: 12,
+            child: Row(
+              children: [
+                IconButton.filledTonal(
+                  style: IconButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    backgroundColor: Colors.black.withValues(alpha: 0.55),
+                    foregroundColor: Colors.white,
+                  ),
+                  tooltip: 'Search assets',
+                  onPressed: () => FieldSearchSheet.show(context),
+                  icon: const Icon(Icons.search, size: 20),
+                ),
+                const SizedBox(width: 6),
+                IconButton.filledTonal(
+                  style: IconButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    backgroundColor: Colors.black.withValues(alpha: 0.55),
+                    foregroundColor: Colors.white,
+                  ),
+                  tooltip: 'Sync queue',
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => SyncQueueScreen(api: widget.api),
+                    ),
+                  ),
+                  icon: Badge(
+                    isLabelVisible: _pendingCount > 0,
+                    label: Text('$_pendingCount'),
+                    child: const Icon(Icons.cloud_upload_outlined, size: 20),
+                  ),
+                ),
+              ],
             ),
           ),
 
@@ -1711,6 +2261,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
               onPan: () => _setTool(MapTool.pan),
               onAdd: () => _setTool(MapTool.addPoint),
               onDrawSpan: () => _setTool(MapTool.drawSpan),
+              onMeasure: () => _setTool(MapTool.measure),
               onLayers: _showLayers,
               onLocate: _centerOnMe,
               onRefresh: () {
@@ -1719,6 +2270,54 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
               },
             ),
           ),
+          if (_tool == MapTool.measure)
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: 88,
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          _measurePoints.isEmpty
+                              ? 'Measure: tap points on the map'
+                              : 'Length: ${(_measureTotalMeters ?? 0).toStringAsFixed(1)} m (${_measurePoints.length} pts)',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () => setState(() => _measurePoints = const []),
+                        child: const Text('Clear'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          if (_stakeoutTarget != null && _stakeoutDistanceM != null)
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: _tool == MapTool.measure ? 148 : 88,
+              child: Card(
+                color: Colors.teal.shade50,
+                child: ListTile(
+                  dense: true,
+                  title: Text(_stakeoutLabel ?? 'Navigate'),
+                  subtitle: Text('${_stakeoutDistanceM!.toStringAsFixed(0)} m away'),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.close),
+                    onPressed: () => setState(() {
+                      _stakeoutTarget = null;
+                      _stakeoutLabel = null;
+                    }),
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -1827,9 +2426,13 @@ class _StatusBar extends StatelessWidget {
     required this.nodeCount,
     required this.vectorGrid,
     required this.usingCache,
+    required this.isOnline,
+    required this.linkUp,
+    required this.serverReachable,
     required this.tool,
     required this.pendingCount,
     required this.onResetNorth,
+    this.onPendingTap,
   });
 
   final Position? position;
@@ -1840,9 +2443,13 @@ class _StatusBar extends StatelessWidget {
   final int nodeCount;
   final bool vectorGrid;
   final bool usingCache;
+  final bool isOnline;
+  final bool linkUp;
+  final bool serverReachable;
   final MapTool tool;
   final int pendingCount;
   final VoidCallback onResetNorth;
+  final VoidCallback? onPendingTap;
 
   @override
   Widget build(BuildContext context) {
@@ -1898,11 +2505,31 @@ class _StatusBar extends StatelessWidget {
                   child: const Text('N', style: TextStyle(color: Colors.white, fontSize: 11)),
                 ),
               ),
-            if (pendingCount > 0)
-              Padding(
-                padding: const EdgeInsets.only(left: 6),
-                child: Icon(Icons.cloud_upload, color: Colors.orange.shade300, size: 16),
+            GestureDetector(
+              onTap: onPendingTap,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    !linkUp
+                        ? Icons.wifi_off
+                        : (serverReachable ? Icons.wifi : Icons.cloud_off),
+                    color: isOnline
+                        ? Colors.lightGreenAccent
+                        : Colors.orange.shade300,
+                    size: 14,
+                  ),
+                  if (pendingCount > 0) ...[
+                    const SizedBox(width: 4),
+                    Icon(Icons.cloud_upload, color: Colors.orange.shade300, size: 16),
+                    Text(
+                      '$pendingCount',
+                      style: TextStyle(color: Colors.orange.shade200, fontSize: 11),
+                    ),
+                  ],
+                ],
               ),
+            ),
             if (usingCache)
               const Padding(
                 padding: EdgeInsets.only(left: 6),
@@ -1935,6 +2562,7 @@ class _MapToolbar extends StatelessWidget {
     required this.onPan,
     required this.onAdd,
     required this.onDrawSpan,
+    required this.onMeasure,
     required this.onLayers,
     required this.onLocate,
     required this.onRefresh,
@@ -1947,6 +2575,7 @@ class _MapToolbar extends StatelessWidget {
   final VoidCallback onPan;
   final VoidCallback onAdd;
   final VoidCallback onDrawSpan;
+  final VoidCallback onMeasure;
   final VoidCallback onLayers;
   final VoidCallback onLocate;
   final VoidCallback onRefresh;
@@ -1980,6 +2609,12 @@ class _MapToolbar extends StatelessWidget {
                 label: 'Span',
                 selected: tool == MapTool.drawSpan,
                 onTap: onDrawSpan,
+              ),
+              _ToolButton(
+                icon: Icons.straighten,
+                label: 'Measure',
+                selected: tool == MapTool.measure,
+                onTap: onMeasure,
               ),
               _ToolButton(
                 icon: Icons.layers,
@@ -2048,10 +2683,14 @@ class _NodeDetailSheet extends StatelessWidget {
   const _NodeDetailSheet({
     required this.node,
     required this.topologyFuture,
+    this.localCapture,
+    this.onNavigate,
   });
 
   final AssetNode node;
   final Future<Map<String, dynamic>?> topologyFuture;
+  final Map<String, dynamic>? localCapture;
+  final VoidCallback? onNavigate;
 
   @override
   Widget build(BuildContext context) {
@@ -2094,7 +2733,7 @@ class _NodeDetailSheet extends StatelessWidget {
             );
           }
 
-          if (snapshot.hasError) {
+          if (snapshot.hasError && !node.isLocalQueued) {
             return Column(
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -2102,14 +2741,26 @@ class _NodeDetailSheet extends StatelessWidget {
                 Text(node.name, style: Theme.of(context).textTheme.titleLarge),
                 const SizedBox(height: 12),
                 Text(
-                  snapshot.error.toString(),
-                  style: const TextStyle(color: Colors.redAccent),
+                  'Could not load connections. Showing saved details.',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                const SizedBox(height: 12),
+                _NodeDetailBody(
+                  node: node,
+                  topology: null,
+                  localCapture: localCapture,
+                  onNavigate: onNavigate,
                 ),
               ],
             );
           }
 
-          return _NodeDetailBody(node: node, topology: snapshot.data);
+          return _NodeDetailBody(
+            node: node,
+            topology: snapshot.data,
+            localCapture: localCapture,
+            onNavigate: onNavigate,
+          );
         },
       ),
     );
@@ -2136,10 +2787,14 @@ class _NodeDetailBody extends StatelessWidget {
   const _NodeDetailBody({
     required this.node,
     required this.topology,
+    this.localCapture,
+    this.onNavigate,
   });
 
   final AssetNode node;
   final Map<String, dynamic>? topology;
+  final Map<String, dynamic>? localCapture;
+  final VoidCallback? onNavigate;
 
   @override
   Widget build(BuildContext context) {
@@ -2147,6 +2802,14 @@ class _NodeDetailBody extends StatelessWidget {
     final upstream = topology?['upstream'] as List<dynamic>? ?? [];
     final degree = (topology?['degree'] as num?)?.toInt();
     final kind = node.displayKind;
+    final syncStatus =
+        localCapture?['sync_status'] as String? ?? 'PENDING';
+    final feeder = node.boundaryFeederId ??
+        localCapture?['boundary_feeder_id'] as String?;
+    final utility = node.operatingUtility ??
+        localCapture?['operating_utility'] as String?;
+    final substation = node.substationName ??
+        localCapture?['substation_name'] as String?;
 
     return SingleChildScrollView(
       child: Column(
@@ -2162,24 +2825,49 @@ class _NodeDetailBody extends StatelessWidget {
               ),
             ],
           ),
+          if (node.isLocalQueued) ...[
+            const SizedBox(height: 10),
+            Chip(
+              avatar: const Icon(Icons.phone_android, size: 18),
+              label: Text(
+                syncStatus == 'CONFLICTED'
+                    ? 'Saved on device — needs review'
+                    : 'Saved on device — uploads when online',
+              ),
+            ),
+          ],
           const SizedBox(height: 12),
           _NodeDetailSheet._detailRow(context, 'Type', assetKindLabel(kind)),
-          _NodeDetailSheet._detailRow(context, 'MRID', node.mrid),
-          _NodeDetailSheet._detailRow(context, 'Status', node.validation),
-          _NodeDetailSheet._detailRow(context, 'Tier', layerLabel(node.layer)),
-          if (node.boundaryFeederId != null)
-            _NodeDetailSheet._detailRow(context, 'Feeder', node.boundaryFeederId!),
-          if (node.operatingUtility != null)
-            _NodeDetailSheet._detailRow(context, 'Utility', node.operatingUtility!),
-          if (node.substationName != null)
-            _NodeDetailSheet._detailRow(context, 'District', node.substationName!),
+          if (!node.isLocalQueued)
+            _NodeDetailSheet._detailRow(context, 'MRID', node.mrid),
+          _NodeDetailSheet._detailRow(
+            context,
+            'Status',
+            node.isLocalQueued ? 'Pending upload' : node.validation,
+          ),
+          if (!node.isLocalQueued)
+            _NodeDetailSheet._detailRow(context, 'Tier', layerLabel(node.layer)),
+          if (feeder != null && feeder.isNotEmpty)
+            _NodeDetailSheet._detailRow(context, 'Feeder', feeder),
+          if (utility != null && utility.isNotEmpty)
+            _NodeDetailSheet._detailRow(context, 'Utility', utility),
+          if (substation != null && substation.isNotEmpty)
+            _NodeDetailSheet._detailRow(context, 'District', substation),
           if (node.hasCoordinates)
             _NodeDetailSheet._detailRow(
               context,
               'Coordinates',
               '${node.latitude!.toStringAsFixed(6)}, ${node.longitude!.toStringAsFixed(6)}',
             ),
-          if (degree != null) ...[
+          if (node.hasCoordinates && onNavigate != null) ...[
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: onNavigate,
+              icon: const Icon(Icons.navigation_outlined),
+              label: const Text('Navigate here'),
+            ),
+          ],
+          if (degree != null && !node.isLocalQueued) ...[
             const SizedBox(height: 12),
             Text(
               'Connections ($degree)',

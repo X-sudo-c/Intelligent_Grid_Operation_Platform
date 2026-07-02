@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../services/capture_preferences.dart';
 import '../services/giop_api.dart';
+import '../services/field_map_fly_bus.dart';
 import '../services/offline_db.dart';
 
 class WorkOrdersScreen extends StatefulWidget {
@@ -65,6 +66,7 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
     try {
       await widget.api.syncWorkOrders();
       final local = await OfflineDb.listWorkOrders();
+      if (!mounted) return;
       setState(() {
         _orders = local;
         _rejected = rejected;
@@ -72,6 +74,7 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
       });
     } catch (e) {
       final local = await OfflineDb.listWorkOrders();
+      if (!mounted) return;
       setState(() {
         _orders = local;
         _rejected = rejected;
@@ -96,10 +99,31 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
       workOrderId: id,
       newStatus: newStatus,
     );
+    if (!mounted) return;
     setState(() {
-      _status = 'Status queued — syncing…';
+      _status = 'Saved on device — uploads when online';
     });
-    await _sync();
+    try {
+      await widget.api.syncWorkOrders();
+      if (mounted) setState(() => _status = null);
+    } catch (_) {}
+    if (mounted) await _sync();
+  }
+
+  void _openOnMap(Map<String, dynamic> wo) {
+    final lat = (wo['latitude'] as num?)?.toDouble();
+    final lon = (wo['longitude'] as num?)?.toDouble();
+    if (lat != null && lon != null && lat.isFinite && lon.isFinite) {
+      FieldMapFlyBus.instance.flyTo(
+        latitude: lat,
+        longitude: lon,
+        label: wo['reference'] as String? ?? wo['id'] as String?,
+      );
+    } else if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No map location for this work order')),
+      );
+    }
   }
 
   Future<void> _setActiveWorkOrder(Map<String, dynamic> wo) async {
@@ -112,9 +136,9 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
         feederId: feeder,
       );
     }
+    if (!mounted) return;
     setState(() => _activeWorkOrderId = id);
     widget.onSelectWorkOrder?.call(id, wo['feeder_mrid'] as String?);
-    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('Active work order: ${wo['reference'] ?? id}')),
     );
@@ -225,12 +249,21 @@ class _WorkOrdersScreenState extends State<WorkOrdersScreen>
                         ),
                         isThreeLine: true,
                         onTap: () => _setActiveWorkOrder(wo),
-                        trailing: status != 'COMPLETED' && status != 'CANCELLED'
-                            ? TextButton(
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              tooltip: 'Show on map',
+                              icon: const Icon(Icons.map_outlined),
+                              onPressed: () => _openOnMap(wo),
+                            ),
+                            if (status != 'COMPLETED' && status != 'CANCELLED')
+                              TextButton(
                                 onPressed: () => _advanceStatus(id, status),
                                 child: const Text('Advance'),
-                              )
-                            : null,
+                              ),
+                          ],
+                        ),
                       ),
                     );
                   }),

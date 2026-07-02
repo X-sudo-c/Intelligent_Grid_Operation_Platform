@@ -75,10 +75,10 @@ export function GiopMeterOcr({ isLightMode }: GiopMeterOcrProps) {
 
   return (
     <div className="h-full overflow-auto p-6 max-w-2xl space-y-4">
-      <h3 className={`text-sm font-semibold ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>Meter Reading (OCR)</h3>
+      <h3 className={`text-sm font-semibold ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>Meter Reading (OCR)</h3>
 
       <div>
-        <label className={`block text-xs mb-1 ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>Meter photo</label>
+        <label className={`block text-xs mb-1 ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>Meter photo</label>
         <input
           type="file"
           accept="image/jpeg,image/png,image/webp"
@@ -110,7 +110,7 @@ export function GiopMeterOcr({ isLightMode }: GiopMeterOcrProps) {
 
       <div className="grid grid-cols-2 gap-3 text-sm">
         <div>
-          <label className={`block text-xs mb-1 ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>Serial number</label>
+          <label className={`block text-xs mb-1 ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>Serial number</label>
           <input
             value={serial}
             onChange={(e) => setSerial(e.target.value)}
@@ -118,7 +118,7 @@ export function GiopMeterOcr({ isLightMode }: GiopMeterOcrProps) {
           />
         </div>
         <div>
-          <label className={`block text-xs mb-1 ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>kWh reading</label>
+          <label className={`block text-xs mb-1 ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>kWh reading</label>
           <input
             type="number"
             step="0.001"
@@ -128,7 +128,7 @@ export function GiopMeterOcr({ isLightMode }: GiopMeterOcrProps) {
           />
         </div>
         <div className="col-span-2">
-          <label className={`block text-xs mb-1 ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>Meter MRID</label>
+          <label className={`block text-xs mb-1 ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>Meter MRID</label>
           <input
             value={mrid}
             onChange={(e) => setMrid(e.target.value)}

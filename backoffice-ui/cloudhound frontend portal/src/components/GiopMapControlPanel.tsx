@@ -1,4 +1,5 @@
 import { useCallback, useState, type ReactNode } from 'react';
+import { giopThemeTokens } from '../lib/giopTheme';
 
 export interface GiopMapLayerToggle {
   id: string;
@@ -39,6 +40,7 @@ function LayerSwitch({
   toggle: GiopMapLayerToggle;
   isLightMode: boolean;
 }) {
+  const t = giopThemeTokens(isLightMode);
   const { active, onToggle, label, color, hint } = toggle;
   return (
     <button
@@ -48,24 +50,16 @@ function LayerSwitch({
       aria-label={label}
       title={hint ?? label}
       onClick={onToggle}
-      className={`group flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors ${
-        isLightMode ? 'hover:bg-slate-100/80' : 'hover:bg-slate-800/60'
-      }`}
+      className={`group flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors ${t.hover}`}
     >
       <span
-        className="h-2.5 w-2.5 shrink-0 rounded-full ring-2 ring-inset ring-white/20 transition-opacity"
-        style={{ backgroundColor: color, opacity: active ? 1 : 0.35 }}
+        className="h-2.5 w-2.5 shrink-0 rounded-full ring-2 ring-inset ring-white/15 transition-opacity"
+        style={{ backgroundColor: color, opacity: active ? 1 : 0.4 }}
         aria-hidden
       />
       <span
         className={`flex-1 truncate text-xs font-medium transition-colors ${
-          active
-            ? isLightMode
-              ? 'text-slate-800'
-              : 'text-slate-100'
-            : isLightMode
-              ? 'text-slate-500'
-              : 'text-slate-400'
+          active ? t.text : t.muted
         }`}
       >
         {label}
@@ -73,10 +67,10 @@ function LayerSwitch({
       <span
         className={`relative h-4 w-7 shrink-0 rounded-full transition-colors duration-200 ${
           active
-            ? 'bg-sky-500/90'
+            ? 'bg-premium-accent'
             : isLightMode
               ? 'bg-slate-300'
-              : 'bg-slate-700'
+              : 'bg-premium-hover-strong'
         }`}
         aria-hidden
       >
@@ -95,6 +89,7 @@ export function GiopMapControlPanel({
   groups,
   footerSlot,
 }: GiopMapControlPanelProps) {
+  const t = giopThemeTokens(isLightMode);
   const [expanded, setExpanded] = useState<boolean>(readExpanded);
 
   const toggleExpanded = useCallback(() => {
@@ -110,28 +105,26 @@ export function GiopMapControlPanel({
   }, []);
 
   const activeCount = groups.reduce(
-    (sum, group) => sum + group.toggles.filter((t) => t.active).length,
+    (sum, group) => sum + group.toggles.filter((toggle) => toggle.active).length,
     0,
   );
 
   const shell = isLightMode
-    ? 'border-slate-200/80 bg-white/85 text-slate-700'
-    : 'border-slate-700/70 bg-slate-900/85 text-slate-200';
+    ? 'border-slate-200/80 bg-white/90 text-slate-700 shadow-lg'
+    : 'border-premium-border/50 bg-premium-card/95 text-premium-text shadow-premium backdrop-blur-xl';
 
   return (
     <div
-      className={`giop-map-control pointer-events-auto absolute left-3 top-3 z-10 w-52 overflow-hidden rounded-xl border shadow-xl backdrop-blur-md ${shell}`}
+      className={`giop-map-control pointer-events-auto absolute left-3 top-3 z-10 w-52 overflow-hidden rounded-xl border ${shell}`}
     >
       <button
         type="button"
         onClick={toggleExpanded}
         aria-expanded={expanded}
-        className={`flex w-full items-center justify-between gap-2 px-3 py-2 transition-colors ${
-          isLightMode ? 'hover:bg-slate-100/70' : 'hover:bg-slate-800/50'
-        }`}
+        className={`flex w-full items-center justify-between gap-2 px-3 py-2.5 transition-colors ${t.hover}`}
       >
-        <span className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden>
+        <span className={`flex items-center gap-2 text-xs font-semibold uppercase tracking-wide ${t.text}`}>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden className="opacity-80">
             <path
               d="M12 3 3 8l9 5 9-5-9-5Z M3 13l9 5 9-5 M3 18l9 5 9-5"
               stroke="currentColor"
@@ -144,8 +137,10 @@ export function GiopMapControlPanel({
         </span>
         <span className="flex items-center gap-1.5">
           <span
-            className={`rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
-              isLightMode ? 'bg-slate-200 text-slate-600' : 'bg-slate-800 text-slate-300'
+            className={`rounded-full px-1.5 py-0.5 text-[10px] font-semibold tabular-nums ${
+              isLightMode
+                ? 'bg-slate-200 text-slate-600'
+                : 'bg-premium-hover text-premium-text-secondary'
             }`}
           >
             {activeCount}
@@ -156,7 +151,7 @@ export function GiopMapControlPanel({
             viewBox="0 0 24 24"
             fill="none"
             aria-hidden
-            className={`transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`}
+            className={`opacity-70 transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`}
           >
             <path
               d="m6 9 6 6 6-6"
@@ -177,15 +172,13 @@ export function GiopMapControlPanel({
         <div className="min-h-0 overflow-hidden">
           <div
             className={`border-t px-1.5 pb-2 pt-1.5 ${
-              isLightMode ? 'border-slate-200/70' : 'border-slate-700/60'
+              isLightMode ? 'border-slate-200/70' : 'border-premium-border/50'
             }`}
           >
             {groups.map((group) => (
               <div key={group.label} className="mb-1 last:mb-0">
                 <p
-                  className={`px-2 pb-0.5 pt-1 text-[10px] font-semibold uppercase tracking-wider ${
-                    isLightMode ? 'text-slate-400' : 'text-slate-500'
-                  }`}
+                  className={`px-2 pb-0.5 pt-1 text-[10px] font-semibold uppercase tracking-wider ${t.mutedDim}`}
                 >
                   {group.label}
                 </p>
@@ -197,7 +190,7 @@ export function GiopMapControlPanel({
             {footerSlot && (
               <div
                 className={`mt-1 border-t px-1 pt-2 ${
-                  isLightMode ? 'border-slate-200/70' : 'border-slate-700/60'
+                  isLightMode ? 'border-slate-200/70' : 'border-premium-border/50'
                 }`}
               >
                 {footerSlot}

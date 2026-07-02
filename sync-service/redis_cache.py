@@ -297,9 +297,16 @@ def assets_master_key(
     )
 
 
-def assets_staging_key(include_rejected: bool, submitted_by: str | None) -> str:
+def assets_staging_key(
+    include_rejected: bool,
+    submitted_by: str | None,
+    limit: int | None = None,
+    queue: str | None = None,
+) -> str:
     who = submitted_by or "*"
-    return f"{_KEY_PREFIX}assets:staging:{int(include_rejected)}:{who}"
+    cap = limit if limit is not None else "*"
+    q = queue or "*"
+    return f"{_KEY_PREFIX}assets:staging:{int(include_rejected)}:{who}:{cap}:{q}"
 
 
 def asset_detail_key(mrid: str) -> str:
@@ -361,17 +368,17 @@ def graph_parity_key() -> str:
     return f"{_KEY_PREFIX}graph:parity"
 
 
-def dq_summary_key() -> str:
-    return f"{_KEY_PREFIX}dq:summary"
+def dq_summary_key(tier: str | None = None) -> str:
+    return f"{_KEY_PREFIX}dq:summary:{tier or 'all'}"
 
 
 def nav_badges_key() -> str:
     return f"{_KEY_PREFIX}ops:badges"
 
 
-def topology_dq_summary_key() -> str:
+def topology_dq_summary_key(tier: str = "master", mode: str = "snapshot") -> str:
     """Under the topology: namespace so topology invalidation clears it."""
-    return f"{_KEY_PREFIX}topology:dq:summary"
+    return f"{_KEY_PREFIX}topology:dq:summary:{tier}:{mode}"
 
 
 def dq_rules_key() -> str:
@@ -384,10 +391,29 @@ def dq_exceptions_key(
     domain: str | None,
     record_mrid: str | None,
     limit: int,
+    queue: str | None = None,
+    offset: int = 0,
 ) -> str:
     return (
         f"{_KEY_PREFIX}dq:exceptions:"
-        f"{status or '*'}:{severity or '*'}:{domain or '*'}:{record_mrid or '*'}:{limit}"
+        f"{status or '*'}:{severity or '*'}:{domain or '*'}:{record_mrid or '*'}:{limit}:"
+        f"{queue or '*'}:{offset}"
+    )
+
+
+def dq_queue_key(
+    validation: str | None,
+    exception_status: str | None,
+    severity: str | None,
+    domain: str | None,
+    limit: int,
+    offset: int = 0,
+    duplicates_only: bool = False,
+) -> str:
+    return (
+        f"{_KEY_PREFIX}dq:queue:"
+        f"{validation or '*'}:{exception_status or '*'}:{severity or '*'}:{domain or '*'}:"
+        f"{'dup' if duplicates_only else '-'}:{limit}:{offset}"
     )
 
 

@@ -8,9 +8,14 @@ import {
   type ReactNode,
 } from 'react';
 import { getAssetLocation, type GiopTopologyPayload } from '../api/giop-api';
-import { normalizeMapCoordinates } from '../lib/giopMapCoordinates';
+import { normalizeMapCoordinates, coordsNearlyEqual } from '../lib/giopMapCoordinates';
+import { DUPLICATE_CLUSTER_ZOOM } from '../lib/giopMapLayers';
+import { giopLog } from '../lib/giopDebugLog';
 import { writeGiopRouteToLocation, type GiopPortalTab } from '../lib/giopPortalRouting';
+import type { GiopMapFlyRequest } from '../lib/giopMapFlyRequest';
 import type { TerritoryHighlightState } from '../lib/giopTerritoryHighlight';
+import type { GiopRepairPreviewLayers } from '../lib/giopRepairPreviewGeojson';
+import type { DuplicateClusterOverlay } from '../lib/giopDuplicateFan';
 import { useGiopSelection } from './GiopSelectionContext';
 
 export type { TerritoryHighlightState };
@@ -28,6 +33,7 @@ export interface FocusCameraRequest {
   mrid: string;
   boostZoom: boolean;
   coordinates?: [number, number] | null;
+  targetZoom?: number;
 }
 
 /** Copilot-driven map pan/zoom (district fit, fly-to, viewport). */
@@ -43,7 +49,14 @@ interface GiopMapOverlayContextValue {
   impactOverlay: GiopTopologyPayload | null;
   setImpactOverlay: (payload: GiopTopologyPayload | null) => void;
   clearImpactOverlay: () => void;
+  repairPreviewLayers: GiopRepairPreviewLayers | null;
+  setRepairPreviewLayers: (layers: GiopRepairPreviewLayers | null) => void;
+  clearRepairPreviewLayers: () => void;
+  duplicateClusterOverlay: DuplicateClusterOverlay | null;
+  setDuplicateClusterOverlay: (overlay: DuplicateClusterOverlay | null) => void;
+  clearDuplicateClusterOverlay: () => void;
   sideMap: GiopSideMapState;
+  sidePanelFlyRequest: GiopMapFlyRequest | null;
   focusCameraRequest: FocusCameraRequest | null;
   mapViewportCommand: MapViewportCommand | null;
   territoryHighlight: TerritoryHighlightState | null;
@@ -56,6 +69,7 @@ interface GiopMapOverlayContextValue {
   clearMapIdentifyFocus: () => void;
   closeSideMap: () => void;
   queueMapViewportCommand: (cmd: Omit<MapViewportCommand, 'id'>) => void;
+  queueFocusCamera: (mrid: string, boostZoom?: boolean, coordinates?: [number, number] | null, targetZoom?: number) => void;
   focusOnMap: (
     mrid: string,
     opts?: {
@@ -65,9 +79,16 @@ interface GiopMapOverlayContextValue {
       tab?: GiopPortalTab;
       /** Switch to a full map tab instead of the side panel (default: side panel). */
       navigateTab?: boolean;
+      /** Open the slide-in side map panel (default: true when navigateTab is false). */
+      sidePanel?: boolean;
       source?: 'map' | 'table' | 'graph';
+      /** Duplicate stack — camera flies to street-level fan view (zoom ~19). */
+      duplicateCluster?: boolean;
+      /** Camera target (e.g. fan-pin offset); defaults to coordinates. */
+      flyCoordinates?: [number, number] | null;
     },
   ) => Promise<void>;
+  bumpSidePanelFly: (coordinates: [number, number], boostZoom?: boolean, targetZoom?: number) => void;
 }
 
 const GiopMapOverlayContext = createContext<GiopMapOverlayContextValue | null>(null);
@@ -82,7 +103,13 @@ const CLOSED_SIDE_MAP: GiopSideMapState = {
 export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
   const { setSelection } = useGiopSelection();
   const [impactOverlay, setImpactOverlayState] = useState<GiopTopologyPayload | null>(null);
+  const [repairPreviewLayers, setRepairPreviewLayersState] = useState<GiopRepairPreviewLayers | null>(
+    null,
+  );
+  const [duplicateClusterOverlay, setDuplicateClusterOverlayState] =
+    useState<DuplicateClusterOverlay | null>(null);
   const [sideMap, setSideMap] = useState<GiopSideMapState>(CLOSED_SIDE_MAP);
+  const [sidePanelFlyRequest, setSidePanelFlyRequest] = useState<GiopMapFlyRequest | null>(null);
   const [focusCameraRequest, setFocusCameraRequest] = useState<FocusCameraRequest | null>(null);
   const [mapViewportCommand, setMapViewportCommand] = useState<MapViewportCommand | null>(null);
   const [territoryHighlight, setTerritoryHighlightState] = useState<TerritoryHighlightState | null>(
@@ -91,16 +118,41 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
   const [mapIdentifyFocusMrid, setMapIdentifyFocusMrid] = useState<string | null>(null);
   const focusCameraRequestIdRef = useRef(0);
   const mapViewportCommandIdRef = useRef(0);
+  /** Only the latest focusOnMap call may apply state after its async coordinate lookup. */
+  const focusOnMapSeqRef = useRef(0);
+  const sideMapRef = useRef(sideMap);
+  sideMapRef.current = sideMap;
+  const sidePanelFlyIdRef = useRef(0);
+
+  const bumpSidePanelFly = useCallback(
+    (coordinates: [number, number], boostZoom = true, targetZoom?: number) => {
+      const normalized = normalizeMapCoordinates(coordinates);
+      if (!normalized) return;
+      sidePanelFlyIdRef.current += 1;
+      const req: GiopMapFlyRequest = {
+        id: sidePanelFlyIdRef.current,
+        coordinates: normalized,
+        boostZoom,
+        targetZoom,
+      };
+      giopLog.overlay.info('bumpSidePanelFly', req);
+      setSidePanelFlyRequest(req);
+    },
+    [],
+  );
 
   const queueFocusCamera = useCallback(
-    (mrid: string, boostZoom = true, coordinates?: [number, number] | null) => {
+    (mrid: string, boostZoom = true, coordinates?: [number, number] | null, targetZoom?: number) => {
       focusCameraRequestIdRef.current += 1;
-      setFocusCameraRequest({
+      const req = {
         id: focusCameraRequestIdRef.current,
         mrid,
         boostZoom,
         coordinates: normalizeMapCoordinates(coordinates) ?? null,
-      });
+        targetZoom,
+      };
+      giopLog.overlay.info('queueFocusCamera', req);
+      setFocusCameraRequest(req);
     },
     [],
   );
@@ -142,6 +194,22 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
     setImpactOverlayState(null);
   }, []);
 
+  const setRepairPreviewLayers = useCallback((layers: GiopRepairPreviewLayers | null) => {
+    setRepairPreviewLayersState(layers);
+  }, []);
+
+  const clearRepairPreviewLayers = useCallback(() => {
+    setRepairPreviewLayersState(null);
+  }, []);
+
+  const setDuplicateClusterOverlay = useCallback((overlay: DuplicateClusterOverlay | null) => {
+    setDuplicateClusterOverlayState(overlay);
+  }, []);
+
+  const clearDuplicateClusterOverlay = useCallback(() => {
+    setDuplicateClusterOverlayState(null);
+  }, []);
+
   const closeSideMap = useCallback(() => {
     setSideMap(CLOSED_SIDE_MAP);
   }, []);
@@ -155,31 +223,43 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
         impact?: GiopTopologyPayload | null;
         tab?: GiopPortalTab;
         navigateTab?: boolean;
+        sidePanel?: boolean;
         source?: 'map' | 'table' | 'graph';
+        duplicateCluster?: boolean;
+        flyCoordinates?: [number, number] | null;
       },
     ) => {
-      if (!mrid?.trim()) return;
+      if (!mrid?.trim()) {
+        giopLog.overlay.warn('focusOnMap skipped — empty mrid');
+        return;
+      }
+
+      giopLog.overlay.info('focusOnMap', { mrid, opts });
+      const seq = ++focusOnMapSeqRef.current;
 
       let coordinates = normalizeMapCoordinates(opts?.coordinates) ?? null;
       let name = opts?.name;
 
       if (!coordinates) {
+        giopLog.overlay.info('focusOnMap resolving coordinates via API', { mrid });
         try {
           const loc = await getAssetLocation(mrid);
           if (loc.longitude != null && loc.latitude != null) {
             coordinates = normalizeMapCoordinates([loc.longitude, loc.latitude]);
           }
           name = name ?? loc.name ?? undefined;
-        } catch {
-          /* flyTo skipped when coords unknown */
+          giopLog.overlay.info('focusOnMap API resolved', { mrid, coordinates, name });
+        } catch (err) {
+          giopLog.overlay.error('focusOnMap asset location failed — fly may be skipped', {
+            mrid,
+            err,
+          });
+        }
+        if (seq !== focusOnMapSeqRef.current) {
+          giopLog.overlay.info('focusOnMap superseded by newer call — dropping', { mrid });
+          return;
         }
       }
-
-      setSelection(mrid, {
-        name,
-        coordinates,
-        source: opts?.source ?? 'table',
-      });
 
       if (opts?.impact !== undefined) {
         setImpactOverlayState(opts.impact);
@@ -192,10 +272,15 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
         setSideMap(CLOSED_SIDE_MAP);
         setMapIdentifyFocusMrid(mrid);
         queueFocusCamera(mrid, true, coordinates);
+        setSelection(mrid, {
+          name,
+          coordinates,
+          source: opts?.source ?? 'table',
+        });
         const tab = opts?.tab ?? 'map';
         writeGiopRouteToLocation({
           tab,
-          startMrid: mrid,
+          ...(tab !== 'operations' ? { startMrid: mrid } : {}),
           focusMrid: mrid,
           ...(tab === 'combined' || tab === 'topology'
             ? { graphQuery: 'traced_subgraph' as const }
@@ -204,16 +289,46 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      queueFocusCamera(mrid, true, coordinates);
-      setMapIdentifyFocusMrid(null);
-      setSideMap({
-        open: true,
-        mrid,
+      // Queue camera before selection so the embedded ops map can fly immediately.
+      const openSidePanel = opts?.sidePanel !== false;
+      const prevSide = sideMapRef.current;
+      const duplicateCluster = opts?.duplicateCluster === true;
+      const samePin =
+        !duplicateCluster &&
+        coordinates != null &&
+        prevSide.open &&
+        coordsNearlyEqual(prevSide.coordinates, coordinates);
+      const boostZoom = duplicateCluster || !(samePin && prevSide.mrid !== mrid);
+      const targetZoom = duplicateCluster ? DUPLICATE_CLUSTER_ZOOM : undefined;
+      const cameraCoords =
+        normalizeMapCoordinates(opts?.flyCoordinates ?? coordinates) ?? null;
+      if (duplicateCluster) {
+        if (cameraCoords && openSidePanel) {
+          bumpSidePanelFly(cameraCoords, true, targetZoom);
+        }
+      } else {
+        queueFocusCamera(mrid, boostZoom, coordinates, targetZoom);
+        if (cameraCoords && openSidePanel) {
+          bumpSidePanelFly(cameraCoords, boostZoom, targetZoom);
+        }
+      }
+      setSelection(mrid, {
+        name,
         coordinates,
-        name: name ?? null,
+        source: opts?.source ?? 'table',
       });
+      setMapIdentifyFocusMrid(null);
+      if (openSidePanel) {
+        giopLog.overlay.info('opening side map panel', { mrid, coordinates, name });
+        setSideMap({
+          open: true,
+          mrid,
+          coordinates,
+          name: name ?? null,
+        });
+      }
     },
-    [setSelection, queueFocusCamera],
+    [setSelection, queueFocusCamera, bumpSidePanelFly],
   );
 
   const value = useMemo(
@@ -221,7 +336,14 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
       impactOverlay,
       setImpactOverlay,
       clearImpactOverlay,
+      repairPreviewLayers,
+      setRepairPreviewLayers,
+      clearRepairPreviewLayers,
+      duplicateClusterOverlay,
+      setDuplicateClusterOverlay,
+      clearDuplicateClusterOverlay,
       sideMap,
+      sidePanelFlyRequest,
       focusCameraRequest,
       mapViewportCommand,
       territoryHighlight,
@@ -233,13 +355,22 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
       clearMapIdentifyFocus,
       closeSideMap,
       queueMapViewportCommand,
+      queueFocusCamera,
       focusOnMap,
+      bumpSidePanelFly,
     }),
     [
       impactOverlay,
       setImpactOverlay,
       clearImpactOverlay,
+      repairPreviewLayers,
+      setRepairPreviewLayers,
+      clearRepairPreviewLayers,
+      duplicateClusterOverlay,
+      setDuplicateClusterOverlay,
+      clearDuplicateClusterOverlay,
       sideMap,
+      sidePanelFlyRequest,
       focusCameraRequest,
       mapViewportCommand,
       territoryHighlight,
@@ -251,7 +382,9 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
       clearMapIdentifyFocus,
       closeSideMap,
       queueMapViewportCommand,
+      queueFocusCamera,
       focusOnMap,
+      bumpSidePanelFly,
     ],
   );
 

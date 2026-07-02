@@ -6,8 +6,10 @@ import json
 from typing import Any
 
 from agents.audit import log_agent_step
+from agents.portal_context import portal_selected_territory, portal_viewport_bbox
 from agents.llm.react import run_tool_loop
 from agents.models import AgentChatRequest, AgentChatResponse
+from agents.voice_router import try_copilot_fast_path
 
 
 SYSTEM_PROMPT = """You are the GIOP GIS data quality steward copilot for Ghana ECG/NEDCo.
@@ -19,6 +21,10 @@ use viewport bbox or selected_district/selected_region from context — do not g
 
 Use tools to inspect staging queues, asset inventory counts (poles, transformers), territory bounds,
 DQ checks, and topology. For counts always call asset_inventory_counts or staging tools before answering.
+
+When the user names a geographic place (district, region, town, or locality like Pokuase or Gbawe),
+call resolve_place first to get the canonical ECG district and bbox. If confidence is low or multiple
+candidates are returned, ask the user to confirm before pan_map or counts.
 
 When the user asks to show, pan, zoom, highlight, or go to a place, call pan_map
 (fit_district, highlight_district, fit_bounds, or fly_to) and navigate to the map tab when helpful.
@@ -35,13 +41,20 @@ def _seed_context(conn, request: AgentChatRequest) -> list[dict[str, Any]]:
     if ctx:
         parts.append(f"Portal UI context: {json.dumps(ctx, default=str)}")
         viewport = ctx.get("viewport")
-        if isinstance(viewport, dict) and viewport.get("west") is not None:
+        bbox = portal_viewport_bbox(ctx) if isinstance(viewport, dict) else None
+        if bbox:
             parts.append(
                 "When user says 'here' or 'this view', use asset_inventory_counts with "
-                f"west={viewport.get('west')}, south={viewport.get('south')}, "
-                f"east={viewport.get('east')}, north={viewport.get('north')}."
+                f"west={bbox['west']}, south={bbox['south']}, "
+                f"east={bbox['east']}, north={bbox['north']}."
             )
-        if ctx.get("selected_district"):
+        sel_d, sel_r = portal_selected_territory(ctx)
+        if sel_d or sel_r:
+            parts.append(
+                "When user says 'this area' or 'this district' and no viewport bbox applies, "
+                f"use asset_inventory_counts with district={sel_d!r}, region={sel_r!r}."
+            )
+        elif ctx.get("selected_district"):
             parts.append(
                 f"Selected map district: {ctx.get('selected_district')} "
                 f"(region: {ctx.get('selected_region') or 'unknown'})."
@@ -81,6 +94,36 @@ def run_steward_chat(
     context: dict[str, Any] | None = None,
     use_tools: bool = True,
 ) -> AgentChatResponse:
+    ctx = context or {}
+    session: dict[str, Any] = {}
+    session_id = ctx.get("voice_session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        from agents import voice_session
+
+        session = voice_session.load(session_id.strip())
+
+    intent, fast = try_copilot_fast_path(conn, message, context=ctx, session=session)
+    if fast:
+        ui_actions = fast.get("ui_actions") or []
+        kind = intent.kind if intent else "command"
+        actions: list[str] = []
+        for ua in ui_actions:
+            if ua.get("type") == "highlight_territory":
+                actions.append(
+                    f"Highlighting {ua.get('label') or ua.get('region') or ua.get('district') or 'territory'} on map"
+                )
+            elif ua.get("type") == "fit_bounds":
+                actions.append("Panning map to area bounds")
+            elif ua.get("type") == "navigate":
+                actions.append(f"Navigating portal to {ua.get('tab')} tab")
+        return AgentChatResponse(
+            content=fast["content"],
+            findings=[f"Fast path: {kind}"],
+            actions=actions or ["Map command ready"],
+            ui_actions=ui_actions,
+            agent={"fast_path": True, "voice": False},
+        )
+
     req = AgentChatRequest(
         message=message,
         exception_id=exception_id,
@@ -124,7 +167,7 @@ def run_steward_chat(
     actions: list[str] = []
     lower = content.lower()
     ui_actions = result.get("ui_actions") or []
-    ctx = request.context or {}
+    ctx = req.context or {}
 
     if "staging" in lower or any(
         t in (result.get("tools_used") or []) for t in ("staging_summary", "list_staging_queue")

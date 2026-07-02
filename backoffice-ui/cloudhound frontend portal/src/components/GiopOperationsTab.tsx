@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { MapPin } from 'lucide-react';
 import {
   approveAsset,
   getStagingAssets,
@@ -15,16 +16,38 @@ import {
   type GiopTopologyRepairResult,
 } from '../api/giop-api';
 import { countValidationStats } from '../lib/giopGraphAdapter';
+import { extractStagingGeomCoordinates } from '../lib/giopMapCoordinates';
+import { giopLog } from '../lib/giopDebugLog';
 import { useGiopSelection } from '../context/GiopSelectionContext';
+import { useGiopMapOverlay } from '../context/GiopMapOverlayContext';
 import { useDebouncedCallback } from '../hooks/useDebouncedCallback';
 import { GHANA_VOLTAGE_OPTIONS } from '../lib/giopSldTheme';
-import { GiopLineageTimeline } from './GiopLineageTimeline';
+import {
+  formatRepairProposalSummary,
+  repairPreviewToGeoJson,
+} from '../lib/giopRepairPreviewGeojson';
 
 interface GiopOperationsTabProps {
   isLightMode: boolean;
+  /** Embedded in FR-010 operations desk (map+topology above). */
+  embedded?: boolean;
   onRefreshTopology?: () => void;
   onMapRefresh?: () => void;
   refreshToken?: number;
+  /** Embedded ops desk: drive the desk map pan + selection from a row. */
+  onAssetFocus?: (asset: GiopStagingAsset) => void;
+  onAssetsLoaded?: (assets: GiopStagingAsset[]) => void;
+}
+
+function assetDisplayName(asset: GiopStagingAsset): string {
+  const name = asset.name?.trim();
+  return name || 'Unnamed asset';
+}
+
+function stagingPointCoords(
+  geom?: GiopStagingAsset['geom'],
+): [number, number] | null {
+  return extractStagingGeomCoordinates(geom);
 }
 
 function validationBadgeClass(validation?: string): string {
@@ -36,13 +59,59 @@ function validationBadgeClass(validation?: string): string {
   return 'bg-slate-800 text-slate-300';
 }
 
+function validationLabel(validation?: string): string {
+  if (validation === 'STAGED') return 'DQ cleared';
+  return validation ?? '—';
+}
+
 export function GiopOperationsTab({
   isLightMode,
+  embedded = false,
   onRefreshTopology,
   onMapRefresh,
   refreshToken = 0,
+  onAssetFocus,
+  onAssetsLoaded,
 }: GiopOperationsTabProps) {
-  const { setSelection } = useGiopSelection();
+  const { setSelection, selection } = useGiopSelection();
+  const { focusOnMap, setRepairPreviewLayers, clearRepairPreviewLayers } = useGiopMapOverlay();
+  const rowFocusMrid = selection.mrid;
+
+  const focusRowOnMap = useCallback(
+    (row: GiopStagingAsset) => {
+      giopLog.ops.info('row focus', { mrid: row.mrid, embedded, hasOnAssetFocus: Boolean(onAssetFocus) });
+      if (embedded) {
+        // Ops desk: parent drives the embedded map pan + selection imperatively.
+        if (onAssetFocus) {
+          void onAssetFocus(row);
+        } else {
+          void focusOnMap(row.mrid, {
+            name: row.name,
+            coordinates: stagingPointCoords(row.geom),
+            navigateTab: false,
+            sidePanel: false,
+            source: 'table',
+          });
+        }
+        return;
+      }
+      setSelection(row.mrid, {
+        name: row.name,
+        coordinates: stagingPointCoords(row.geom),
+        source: 'table',
+      });
+    },
+    [embedded, onAssetFocus, focusOnMap, setSelection],
+  );
+
+  const activateRow = useCallback(
+    (row: GiopStagingAsset) => {
+      setRepairTarget(row.mrid);
+      focusRowOnMap(row);
+    },
+    [focusRowOnMap],
+  );
+
   const [assets, setAssets] = useState<GiopStagingAsset[]>([]);
   const [inspectionsByAsset, setInspectionsByAsset] = useState<Record<string, GiopInspection>>({});
   const [conflicts, setConflicts] = useState<GiopConflictProposal[]>([]);
@@ -69,7 +138,10 @@ export function GiopOperationsTab({
     }
     setError(null);
     try {
-      const rows = await getStagingAssets({ includeRejected: showRejected });
+      const rows = await getStagingAssets({
+        includeRejected: showRejected,
+        queue: showRejected ? 'all' : 'operations',
+      });
       setAssets(rows);
       const inspections = await listInspections().catch(() => [] as GiopInspection[]);
       const byAsset: Record<string, GiopInspection> = {};
@@ -91,6 +163,10 @@ export function GiopOperationsTab({
   useEffect(() => {
     void loadAssets();
   }, [loadAssets, refreshToken]);
+
+  useEffect(() => {
+    if (!loading) onAssetsLoaded?.(assets);
+  }, [assets, loading, onAssetsLoaded]);
 
   const stats = countValidationStats(assets);
   const total = assets.length || 1;
@@ -134,7 +210,7 @@ export function GiopOperationsTab({
   };
 
   const approvableMrids = assets
-    .filter((row) => row.validation === 'PENDING_FIELD' || row.validation === 'STAGED')
+    .filter((row) => row.validation === 'STAGED')
     .map((row) => row.mrid);
 
   const toggleSelectAll = () => {
@@ -206,8 +282,32 @@ export function GiopOperationsTab({
     }
   };
 
+  const focusAssetOnMap = async (
+    mrid: string,
+    opts?: { name?: string; coordinates?: [number, number] | null },
+  ) => {
+    if (embedded) {
+      await focusOnMap(mrid, {
+        name: opts?.name,
+        coordinates: opts?.coordinates,
+        navigateTab: false,
+        sidePanel: false,
+        source: 'table',
+      });
+      return;
+    }
+    await focusOnMap(mrid, {
+      name: opts?.name,
+      coordinates: opts?.coordinates,
+      navigateTab: false,
+      source: 'table',
+    });
+  };
+
+  const activeRepairMrid = repairTarget || selection.mrid || assets[0]?.mrid;
+
   const handleRepairPreview = async () => {
-    const mrid = repairTarget || assets[0]?.mrid;
+    const mrid = activeRepairMrid;
     if (!mrid) return;
     setRepairBusy(true);
     setStatus('Previewing topology repair…');
@@ -216,8 +316,16 @@ export function GiopOperationsTab({
       setRepairPreview(preview);
       const count = preview.result.proposed?.length ?? 0;
       setStatus(`Preview: ${count} proposed link(s) for ${mrid.slice(0, 8)}…`);
+      const layers = repairPreviewToGeoJson(preview.result);
+      setRepairPreviewLayers(layers);
+      const asset = assets.find((a) => a.mrid === mrid);
+      await focusAssetOnMap(mrid, {
+        name: asset?.name,
+        coordinates: stagingPointCoords(asset?.geom),
+      });
     } catch (err) {
       setRepairPreview(null);
+      clearRepairPreviewLayers();
       setStatus(err instanceof Error ? err.message : 'Preview failed');
     } finally {
       setRepairBusy(false);
@@ -225,13 +333,14 @@ export function GiopOperationsTab({
   };
 
   const handleRepairApply = async () => {
-    const mrid = repairTarget || assets[0]?.mrid;
+    const mrid = activeRepairMrid;
     if (!mrid) return;
     setRepairBusy(true);
     setStatus('Applying topology repair…');
     try {
       const result = await repairTopology(mrid, { dryRun: false });
       setRepairPreview(null);
+      clearRepairPreviewLayers();
       const count = result.result.applied?.length ?? 0;
       setStatus(`Repair applied: ${count} segment link(s) for ${mrid.slice(0, 8)}…`);
       onRefreshTopology?.();
@@ -258,8 +367,20 @@ export function GiopOperationsTab({
   };
 
   return (
-    <div className="h-full overflow-auto p-6 space-y-6">
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+    <div
+      className={
+        embedded
+          ? 'h-full min-h-0 flex flex-col overflow-hidden'
+          : 'h-full overflow-auto p-6 space-y-6'
+      }
+    >
+      <div
+        className={
+          embedded
+            ? `shrink-0 grid grid-cols-5 gap-2 px-4 py-2 border-b ${isLightMode ? 'border-slate-200 bg-slate-50' : 'border-slate-800 bg-slate-900/40'}`
+            : 'grid grid-cols-2 md:grid-cols-5 gap-4'
+        }
+      >
         {[
           { label: 'Pending field', value: stats.pending, color: '#f59e0b' },
           { label: 'Staged', value: stats.staged, color: '#3b82f6' },
@@ -269,16 +390,24 @@ export function GiopOperationsTab({
         ].map((item) => (
           <div
             key={item.label}
-            className={`rounded-xl border p-4 ${isLightMode ? 'border-slate-200 bg-white' : 'border-[#283246]/75 bg-[#0f141d]'}`}
+            className={
+              embedded
+                ? `rounded-lg border px-3 py-2 ${isLightMode ? 'border-slate-200 bg-white' : 'border-slate-800 bg-premium-sidebar'}`
+                : `rounded-xl border p-4 ${isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/75 bg-premium-sidebar'}`
+            }
           >
-            <p className={`text-xs uppercase tracking-wide ${isLightMode ? 'text-slate-500' : 'text-[#93a0b8]'}`}>{item.label}</p>
-            <p className="text-2xl font-light mt-1" style={{ color: item.color }}>{item.value}</p>
-            <p className={`text-xs mt-1 ${isLightMode ? 'text-slate-400' : 'text-[#6b7a94]'}`}>
-              {((item.value / total) * 100).toFixed(0)}% of queue
-            </p>
+            <p className={`text-xs uppercase tracking-wide ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>{item.label}</p>
+            <p className={`font-light ${embedded ? 'text-lg mt-0.5' : 'text-2xl mt-1'}`} style={{ color: item.color }}>{item.value}</p>
+            {!embedded && (
+              <p className={`text-xs mt-1 ${isLightMode ? 'text-slate-400' : 'text-[#6b7a94]'}`}>
+                {((item.value / total) * 100).toFixed(0)}% of queue
+              </p>
+            )}
           </div>
         ))}
       </div>
+
+      <div className={embedded ? 'flex-1 min-h-0 overflow-auto px-4 py-3 space-y-4' : 'contents'}>
 
       {confirmation && (
         <div
@@ -312,8 +441,10 @@ export function GiopOperationsTab({
 
       <div className="flex items-center justify-between gap-4">
         <div>
-          <h3 className={`text-sm font-semibold ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>Asset Verification</h3>
-          <p className={`text-xs ${isLightMode ? 'text-slate-500' : 'text-slate-400'}`}>{status}</p>
+          <h3 className={`text-sm font-semibold ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>Asset Verification</h3>
+          <p className={`text-xs ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>
+            {status || 'DQ-cleared staging assets ready for promotion'}
+          </p>
         </div>
         <button
           type="button"
@@ -385,20 +516,23 @@ export function GiopOperationsTab({
 
       {repairPreview && (repairPreview.result.proposed?.length ?? 0) > 0 && (
         <div className={`rounded-xl border p-3 text-xs ${isLightMode ? 'border-amber-200 bg-amber-50' : 'border-amber-900/50 bg-amber-950/30'}`}>
-          <p className="font-semibold mb-2">Repair preview ({repairPreview.result.proposed?.length} proposed)</p>
-          <ul className="space-y-1 font-mono max-h-32 overflow-auto">
+          <p className="font-semibold mb-2">
+            Repair preview ({repairPreview.result.proposed?.length} proposed)
+            <span className={`ml-2 font-normal ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>
+              amber = before · green = after {embedded ? '(map above)' : '(see map panel)'}
+            </span>
+          </p>
+          <ul className="space-y-1 max-h-32 overflow-auto">
             {repairPreview.result.proposed?.map((item, i) => (
-              <li key={i}>{JSON.stringify(item)}</li>
+              <li key={i} className={isLightMode ? 'text-slate-700' : 'text-premium-text-secondary'}>
+                {formatRepairProposalSummary(item)}
+              </li>
             ))}
           </ul>
         </div>
       )}
 
-      {repairTarget && (
-        <GiopLineageTimeline assetMrid={repairTarget} isLightMode={isLightMode} compact />
-      )}
-
-      <div className={`rounded-xl border overflow-hidden ${isLightMode ? 'border-slate-200' : 'border-slate-800'}`}>
+      <div className={`rounded-xl border overflow-hidden ${isLightMode ? 'border-slate-200' : 'border-premium-border/80'}`}>
         <table className="w-full text-sm text-left">
           <thead className={`text-xs uppercase sticky top-0 ${isLightMode ? 'bg-slate-100 text-slate-500' : 'bg-slate-900 text-slate-400'}`}>
             <tr>
@@ -413,8 +547,7 @@ export function GiopOperationsTab({
                   onChange={toggleSelectAll}
                 />
               </th>
-              <th className="px-4 py-3">Asset MRID</th>
-              <th className="px-4 py-3">Name</th>
+              <th className="px-4 py-3">Asset</th>
               <th className="px-4 py-3">Type</th>
               <th className="px-4 py-3">Voltage</th>
               <th className="px-4 py-3">Validation</th>
@@ -426,18 +559,19 @@ export function GiopOperationsTab({
           <tbody className={`divide-y ${isLightMode ? 'divide-slate-200' : 'divide-slate-800'}`}>
             {loading && (
               <tr>
-                <td colSpan={9} className="px-4 py-6 text-slate-500">Loading staging assets…</td>
+                <td colSpan={8} className="px-4 py-6 text-slate-500">Loading staging assets…</td>
               </tr>
             )}
             {!loading && assets.length === 0 && (
               <tr>
-                <td colSpan={9} className="px-4 py-6 text-slate-500">No pending field assets</td>
+                <td colSpan={8} className="px-4 py-6 text-slate-500">
+                  No assets released from Data Quality yet
+                </td>
               </tr>
             )}
             {assets.map((row) => {
-              const canApprove = row.validation === 'PENDING_FIELD' || row.validation === 'STAGED';
+              const canApprove = row.validation === 'STAGED';
               const canReject =
-                row.validation === 'PENDING_FIELD' ||
                 row.validation === 'STAGED' ||
                 row.validation === 'IN_CONFLICT';
               const isRejecting = rejectingMrid === row.mrid;
@@ -446,17 +580,15 @@ export function GiopOperationsTab({
                 <tr
                   key={row.mrid}
                   className={`cursor-pointer ${isLightMode ? 'hover:bg-slate-50' : 'hover:bg-slate-900/60'} ${
+                    rowFocusMrid === row.mrid
+                      ? isLightMode
+                        ? 'bg-blue-50'
+                        : 'bg-blue-950/30'
+                      : ''
+                  } ${
                     isRejectBusy ? (isLightMode ? 'bg-amber-50/80' : 'bg-amber-950/20') : ''
                   }`}
-                  onClick={() => {
-                    setRepairTarget(row.mrid);
-                    const coords = row.geom?.coordinates;
-                    setSelection(row.mrid, {
-                      name: row.name,
-                      coordinates: coords ?? null,
-                      source: 'table',
-                    });
-                  }}
+                  onClick={() => activateRow(row)}
                 >
                   <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
                     {canApprove && (
@@ -468,18 +600,26 @@ export function GiopOperationsTab({
                       />
                     )}
                   </td>
-                  <td className="px-4 py-3 font-mono text-xs">{row.mrid}</td>
                   <td className="px-4 py-3">
-                    <input
-                      type="text"
-                      defaultValue={row.name ?? ''}
-                      className={`w-full rounded px-2 py-1 text-sm border ${isLightMode ? 'bg-white border-slate-300' : 'bg-slate-900 border-slate-700'}`}
-                      onClick={(e) => e.stopPropagation()}
-                      onChange={(e) => {
-                        const value = e.target.value.trim();
-                        if (value) void debouncedPatchName(row.mrid, value);
-                      }}
-                    />
+                    <div className="flex flex-col gap-1">
+                      <input
+                        type="text"
+                        defaultValue={row.name ?? ''}
+                        placeholder={assetDisplayName(row)}
+                        className={`w-full rounded px-2 py-1 text-sm font-medium border ${isLightMode ? 'bg-white border-slate-300' : 'bg-slate-900 border-slate-700'}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          activateRow(row);
+                        }}
+                        onChange={(e) => {
+                          const value = e.target.value.trim();
+                          if (value) void debouncedPatchName(row.mrid, value);
+                        }}
+                      />
+                      <span className={`text-[10px] font-mono ${isLightMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                        {row.mrid}
+                      </span>
+                    </div>
                   </td>
                   <td className="px-4 py-3 text-xs text-slate-400">
                     {row.asset_kind?.replaceAll('_', ' ') ?? '—'}
@@ -504,7 +644,7 @@ export function GiopOperationsTab({
                   </td>
                   <td className="px-4 py-3">
                     <span className={`px-2 py-0.5 rounded text-xs ${validationBadgeClass(row.validation)}`}>
-                      {row.validation ?? '—'}
+                      {validationLabel(row.validation)}
                     </span>
                   </td>
                   <td className="px-4 py-3 text-xs text-slate-400 font-mono">
@@ -514,6 +654,24 @@ export function GiopOperationsTab({
                     {inspectionsByAsset[row.mrid]?.ai_validation_status ?? '—'}
                   </td>
                   <td className="px-4 py-3 space-y-1">
+                    <button
+                      type="button"
+                      className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded mr-1 ${
+                        rowFocusMrid === row.mrid
+                          ? 'bg-cyan-600 text-white'
+                          : isLightMode
+                            ? 'bg-slate-200 hover:bg-slate-300 text-slate-700'
+                            : 'bg-slate-700 hover:bg-slate-600 text-slate-100'
+                      }`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        focusRowOnMap(row);
+                      }}
+                      title="Pan the map to this asset"
+                    >
+                      <MapPin className="h-3 w-3" />
+                      View on map
+                    </button>
                     {canApprove && (
                       <button
                         type="button"
@@ -586,6 +744,7 @@ export function GiopOperationsTab({
             })}
           </tbody>
         </table>
+      </div>
       </div>
     </div>
   );

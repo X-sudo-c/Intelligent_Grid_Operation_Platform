@@ -41,7 +41,7 @@ export function GiopInsightsTab({ isLightMode }: GiopInsightsTabProps) {
 
   return (
     <div className="h-full overflow-auto p-6 max-w-3xl space-y-4">
-      <h3 className={`text-sm font-semibold ${isLightMode ? 'text-slate-800' : 'text-slate-200'}`}>
+      <h3 className={`text-sm font-semibold ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>
         Energy accounting
       </h3>
       <div className="grid grid-cols-2 gap-3">
@@ -72,7 +72,7 @@ export function GiopInsightsTab({ isLightMode }: GiopInsightsTabProps) {
       </button>
       {error && <p className="text-xs text-red-400">{error}</p>}
       {result && (
-        <div className={`rounded-lg border p-4 text-sm space-y-1 ${isLightMode ? 'border-slate-200' : 'border-slate-700'}`}>
+        <div className={`rounded-lg border p-4 text-sm space-y-1 ${isLightMode ? 'border-slate-200' : 'border-premium-border/70'}`}>
           <p>
             In: <strong>{result.energy_in_kwh}</strong> kWh · Out: <strong>{result.energy_out_kwh}</strong> kWh
           </p>

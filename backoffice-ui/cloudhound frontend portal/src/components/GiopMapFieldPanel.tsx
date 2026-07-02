@@ -68,8 +68,11 @@ export function GiopMapFieldPanel({
   onFocusAsset,
 }: GiopMapFieldPanelProps) {
   const shell = isLightMode
-    ? 'border-slate-200 bg-white/95 text-slate-800'
-    : 'border-slate-700 bg-slate-900/95 text-slate-100';
+    ? 'border-slate-200/90 bg-white text-slate-800 shadow-premium-lg'
+    : 'border-premium-border/50 bg-premium-card text-slate-100 shadow-premium-lg';
+
+  const rowDivider = isLightMode ? 'border-slate-100' : 'border-premium-border/40';
+  const headerDivider = isLightMode ? 'border-slate-200/80' : 'border-premium-border/45';
 
   const isTerritory = mode === 'territory';
   const [territoryMounted, setTerritoryMounted] = useState(isTerritory);
@@ -194,11 +197,11 @@ export function GiopMapFieldPanel({
 
   return (
     <div
-      className={`giop-field-panel w-72 overflow-hidden rounded-lg border shadow-lg ${shell} ${
+      className={`giop-field-panel w-72 overflow-hidden rounded-lg border ${shell} ${
         territoryChrome ? 'giop-field-panel--territory giop-field-panel--tall' : 'giop-field-panel--crews'
       } ${isLightMode ? 'giop-field-panel--light' : 'giop-field-panel--dark'}`}
     >
-      <div className="flex items-center justify-between border-b border-inherit px-3 py-2">
+      <div className={`flex items-center justify-between border-b px-3 py-2 ${headerDivider}`}>
         <div className="giop-field-panel-heading min-w-0 flex-1">
           <div
             className={`giop-field-panel-heading-track ${isTerritory ? 'giop-field-panel-heading-track--territory' : ''}`}
@@ -260,8 +263,8 @@ export function GiopMapFieldPanel({
                   <button
                     key={tech.technician_id}
                     type="button"
-                    className={`giop-field-panel-row w-full text-left px-3 py-2 border-b border-inherit/40 hover:bg-cyan-500/10 transition-colors duration-200 ${
-                      isLightMode ? 'hover:bg-cyan-50' : ''
+                    className={`giop-field-panel-row w-full text-left px-3 py-2 border-b last:border-b-0 hover:bg-cyan-500/10 transition-colors duration-200 ${rowDivider} ${
+                      isLightMode ? 'hover:bg-cyan-50' : 'hover:bg-premium-hover/60'
                     } ${!isTerritory && !stageMinHeight ? 'giop-field-panel-row--enter' : ''}`}
                     style={!isTerritory && !stageMinHeight ? { animationDelay: `${index * 24}ms` } : undefined}
                     onClick={() => {
@@ -304,7 +307,7 @@ export function GiopMapFieldPanel({
                         <li key={asset.mrid}>
                           <button
                             type="button"
-                            className="w-full text-left text-xs rounded px-2 py-1 hover:bg-slate-800/40 transition-colors duration-200"
+                            className="w-full text-left text-xs rounded px-2 py-1 hover:bg-premium-hover/40 transition-colors duration-200"
                             onClick={() => onFocusAsset?.(asset.mrid, coords ?? undefined)}
                           >
                             <span className="font-mono">{asset.mrid.slice(0, 8)}…</span>

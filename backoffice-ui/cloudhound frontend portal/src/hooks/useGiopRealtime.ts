@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { getGiopSupabaseClient } from '../lib/giopSupabaseClient';
 
 interface UseGiopRealtimeOptions {
@@ -12,6 +12,13 @@ export function useGiopRealtime({
   onMasterChange,
   enabled = true,
 }: UseGiopRealtimeOptions) {
+  // Callers pass inline callbacks; keep the latest in refs so the websocket
+  // channel is created once per `enabled` flip, not torn down on every render.
+  const onStagingChangeRef = useRef(onStagingChange);
+  const onMasterChangeRef = useRef(onMasterChange);
+  onStagingChangeRef.current = onStagingChange;
+  onMasterChangeRef.current = onMasterChange;
+
   useEffect(() => {
     if (!enabled) return;
 
@@ -22,32 +29,32 @@ export function useGiopRealtime({
       .on(
         'postgres_changes',
         { event: '*', schema: 'staging', table: 'connectivity_nodes' },
-        (payload) => onStagingChange?.(`staging nodes ${payload.eventType}`),
+        (payload) => onStagingChangeRef.current?.(`staging nodes ${payload.eventType}`),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'staging', table: 'identified_objects' },
-        (payload) => onStagingChange?.(`staging assets ${payload.eventType}`),
+        (payload) => onStagingChangeRef.current?.(`staging assets ${payload.eventType}`),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'connectivity_nodes' },
-        (payload) => onMasterChange?.(`nodes ${payload.eventType}`),
+        (payload) => onMasterChangeRef.current?.(`nodes ${payload.eventType}`),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'ac_line_segments' },
-        (payload) => onMasterChange?.(`lines ${payload.eventType}`),
+        (payload) => onMasterChangeRef.current?.(`lines ${payload.eventType}`),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'identified_objects' },
-        (payload) => onMasterChange?.(`assets ${payload.eventType}`),
+        (payload) => onMasterChangeRef.current?.(`assets ${payload.eventType}`),
       )
       .subscribe();
 
     return () => {
       void supabase.removeChannel(channel);
     };
-  }, [enabled, onStagingChange, onMasterChange]);
+  }, [enabled]);
 }

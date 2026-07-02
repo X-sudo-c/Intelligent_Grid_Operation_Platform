@@ -55,7 +55,7 @@ export function ValidationRunProgressContent({
   const current = resolveActivePhase(
     progress?.current_phase ?? (runId === 'pending' ? 'queued' : 'starting'),
   );
-  const muted = isLightMode ? 'text-slate-500' : 'text-slate-400';
+  const muted = isLightMode ? 'text-slate-500' : 'text-premium-muted';
   const pct = phaseProgressPct(completed, phases.length, isDone);
 
   return (

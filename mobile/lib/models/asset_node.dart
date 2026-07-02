@@ -57,6 +57,12 @@ class AssetNode {
       latitude!.isFinite &&
       longitude!.isFinite;
 
+  /// Device-only capture not yet on staging (mrid like `local:42`).
+  bool get isLocalQueued =>
+      layer == MapNodeLayer.queuedLocal ||
+      mrid.startsWith('local:') ||
+      mrid.startsWith('local-');
+
   AssetNode copyWith({MapNodeLayer? layer, AssetKind? assetKind, int? wireDegree}) {
     return AssetNode(
       mrid: mrid,

@@ -16,3 +16,13 @@ export function dqExceptionMapMrid(item: GiopDqException): string {
   }
   return item.record_mrid;
 }
+
+/** Staging/DQ exception coordinates when the API enriched the row. */
+export function dqExceptionCoordinates(
+  item: GiopDqException,
+): [number, number] | null {
+  const lon = item.longitude;
+  const lat = item.latitude;
+  if (lon == null || lat == null || Number.isNaN(lon) || Number.isNaN(lat)) return null;
+  return [lon, lat];
+}

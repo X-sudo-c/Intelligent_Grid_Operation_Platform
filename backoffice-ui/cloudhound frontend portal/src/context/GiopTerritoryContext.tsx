@@ -412,14 +412,20 @@ export function GiopTerritoryProvider({
     return () => {
       cancelled = true;
       window.clearTimeout(debounceTimer);
-      map.off('zoom', onZoom);
-      map.off('moveend', scheduleGrid);
-      map.off('zoomend', scheduleGrid);
-      map.off('click', onTerritoryMapClick);
-      map.off('dblclick', onTerritoryDblClick);
-      map.doubleClickZoom.enable();
-      map.getCanvas().style.cursor = '';
-      whenMapReady(map, () => removeLayers(map));
+      // GiopMapView may have already called map.remove() during unmount —
+      // touching a destroyed map instance throws.
+      try {
+        map.off('zoom', onZoom);
+        map.off('moveend', scheduleGrid);
+        map.off('zoomend', scheduleGrid);
+        map.off('click', onTerritoryMapClick);
+        map.off('dblclick', onTerritoryDblClick);
+        map.doubleClickZoom.enable();
+        map.getCanvas().style.cursor = '';
+        whenMapReady(map, () => removeLayers(map));
+      } catch {
+        // Map already destroyed — nothing to clean up.
+      }
     };
   }, [
     active,
@@ -584,13 +590,13 @@ export function GiopTerritoryMapToggle({ inline = false }: { inline?: boolean } 
         role="switch"
         aria-checked={active}
         className={`flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors ${
-          isLightMode ? 'hover:bg-slate-100/80' : 'hover:bg-slate-800/60'
+          isLightMode ? 'hover:bg-slate-100/80' : 'hover:bg-premium-hover/80'
         }`}
         title="Assign field-work territories (H3 hexagons)"
       >
         <span
-          className="h-2.5 w-2.5 shrink-0 rounded-full ring-2 ring-inset ring-white/20"
-          style={{ backgroundColor: '#f59e0b', opacity: active ? 1 : 0.35 }}
+          className="h-2.5 w-2.5 shrink-0 rounded-full ring-2 ring-inset ring-white/15"
+          style={{ backgroundColor: '#f59e0b', opacity: active ? 1 : 0.4 }}
           aria-hidden
         />
         <span
@@ -598,17 +604,21 @@ export function GiopTerritoryMapToggle({ inline = false }: { inline?: boolean } 
             active
               ? isLightMode
                 ? 'text-amber-700'
-                : 'text-amber-300'
+                : 'text-amber-400'
               : isLightMode
                 ? 'text-slate-500'
-                : 'text-slate-400'
+                : 'text-premium-muted'
           }`}
         >
           Territory mode
         </span>
         <span
           className={`relative h-4 w-7 shrink-0 rounded-full transition-colors duration-200 ${
-            active ? 'bg-amber-500' : isLightMode ? 'bg-slate-300' : 'bg-slate-700'
+            active
+              ? 'bg-amber-500'
+              : isLightMode
+                ? 'bg-slate-300'
+                : 'bg-premium-hover-strong'
           }`}
           aria-hidden
         >
@@ -631,7 +641,7 @@ export function GiopTerritoryMapToggle({ inline = false }: { inline?: boolean } 
           ? 'border-amber-500 bg-amber-600 text-white shadow-[0_8px_24px_rgba(245,158,11,0.28)] scale-[1.02]'
           : isLightMode
             ? 'border-slate-200 bg-white/90 text-slate-700 hover:bg-white hover:shadow-md'
-            : 'border-slate-700 bg-slate-900/90 text-slate-200 hover:bg-slate-800 hover:shadow-md'
+            : 'border-premium-border/70 bg-premium-card text-slate-200 hover:bg-premium-hover hover:shadow-md'
       }`}
       title="Assign field-work territories (H3 hexagons)"
     >
@@ -672,7 +682,7 @@ function TerritoryAssignmentList({
             <button
               type="button"
               className={`w-full rounded px-1 py-0.5 text-left hover:underline ${
-                isLightMode ? 'hover:bg-slate-100' : 'hover:bg-slate-800'
+                isLightMode ? 'hover:bg-slate-100' : 'hover:bg-premium-hover'
               }`}
               onClick={() => onPick(f)}
             >
@@ -841,7 +851,7 @@ export function GiopTerritoryAssignPanel() {
           disabled={saving || selectedCount === 0}
           onClick={() => void handleUnassignSelected()}
           className={`rounded border px-3 py-1.5 font-medium ${
-            isLightMode ? 'border-slate-300 hover:bg-slate-50' : 'border-slate-600 hover:bg-slate-800'
+            isLightMode ? 'border-slate-300 hover:bg-slate-50' : 'border-slate-600 hover:bg-premium-hover'
           }`}
         >
           Unassign
@@ -851,7 +861,7 @@ export function GiopTerritoryAssignPanel() {
           disabled={selectedCount === 0}
           onClick={clearSelection}
           className={`rounded border px-3 py-1.5 ${
-            isLightMode ? 'border-slate-300 hover:bg-slate-50' : 'border-slate-600 hover:bg-slate-800'
+            isLightMode ? 'border-slate-300 hover:bg-slate-50' : 'border-slate-600 hover:bg-premium-hover'
           }`}
         >
           Clear

@@ -42,8 +42,8 @@ export function GiopExportsTab({ isLightMode }: GiopExportsTabProps) {
   const [busy, setBusy] = useState<string | null>(null);
   const [status, setStatus] = useState('');
 
-  const card = isLightMode ? 'border-slate-200 bg-white' : 'border-slate-700 bg-slate-900/40';
-  const muted = isLightMode ? 'text-slate-500' : 'text-slate-400';
+  const card = isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/70 bg-premium-card';
+  const muted = isLightMode ? 'text-slate-500' : 'text-premium-muted';
   const btn = 'rounded bg-cyan-700 hover:bg-cyan-600 disabled:opacity-50 text-white text-sm py-1.5 px-3';
   const btnSecondary = 'rounded border border-cyan-700/50 hover:bg-cyan-900/20 disabled:opacity-50 text-cyan-700 dark:text-cyan-300 text-sm py-1.5 px-3';
 
@@ -154,7 +154,7 @@ export function GiopExportsTab({ isLightMode }: GiopExportsTabProps) {
           </thead>
           <tbody>
             {jobs.map((job) => (
-              <tr key={job.id} className={`border-t ${isLightMode ? 'border-slate-200' : 'border-slate-800'}`}>
+              <tr key={job.id} className={`border-t ${isLightMode ? 'border-slate-200' : 'border-premium-border/80'}`}>
                 <td className="px-3 py-2 whitespace-nowrap">
                   {job.created_at ? new Date(job.created_at).toLocaleString() : '—'}
                 </td>

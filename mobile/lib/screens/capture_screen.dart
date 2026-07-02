@@ -86,6 +86,7 @@ class _CaptureScreenState extends State<CaptureScreen> {
           accuracy: LocationAccuracy.high,
         ),
       );
+      if (!mounted) return;
       setState(() {
         _position = pos;
         _status =
@@ -93,6 +94,7 @@ class _CaptureScreenState extends State<CaptureScreen> {
         _loading = false;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _status = e.toString();
         _loading = false;
@@ -124,6 +126,7 @@ class _CaptureScreenState extends State<CaptureScreen> {
         offlineSessionStartedAt: DateTime.now().toUtc().toIso8601String(),
         operatorId: widget.api.operatorId,
       );
+      if (!mounted) return;
       if (result.conflict) {
         setState(() {
           _status = result.message ?? 'Conflict — server record is newer';
@@ -143,6 +146,7 @@ class _CaptureScreenState extends State<CaptureScreen> {
         latitude: _position!.latitude,
       );
       final pending = await OfflineDb.pendingCaptures();
+      if (!mounted) return;
       setState(() {
         _status =
             'Offline — queued locally (${pending.length} pending). Will sync when online.';

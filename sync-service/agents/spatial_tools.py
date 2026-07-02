@@ -7,6 +7,12 @@ from typing import Any
 from agents import spatial
 
 
+def tool_resolve_place(conn, *, query: str, allow_geocode: bool | None = None) -> dict[str, Any]:
+    from agents.place_resolve import resolve_place
+
+    return resolve_place(conn, query, allow_geocode=allow_geocode)
+
+
 def tool_resolve_territory(
     conn,
     *,

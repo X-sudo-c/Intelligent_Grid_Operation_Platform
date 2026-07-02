@@ -9,6 +9,7 @@ class UserLocationMarker extends StatefulWidget {
     required this.heading,
     required this.headingConfidence,
     this.accuracyMeters,
+    this.navigationMode = false,
   });
 
   /// Device heading in degrees clockwise from north (0–360).
@@ -17,6 +18,9 @@ class UserLocationMarker extends StatefulWidget {
   /// 0..1 confidence for heading quality.
   final double headingConfidence;
   final double? accuracyMeters;
+
+  /// Uber-style: arrow fixed pointing up; map rotates underneath.
+  final bool navigationMode;
 
   @override
   State<UserLocationMarker> createState() => _UserLocationMarkerState();
@@ -44,9 +48,15 @@ class _UserLocationMarkerState extends State<UserLocationMarker>
   @override
   Widget build(BuildContext context) {
     final heading = widget.heading;
-    final showWedge = heading != null && widget.headingConfidence >= 0.45;
-    final wedgeRotation = heading != null ? heading * math.pi / 180 : 0.0;
-    final wedgeOpacity = widget.headingConfidence.clamp(0.35, 1.0);
+    final showWedge = widget.navigationMode ||
+        (heading != null && widget.headingConfidence >= 0.45);
+    // Navigation mode: wedge stays screen-up; map bearing handles rotation.
+    final wedgeRotation = widget.navigationMode
+        ? 0.0
+        : (heading != null ? heading * math.pi / 180 : 0.0);
+    final wedgeOpacity = widget.navigationMode
+        ? 1.0
+        : widget.headingConfidence.clamp(0.35, 1.0);
     final accuracy = widget.accuracyMeters;
     final accuracyRadius = accuracy != null && accuracy.isFinite
         ? (12 + accuracy.clamp(3, 35) * 0.55)
