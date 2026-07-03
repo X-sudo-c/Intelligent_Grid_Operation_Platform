@@ -15,7 +15,7 @@ from typing import Any, Literal, Optional
 
 import psycopg2
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from neo4j import GraphDatabase
@@ -230,7 +230,8 @@ from agents import approval_agent, cleanup_agent, kpi, proposal_agent, repositor
 from pathlib import Path
 
 load_dotenv()
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+# Project .env must win over stale shell exports (e.g. old qwen-plus in the environment).
+load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
 
 GRAPH_URI = os.getenv("GRAPH_DB_URI") or os.getenv("MEMGRAPH_URI", "bolt://localhost:7687")
 SUPABASE_DB_URI = os.getenv("SUPABASE_DB_URI")
@@ -3674,15 +3675,20 @@ async def get_validation_run_progress(run_id: str):
 
 
 @app.get("/api/v1/agents/status")
-async def get_agents_status():
-    from agents.llm.provider import llm_configured
-    import os
+async def get_agents_status(probe: bool = Query(default=False)):
+    from agents.llm.provider import llm_base_url, llm_configured, llm_health, llm_model
+    from agents.llm.react import tool_names
 
-    model = os.getenv("GIOP_LLM_MODEL") or "gpt-4o-mini"
-    return {
+    configured = llm_configured()
+    model = llm_model()
+    tools = tool_names()
+    payload: dict[str, Any] = {
         "engine": "online" if SUPABASE_DB_URI else "offline",
-        "llm_configured": llm_configured(),
-        "llm_model": model if llm_configured() else None,
+        "llm_configured": configured,
+        "llm_model": model if configured else None,
+        "llm_base_url": llm_base_url() if configured else None,
+        "llm_tools": tools,
+        "llm_tool_count": len(tools),
         "agents": [
             "OrchestratorAgent",
             "ValidatorAgent",
@@ -3693,6 +3699,11 @@ async def get_agents_status():
             "StewardAssistant",
         ],
     }
+    if configured:
+        health = await asyncio.to_thread(llm_health, force=probe)
+        payload["llm_reachable"] = bool(health.get("reachable"))
+        payload["llm_error"] = health.get("error")
+    return payload
 
 
 @app.get("/api/v1/validation/runs")
@@ -3821,17 +3832,76 @@ async def portal_voice_status():
     }
 
 
+REALTIME_MODEL = os.getenv("GIOP_REALTIME_MODEL", "gpt-realtime")
+
+
+def _mint_realtime_secret(operator_id: str | None) -> dict[str, Any]:
+    """Create a short-lived Realtime client secret for the browser (GA endpoint)."""
+    import requests
+    from agents.llm.provider import llm_base_url
+
+    api_key = os.getenv("GIOP_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("LLM not configured — set GIOP_LLM_API_KEY.")
+    base = llm_base_url()
+    if "openai.com" not in base:
+        raise RuntimeError(
+            "Realtime speech-to-speech requires the OpenAI API "
+            f"(GIOP_LLM_BASE_URL is {base}). Set an OpenAI key/base to use live voice."
+        )
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "OpenAI-Safety-Identifier": (operator_id or "giop-portal")[:64],
+    }
+    body = {
+        "expires_after": {"anchor": "created_at", "seconds": 3600},
+        "session": {"type": "realtime", "model": REALTIME_MODEL},
+    }
+    resp = requests.post(
+        f"{base}/realtime/client_secrets",
+        headers=headers,
+        json=body,
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        detail = resp.text[:400]
+        try:
+            err = resp.json().get("error") or {}
+            detail = err.get("message") or detail
+        except Exception:
+            pass
+        raise RuntimeError(f"Realtime session mint failed: {detail}")
+    data = resp.json()
+    token = data.get("value")
+    if not token:
+        raise RuntimeError("Realtime API returned no client secret value.")
+    return {"value": token, "expires_at": data.get("expires_at"), "model": REALTIME_MODEL}
+
+
+@app.post("/api/v1/portal/ai/realtime/session")
+async def portal_realtime_session(payload: dict[str, Any] | None = None):
+    """Mint an ephemeral Realtime client secret for the live-voice PoC (browser WebRTC)."""
+    operator_id = (payload or {}).get("operator_id") if isinstance(payload, dict) else None
+    try:
+        return await asyncio.to_thread(_mint_realtime_secret, operator_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.post("/api/v1/portal/ai/transcribe")
 async def portal_ai_transcribe(audio: UploadFile = File(...)):
     from agents import voice_stt
 
     if not voice_stt.is_available():
+        provider = voice_stt.active_provider()
         raise HTTPException(
             status_code=503,
             detail=(
-                "Local STT not installed. In the repo venv run: "
-                "pip install -r sync-service/requirements-voice.txt "
-                "(requires ffmpeg)"
+                "Speech-to-text not configured. Set GIOP_LLM_API_KEY for OpenAI STT "
+                f"(VOICE_STT_PROVIDER={provider}) or install faster-whisper for local mode."
             ),
         )
     data = await audio.read()
@@ -3845,7 +3915,18 @@ async def portal_ai_transcribe(audio: UploadFile = File(...)):
         )
         from agents.voice_normalize import normalize_transcript
 
-        normalized, meta = normalize_transcript(text)
+        boundary_names: list[str] | None = None
+        if SUPABASE_DB_URI:
+            try:
+                conn = pooled_connect(SUPABASE_DB_URI)
+                try:
+                    voice_stt.warm_boundary_prompt(conn)
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
+        normalized, meta = normalize_transcript(text, boundary_names=boundary_names)
         return {
             "text": normalized,
             "raw": meta.get("raw"),
@@ -3857,6 +3938,65 @@ async def portal_ai_transcribe(audio: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/portal/ai/voice-audio-turn")
+async def portal_voice_audio_turn(
+    audio: UploadFile = File(...),
+    session_id: str | None = Form(None),
+    exception_id: str | None = Form(None),
+    mrid: str | None = Form(None),
+    operator_id: str | None = Form(None),
+    context: str | None = Form(None),
+):
+    """Transcribe audio and run the voice copilot in one request (lower latency)."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    from agents import voice_stt
+    from agents.voice import run_voice_turn_from_audio
+
+    if not voice_stt.is_available():
+        raise HTTPException(
+            status_code=503,
+            detail="Speech-to-text not configured — set GIOP_LLM_API_KEY (OpenAI STT).",
+        )
+    data = await audio.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty audio upload")
+    ctx: dict[str, Any] = {}
+    if context:
+        try:
+            parsed = json.loads(context)
+            if isinstance(parsed, dict):
+                ctx = parsed
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Invalid context JSON") from exc
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        result = await asyncio.to_thread(
+            run_voice_turn_from_audio,
+            conn,
+            data=data,
+            content_type=audio.content_type,
+            session_id=session_id,
+            exception_id=exception_id,
+            mrid=mrid,
+            operator_id=operator_id,
+            context=ctx,
+        )
+        conn.commit()
+        return result.model_dump()
+    except ValueError as exc:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        conn.rollback()
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
 
 
 @app.post("/api/v1/portal/ai/voice-turn")

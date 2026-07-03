@@ -7,7 +7,9 @@ import {
   useState,
   type KeyboardEvent,
 } from 'react';
-import { Layers, MapPin, Search, UserRound, Wrench } from 'lucide-react';
+import { Layers, Search, UserRound, Wrench } from 'lucide-react';
+import { useGiopVoiceMode } from '../context/GiopVoiceModeContext';
+import { GiopTwistWaveCanvas } from './GiopTwistWaveCanvas';
 import { getMapGeocode, type GiopMapSearchKind, type GiopMapSearchResult } from '../api/giop-api';
 import {
   mergeGeocodePlaces,
@@ -34,7 +36,6 @@ const FILTER_OPTIONS: {
   icon: typeof Search;
 }[] = [
   { id: 'all', label: 'All', title: 'Search everything', icon: Search },
-  { id: 'place', label: 'Places', title: 'ECG districts + map towns (OSM)', icon: MapPin },
   { id: 'asset', label: 'Assets', title: 'Staging assets on map', icon: Layers },
   { id: 'work_order', label: 'Orders', title: 'Work orders', icon: Wrench },
   { id: 'crew', label: 'Crews', title: 'Field technicians', icon: UserRound },
@@ -87,7 +88,7 @@ export function GiopMapSearchBar({
   const [geocodeHits, setGeocodeHits] = useState<GiopMapSearchResult[]>([]);
   const [geocoding, setGeocoding] = useState(false);
 
-  const wantsGeocode = filter === 'all' || filter === 'place';
+  const wantsGeocode = filter === 'all';
 
   useEffect(() => {
     const q = query.trim();
@@ -245,6 +246,8 @@ export function GiopMapSearchBar({
   const showPanel = open && query.trim().length >= 1;
   const indexing = !placesReady && wantsGeocode;
   const busy = indexing || geocoding;
+  const voice = useGiopVoiceMode();
+  const voiceActive = voice.mapVoiceActive || voice.recording;
 
   return (
     <div
@@ -284,7 +287,39 @@ export function GiopMapSearchBar({
       </div>
 
       <div className="giop-map-spotlight__filters" role="group" aria-label="Search filters">
-        {FILTER_OPTIONS.map(({ id, title, icon: Icon }) => {
+        {FILTER_OPTIONS.slice(0, 1).map(({ id, title, icon: Icon }) => {
+          const active = filter === id;
+          return (
+            <button
+              key={id}
+              type="button"
+              title={title}
+              aria-label={title}
+              aria-pressed={active}
+              onClick={() => setSearchFilter(id)}
+              className={`giop-map-spotlight__filter-btn${active ? ' giop-map-spotlight__filter-btn--active' : ''}`}
+            >
+              <Icon className="h-4 w-4" aria-hidden />
+            </button>
+          );
+        })}
+        <button
+          type="button"
+          title="Voice copilot — speak naturally, sends when you pause"
+          aria-label={voiceActive ? 'Stop voice copilot' : 'Start voice copilot — speak naturally'}
+          aria-pressed={voiceActive}
+          onClick={voice.toggleMapVoice}
+          className={`giop-map-spotlight__filter-btn giop-map-spotlight__voice-btn${
+            voiceActive ? ' giop-map-spotlight__voice-btn--active' : ''
+          }`}
+        >
+          <GiopTwistWaveCanvas
+            className="giop-map-spotlight__voice-canvas"
+            density={38}
+            active={voiceActive}
+          />
+        </button>
+        {FILTER_OPTIONS.slice(1).map(({ id, title, icon: Icon }) => {
           const active = filter === id;
           return (
             <button

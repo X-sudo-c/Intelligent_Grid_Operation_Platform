@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Mic, MicOff, Send, Sparkles, X, Bot, User } from 'lucide-react';
-import { portalAiVoiceTurn } from '../api/giop-api';
-import { useGiopVoiceSession } from '../hooks/useGiopVoiceSession';
+import { portalAiVoiceAudioTurn, portalAiVoiceTurn } from '../api/giop-api';
+import { useGiopVoiceMode } from '../context/GiopVoiceModeContext';
+import { useGiopMapOverlay } from '../context/GiopMapOverlayContext';
 import { playCopilotSpeech, stopCopilotSpeech } from '../lib/giopVoicePlayback';
+import { buildCopilotContext } from '../lib/giopMapViewport';
 import {
   COPILOT_SUGGESTIONS,
   describeCopilotUiAction,
@@ -11,6 +13,7 @@ import {
   type GiopCopilotPortalContext,
   type GiopCopilotUiAction,
 } from '../lib/giopCopilotTypes';
+import { GiopVoiceDock } from './GiopVoiceDock';
 import { slideUp, staggerContainer, fadeUpItem } from '../lib/motion';
 
 interface EnhancedCopilotPanelProps {
@@ -37,18 +40,23 @@ export function EnhancedCopilotPanel({
   portalContext,
   onUiAction,
 }: EnhancedCopilotPanelProps) {
+  const { getLiveMapViewport } = useGiopMapOverlay();
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const voiceSessionIdRef = useRef<string | undefined>(undefined);
+  const copilotContextForVoice = useCallback(
+    () => buildCopilotContext(portalContext, getLiveMapViewport),
+    [portalContext, getLiveMapViewport],
+  );
   const [messages, setMessages] = useState<GiopCopilotMessage[]>([
     {
       id: 'welcome',
       role: 'assistant',
       content:
         'I can count poles and assets by district or map view, review staging captures, ' +
-        'highlight territories on the map, and answer by voice. Tap the mic, speak your question, ' +
-        'tap again to send (local Whisper — no Google). Example: "How many poles in Accra?"',
+        'highlight territories on the map, and answer by voice. Tap the wave on the map for ' +
+        'hands-free mode — speak naturally and it sends when you pause; tap the wave or Escape to stop.',
     },
   ]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -97,6 +105,62 @@ export function EnhancedCopilotPanel({
     [onUiAction],
   );
 
+  const runAudioVoiceTurn = useCallback(
+    async (blob: Blob, meta?: { rearmMic?: () => void }) => {
+      if (busy) return;
+      setBusy(true);
+      const pendingId = newId();
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: pendingId,
+          role: 'assistant',
+          content: 'Processing…',
+          pending: true,
+        },
+      ]);
+      try {
+        const resp = await portalAiVoiceAudioTurn({
+          audio: blob,
+          sessionId: voiceSessionIdRef.current,
+          mrid: portalContext.focus_mrid ?? undefined,
+          context: copilotContextForVoice() as Record<string, unknown>,
+        });
+        const transcript = String(resp.agent?.transcript ?? '').trim();
+        if (transcript) {
+          setMessages((prev) => [
+            ...prev.filter((m) => m.id !== pendingId),
+            { id: newId(), role: 'user', content: transcript },
+            {
+              id: pendingId,
+              role: 'assistant',
+              content: 'Thinking…',
+              pending: true,
+            },
+          ]);
+        }
+        await applyResponse(resp, pendingId);
+        const speak = resp.agent?.speak ?? resp.content;
+        await playCopilotSpeech(speak);
+        meta?.rearmMic?.();
+      } catch (e) {
+        const err = e instanceof Error ? e.message : 'Failed to get response';
+        setMessages((prev) =>
+          prev
+            .filter((m) => m.id !== pendingId)
+            .concat({
+              id: newId(),
+              role: 'assistant',
+              content: `Error: ${err}`,
+            }),
+        );
+      } finally {
+        setBusy(false);
+      }
+    },
+    [busy, portalContext, applyResponse, copilotContextForVoice],
+  );
+
   const runTextTurn = useCallback(
     async (text: string, opts?: { voice?: boolean }) => {
       const trimmed = text.trim();
@@ -123,7 +187,7 @@ export function EnhancedCopilotPanel({
           text: trimmed,
           sessionId: voiceSessionIdRef.current,
           mrid: portalContext.focus_mrid ?? undefined,
-          context: { ...portalContext } as Record<string, unknown>,
+          context: copilotContextForVoice() as Record<string, unknown>,
         });
         await applyResponse(resp, pendingId);
         if (opts?.voice) {
@@ -145,22 +209,52 @@ export function EnhancedCopilotPanel({
         setBusy(false);
       }
     },
-    [busy, portalContext, applyResponse],
+    [busy, portalContext, applyResponse, copilotContextForVoice],
   );
 
-  const voice = useGiopVoiceSession({
-    onUtterance: (text) => runTextTurn(text, { voice: true }),
-    enabled: open && !busy,
-  });
-  const { recording, transcribing, error: voiceError, toggle: toggleVoice } = voice;
+  const voiceMode = useGiopVoiceMode();
+  const {
+    mode: voiceUiMode,
+    overlayActive,
+    recording,
+    transcribing,
+    processing,
+    speaking,
+    error: voiceError,
+    togglePanelVoice,
+    registerAudioTurnHandler,
+    registerCopilotOpen,
+    setCopilotOpen: notifyCopilotOpen,
+    cancelMapVoice,
+    getAnalyser,
+  } = voiceMode;
+
+  useEffect(() => {
+    registerCopilotOpen(() => setOpen(true));
+  }, [registerCopilotOpen]);
+
+  useEffect(() => {
+    registerAudioTurnHandler(runAudioVoiceTurn);
+  }, [registerAudioTurnHandler, runAudioVoiceTurn]);
+
+  const prevOpenRef = useRef(open);
+  useEffect(() => {
+    if (prevOpenRef.current && !open) {
+      notifyCopilotOpen(false);
+    }
+    prevOpenRef.current = open;
+  }, [notifyCopilotOpen, open]);
+
+  // Map-voice capture takes over the screen; assistant speech does not close
+  // the panel (closing it would cut the TTS mid-sentence).
+  useEffect(() => {
+    if (voiceUiMode !== 'idle' && open) setOpen(false);
+  }, [voiceUiMode, open]);
 
   // Closing the panel must silence the assistant: stop any in-progress
   // recording and cut TTS playback.
-  const voiceStopRef = useRef(voice.stop);
-  voiceStopRef.current = voice.stop;
   useEffect(() => {
     if (!open) {
-      voiceStopRef.current();
       stopCopilotSpeech();
     }
   }, [open]);
@@ -174,31 +268,60 @@ export function EnhancedCopilotPanel({
 
   return (
     <>
-      {/* Floating Action Button */}
-      <motion.button
-        type="button"
-        onClick={() => setOpen((s) => !s)}
-        whileHover={{ scale: 1.05 }}
-        whileTap={{ scale: 0.95 }}
-        className={`fixed bottom-6 right-6 z-40 flex items-center gap-2 px-4 py-3 rounded-full shadow-2xl transition ${
-          isLightMode
-            ? 'bg-indigo-600 text-white shadow-indigo-500/30'
-            : 'bg-indigo-500 text-white shadow-indigo-500/20'
-        } ${open ? 'ring-2 ring-offset-2 ring-indigo-400' : ''}`}
-      >
+      <div className="giop-copilot-fab-slot fixed bottom-6 right-6 z-40">
         <AnimatePresence mode="wait">
-          {open ? (
-            <motion.div key="close" initial={{ rotate: -90, opacity: 0 }} animate={{ rotate: 0, opacity: 1 }} exit={{ rotate: 90, opacity: 0 }}>
-              <X className="h-5 w-5" />
-            </motion.div>
+          {overlayActive ? (
+            <GiopVoiceDock
+              key="voice-dock"
+              mode={voiceUiMode}
+              arming={voiceUiMode === 'arming'}
+              recording={recording}
+              transcribing={transcribing}
+              speaking={speaking}
+              error={voiceError}
+              getAnalyser={getAnalyser}
+              onTap={() => {
+                if (speaking) {
+                  stopCopilotSpeech();
+                  return;
+                }
+                if (recording) togglePanelVoice();
+              }}
+              onCancel={cancelMapVoice}
+            />
           ) : (
-            <motion.div key="open" initial={{ scale: 0 }} animate={{ scale: 1 }} exit={{ scale: 0 }} className="flex items-center gap-2">
-              <Sparkles className="h-5 w-5" />
-              <span className="font-medium">AI Copilot</span>
-            </motion.div>
+            <motion.button
+              key="copilot-fab"
+              type="button"
+              onClick={() => setOpen((s) => !s)}
+              initial={{ opacity: 0, scale: 0.92 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.88, y: 6 }}
+              transition={{ duration: 0.25, ease: 'easeOut' }}
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
+              className={`flex items-center gap-2 px-4 py-3 rounded-full shadow-2xl transition ${
+                isLightMode
+                  ? 'bg-indigo-600 text-white shadow-indigo-500/30'
+                  : 'bg-indigo-500 text-white shadow-indigo-500/20'
+              } ${open ? 'ring-2 ring-offset-2 ring-indigo-400' : ''}`}
+            >
+              <AnimatePresence mode="wait">
+                {open ? (
+                  <motion.div key="close" initial={{ rotate: -90, opacity: 0 }} animate={{ rotate: 0, opacity: 1 }} exit={{ rotate: 90, opacity: 0 }}>
+                    <X className="h-5 w-5" />
+                  </motion.div>
+                ) : (
+                  <motion.div key="open" initial={{ scale: 0 }} animate={{ scale: 1 }} exit={{ scale: 0 }} className="flex items-center gap-2">
+                    <Sparkles className="h-5 w-5" />
+                    <span className="font-medium">AI Copilot</span>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </motion.button>
           )}
         </AnimatePresence>
-      </motion.button>
+      </div>
 
       {/* Panel */}
       <AnimatePresence>
@@ -227,13 +350,13 @@ export function EnhancedCopilotPanel({
                   <div>
                     <span className={`font-medium ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>Grid Copilot</span>
                     <p className={`text-[11px] ${isLightMode ? 'text-slate-500' : 'text-premium-muted'}`}>
-                      {transcribing
-                        ? 'Transcribing…'
+                      {transcribing || processing
+                        ? 'Processing…'
                         : recording
-                          ? 'Recording… tap mic to send (max 12s)'
+                          ? 'Listening… stops when you pause'
                           : busy
                             ? 'Thinking…'
-                            : 'Tap mic · speak · tap again to send'}
+                            : 'Tap mic · speak · sends when you pause'}
                     </p>
                   </div>
                 </div>
@@ -389,11 +512,11 @@ export function EnhancedCopilotPanel({
               <div className="flex items-center gap-2">
                 <motion.button
                   type="button"
-                  onClick={toggleVoice}
+                  onClick={togglePanelVoice}
                   whileHover={{ scale: 1.05 }}
                   whileTap={{ scale: 0.95 }}
-                  disabled={busy || transcribing}
-                  aria-label={recording ? 'Stop recording and send' : 'Start voice recording'}
+                  disabled={busy || transcribing || overlayActive}
+                  aria-label={recording ? 'Send now (optional)' : 'Start voice'}
                   className={`relative p-2.5 rounded-full transition ${
                     recording
                       ? 'bg-rose-500 text-white'
@@ -402,7 +525,7 @@ export function EnhancedCopilotPanel({
                         : isLightMode
                           ? 'bg-slate-200 hover:bg-slate-300 text-slate-700'
                           : 'bg-slate-800 hover:bg-slate-700 text-slate-300'
-                  } ${busy || transcribing ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  } ${busy || transcribing || overlayActive ? 'opacity-50 cursor-not-allowed' : ''}`}
                 >
                   {recording ? (
                     <>

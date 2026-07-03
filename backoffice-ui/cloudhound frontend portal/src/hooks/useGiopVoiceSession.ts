@@ -1,12 +1,12 @@
 /**
- * Local voice capture — record in browser, transcribe on sync-service (Whisper).
- * No Google/cloud STT; works offline after the model is downloaded.
+ * Voice capture — record in browser, auto-send on silence, one API hop to copilot.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { portalAiTranscribe } from '../api/giop-api';
+import { DEFAULT_VOICE_VAD, VoiceVadMonitor } from '../lib/giopVoiceVad';
 
 const MAX_RECORD_MS = 12_000;
+const VAD_POLL_MS = 60;
 
 function pickRecorderMime(): string {
   const candidates = [
@@ -21,39 +21,34 @@ function pickRecorderMime(): string {
   return '';
 }
 
-async function ensureMicrophonePermission(): Promise<string | null> {
-  if (!navigator.mediaDevices?.getUserMedia) {
-    return 'Microphone API not available in this browser.';
-  }
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    stream.getTracks().forEach((t) => t.stop());
-    return null;
-  } catch (err) {
-    if (err instanceof DOMException) {
-      if (err.name === 'NotAllowedError') {
-        return 'Microphone permission denied — allow mic access in browser settings.';
-      }
-      if (err.name === 'NotFoundError') {
-        return 'No microphone detected.';
-      }
-      return err.message || err.name;
-    }
-    return err instanceof Error ? err.message : 'Microphone permission failed';
-  }
+function streamIsLive(stream: MediaStream | null): boolean {
+  return Boolean(stream?.getTracks().some((t) => t.readyState === 'live'));
+}
+
+export interface PendingVoiceTranscript {
+  text: string;
+  raw?: string;
+  fixes?: string[];
 }
 
 export interface UseGiopVoiceSessionOptions {
-  onUtterance: (text: string) => void | Promise<void>;
+  /** Send recorded audio to the copilot (transcribe + chat on server). */
+  onAudioTurn: (blob: Blob) => void | Promise<void>;
   enabled?: boolean;
+  /** Keep the mic stream open between turns (handsfree — faster re-listen). */
+  keepStreamBetweenTurns?: boolean;
+  /** Auto-stop and send when the user pauses (default true). */
+  autoSendOnSilence?: boolean;
 }
 
 export function useGiopVoiceSession({
-  onUtterance,
+  onAudioTurn,
   enabled = true,
+  keepStreamBetweenTurns = false,
+  autoSendOnSilence = true,
 }: UseGiopVoiceSessionOptions) {
   const [recording, setRecording] = useState(false);
-  const [transcribing, setTranscribing] = useState(false);
+  const [processing, setProcessing] = useState(false);
   const [supported, setSupported] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -61,9 +56,18 @@ export function useGiopVoiceSession({
   const chunksRef = useRef<Blob[]>([]);
   const mimeRef = useRef('audio/webm');
   const maxTimerRef = useRef<number | undefined>(undefined);
-  const onUtteranceRef = useRef(onUtterance);
+  const vadTimerRef = useRef<number | undefined>(undefined);
+  const vadRef = useRef(new VoiceVadMonitor());
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const onAudioTurnRef = useRef(onAudioTurn);
+  const keepStreamRef = useRef(keepStreamBetweenTurns);
+  const autoSendRef = useRef(autoSendOnSilence);
+  const startRecordingRef = useRef<() => void>(() => undefined);
 
-  onUtteranceRef.current = onUtterance;
+  onAudioTurnRef.current = onAudioTurn;
+  keepStreamRef.current = keepStreamBetweenTurns;
+  autoSendRef.current = autoSendOnSilence;
 
   useEffect(() => {
     const ok =
@@ -74,28 +78,103 @@ export function useGiopVoiceSession({
     setSupported(ok);
   }, []);
 
-  const cleanupStream = useCallback(() => {
+  const cleanupAnalyser = useCallback(() => {
+    analyserRef.current = null;
+    const ctx = audioContextRef.current;
+    audioContextRef.current = null;
+    if (ctx && ctx.state !== 'closed') {
+      void ctx.close().catch(() => undefined);
+    }
+  }, []);
+
+  const releaseStream = useCallback(() => {
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
     recorderRef.current = null;
-    window.clearTimeout(maxTimerRef.current);
+    cleanupAnalyser();
+  }, [cleanupAnalyser]);
+
+  const stopVad = useCallback(() => {
+    window.clearInterval(vadTimerRef.current);
+    vadTimerRef.current = undefined;
+    vadRef.current.reset();
   }, []);
 
+  const cleanupAfterTurn = useCallback(() => {
+    stopVad();
+    recorderRef.current = null;
+    window.clearTimeout(maxTimerRef.current);
+    if (!keepStreamRef.current || !streamIsLive(streamRef.current)) {
+      releaseStream();
+    }
+  }, [releaseStream, stopVad]);
+
+  const attachAnalyser = useCallback(async (stream: MediaStream) => {
+    if (analyserRef.current && streamIsLive(streamRef.current)) return;
+    cleanupAnalyser();
+    const AudioCtx =
+      window.AudioContext ??
+      (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.45;
+    analyser.minDecibels = -90;
+    analyser.maxDecibels = -10;
+    const source = ctx.createMediaStreamSource(stream);
+    const silent = ctx.createGain();
+    silent.gain.value = 0;
+    source.connect(analyser);
+    analyser.connect(silent);
+    silent.connect(ctx.destination);
+    audioContextRef.current = ctx;
+    analyserRef.current = analyser;
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
+    }
+  }, [cleanupAnalyser]);
+
   const stopRecording = useCallback(() => {
+    stopVad();
     window.clearTimeout(maxTimerRef.current);
     const recorder = recorderRef.current;
     if (recorder && recorder.state !== 'inactive') {
       try {
         recorder.stop();
       } catch {
-        cleanupStream();
+        cleanupAfterTurn();
         setRecording(false);
       }
       return;
     }
-    cleanupStream();
+    cleanupAfterTurn();
     setRecording(false);
-  }, [cleanupStream]);
+  }, [cleanupAfterTurn, stopVad]);
+
+  const stopRecordingRef = useRef(stopRecording);
+  stopRecordingRef.current = stopRecording;
+
+  const scheduleRestart = useCallback(() => {
+    if (!keepStreamRef.current) return;
+    window.setTimeout(() => {
+      if (!recorderRef.current) startRecordingRef.current();
+    }, 120);
+  }, []);
+
+  const startVad = useCallback(() => {
+    if (!autoSendRef.current) return;
+    stopVad();
+    vadRef.current.reset();
+    vadTimerRef.current = window.setInterval(() => {
+      const analyser = analyserRef.current;
+      const recorder = recorderRef.current;
+      if (!analyser || !recorder || recorder.state === 'inactive') return;
+      if (vadRef.current.shouldSend(analyser, performance.now(), DEFAULT_VOICE_VAD)) {
+        stopRecordingRef.current();
+      }
+    }, VAD_POLL_MS);
+  }, [stopVad]);
 
   const startRecording = useCallback(async () => {
     if (!enabled) {
@@ -109,15 +188,24 @@ export function useGiopVoiceSession({
     }
 
     setError(null);
-    const micErr = await ensureMicrophonePermission();
-    if (micErr) {
-      setError(micErr);
-      return;
-    }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
+      let stream = streamRef.current;
+      if (!streamIsLive(stream)) {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        streamRef.current = stream;
+      }
+      if (!stream) {
+        setError('Could not access the microphone.');
+        return;
+      }
+      await attachAnalyser(stream);
       mimeRef.current = mime;
       chunksRef.current = [];
 
@@ -131,29 +219,27 @@ export function useGiopVoiceSession({
       recorder.onstop = () => {
         setRecording(false);
         const blob = new Blob(chunksRef.current, { type: mimeRef.current });
-        cleanupStream();
+        cleanupAfterTurn();
         chunksRef.current = [];
 
         if (blob.size < 800) {
-          setError('Recording too short — tap mic, speak, then tap again.');
+          if (keepStreamRef.current) {
+            scheduleRestart();
+          } else {
+            setError('No speech detected — try again.');
+          }
           return;
         }
 
-        setTranscribing(true);
+        setProcessing(true);
         void (async () => {
           try {
-            const { text } = await portalAiTranscribe(blob);
-            const trimmed = text.trim();
-            if (!trimmed) {
-              setError('No speech detected — try again.');
-              return;
-            }
+            await onAudioTurnRef.current(blob);
             setError(null);
-            await onUtteranceRef.current(trimmed);
           } catch (err) {
-            setError(err instanceof Error ? err.message : 'Transcription failed');
+            setError(err instanceof Error ? err.message : 'Voice request failed');
           } finally {
-            setTranscribing(false);
+            setProcessing(false);
           }
         })();
       };
@@ -163,30 +249,64 @@ export function useGiopVoiceSession({
         stopRecording();
       };
 
-      recorder.start();
+      recorder.start(200);
       setRecording(true);
+      startVad();
       maxTimerRef.current = window.setTimeout(() => {
         stopRecording();
       }, MAX_RECORD_MS);
     } catch (err) {
-      cleanupStream();
+      releaseStream();
       setRecording(false);
-      setError(err instanceof Error ? err.message : 'Could not start recording');
+      if (err instanceof DOMException && err.name === 'NotAllowedError') {
+        setError('Microphone permission denied — allow mic access in browser settings.');
+      } else if (err instanceof DOMException && err.name === 'NotFoundError') {
+        setError('No microphone detected.');
+      } else {
+        setError(err instanceof Error ? err.message : 'Could not start recording');
+      }
     }
-  }, [cleanupStream, enabled, stopRecording]);
+  }, [
+    attachAnalyser,
+    cleanupAfterTurn,
+    enabled,
+    releaseStream,
+    scheduleRestart,
+    startVad,
+    stopRecording,
+  ]);
+
+  startRecordingRef.current = () => {
+    void startRecording();
+  };
 
   const toggle = useCallback(() => {
-    if (recording || transcribing) stopRecording();
+    if (recording || processing) stopRecording();
     else void startRecording();
-  }, [recording, startRecording, stopRecording, transcribing]);
+  }, [processing, recording, startRecording, stopRecording]);
 
-  const stopRef = useRef(stopRecording);
-  stopRef.current = stopRecording;
+  const forceRelease = useCallback(() => {
+    stopVad();
+    window.clearTimeout(maxTimerRef.current);
+    const recorder = recorderRef.current;
+    if (recorder && recorder.state !== 'inactive') {
+      try {
+        recorder.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    releaseStream();
+    setRecording(false);
+    setProcessing(false);
+  }, [releaseStream, stopVad]);
+
+  const stopRef = useRef(forceRelease);
+  stopRef.current = forceRelease;
 
   useEffect(() => () => {
     stopRef.current();
-    cleanupStream();
-  }, [cleanupStream]);
+  }, []);
 
   useEffect(() => {
     if (!enabled && recording) {
@@ -194,16 +314,25 @@ export function useGiopVoiceSession({
     }
   }, [enabled, recording]);
 
+  const getAnalyser = useCallback(() => analyserRef.current, []);
+
   return {
     active: recording,
-    requesting: transcribing,
+    requesting: processing,
     recording,
-    transcribing,
+    transcribing: processing,
+    processing,
     interim: '',
     supported,
     error,
+    pendingUtterance: null as PendingVoiceTranscript | null,
+    confirmPending: async () => undefined,
+    discardPending: () => undefined,
+    updatePendingText: (_text?: string) => undefined,
     toggle,
     start: startRecording,
     stop: stopRecording,
+    release: forceRelease,
+    getAnalyser,
   };
 }

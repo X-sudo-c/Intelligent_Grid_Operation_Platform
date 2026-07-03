@@ -14,8 +14,33 @@ from typing import Any, Callable
 
 from lineage import log_lineage
 
+PUBLIC_EXCEPTIONS = "public.data_quality_exceptions"
+STAGING_EXCEPTIONS = "staging.data_quality_exceptions"
+
 # Ghana operating bbox (matches config/martin.yaml): west, south, east, north.
 GHANA_BBOX = (-3.5, 4.5, 1.5, 8.5)
+
+
+def exceptions_table(tier: str) -> str:
+    """Per-asset exception queue: staging captures → staging schema, master → public."""
+    return STAGING_EXCEPTIONS if tier == "staging" else PUBLIC_EXCEPTIONS
+
+
+def detect_asset_tier(conn, mrid: str) -> str | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM staging.identified_objects WHERE mrid = %s::uuid",
+            (mrid,),
+        )
+        if cur.fetchone():
+            return "staging"
+        cur.execute(
+            "SELECT 1 FROM public.identified_objects WHERE mrid = %s::uuid",
+            (mrid,),
+        )
+        if cur.fetchone():
+            return "master"
+    return None
 STALE_ASSET_DAYS = int(os.getenv("DQ_STALE_ASSET_DAYS", "365"))
 _CAPACITY_COLUMN: str | None = None
 
@@ -396,6 +421,7 @@ def run_asset_checks(conn, mrid: str, tier: str) -> dict[str, Any]:
     rules = _enabled_rules(conn)
     failures: list[dict[str, Any]] = []
     checked = 0
+    exc_table = exceptions_table(tier)
     with conn.cursor() as cur:
         for rule_code, meta in rules.items():
             evaluator = RULES.get(rule_code)
@@ -408,8 +434,8 @@ def run_asset_checks(conn, mrid: str, tier: str) -> dict[str, Any]:
             if status == "FAIL":
                 merged_details = {**_exception_details_snapshot(ctx), **(details or {})}
                 cur.execute(
-                    """
-                    INSERT INTO public.data_quality_exceptions
+                    f"""
+                    INSERT INTO {exc_table}
                       (record_type, record_mrid, rule_code, severity, error_message, details)
                     VALUES ('connectivity_node', %s::uuid, %s, %s::dq_severity, %s, %s::jsonb)
                     ON CONFLICT (record_mrid, rule_code) WHERE status = 'OPEN'
@@ -428,8 +454,8 @@ def run_asset_checks(conn, mrid: str, tier: str) -> dict[str, Any]:
                 )
             else:  # PASS — auto-clear any open exception for this rule.
                 cur.execute(
-                    """
-                    UPDATE public.data_quality_exceptions
+                    f"""
+                    UPDATE {exc_table}
                     SET status = 'RESOLVED', resolved_at = NOW(),
                         resolved_by = 'system', resolution_note = 'Auto-cleared: rule now passes'
                     WHERE record_mrid = %s::uuid AND rule_code = %s AND status = 'OPEN'
@@ -448,16 +474,18 @@ def upsert_record_exception(
     message: str,
     details: dict[str, Any] | None = None,
     queue_name: str | None = None,
+    tier: str = "master",
 ) -> bool:
     """Insert open exception if rule enabled; returns True if inserted."""
     rules = _enabled_rules(conn)
     meta = rules.get(rule_code)
     if not meta:
         return False
+    exc_table = exceptions_table(tier)
     with conn.cursor() as cur:
         cur.execute(
-            """
-            INSERT INTO public.data_quality_exceptions
+            f"""
+            INSERT INTO {exc_table}
               (record_type, record_mrid, rule_code, severity, error_message, details, queue_name)
             VALUES (%s, %s::uuid, %s, %s::dq_severity, %s, %s::jsonb, %s)
             ON CONFLICT (record_mrid, rule_code) WHERE status = 'OPEN'
@@ -797,13 +825,15 @@ def run_batch_validation(conn) -> dict[str, Any]:
     }
 
 
-def count_blocking_open(conn, mrid: str) -> list[dict[str, Any]]:
+def count_blocking_open(conn, mrid: str, *, tier: str | None = None) -> list[dict[str, Any]]:
     """Open exceptions whose rule blocks promotion — used as a promote gate."""
+    resolved_tier = tier or detect_asset_tier(conn, mrid) or "master"
+    exc_table = exceptions_table(resolved_tier)
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             SELECT e.rule_code, e.severity::text, e.error_message
-            FROM public.data_quality_exceptions e
+            FROM {exc_table} e
             JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
             WHERE e.record_mrid = %s::uuid
               AND e.status = 'OPEN'
@@ -822,7 +852,7 @@ DQ_STAGING_QUEUE = ("PENDING_FIELD", "IN_CONFLICT")
 OPS_STAGING_QUEUE = ("STAGED", "IN_CONFLICT")
 
 
-def _exception_filters(
+def _staging_exception_filters(
     *,
     status: str | None = "OPEN",
     severity: str | None = None,
@@ -845,11 +875,35 @@ def _exception_filters(
         filters.append("e.record_mrid = %s::uuid")
         params.append(record_mrid)
     if queue == "dq":
-        filters.append("(sio.mrid IS NULL OR sio.validation::text = ANY(%s))")
+        filters.append("sio.validation::text = ANY(%s)")
         params.append(list(DQ_STAGING_QUEUE))
     elif queue == "operations":
         filters.append("sio.validation::text = ANY(%s)")
         params.append(list(OPS_STAGING_QUEUE))
+    return filters, params
+
+
+def _master_exception_filters(
+    *,
+    status: str | None = "OPEN",
+    severity: str | None = None,
+    domain: str | None = None,
+    record_mrid: str | None = None,
+) -> tuple[list[str], list[Any]]:
+    filters: list[str] = ["pio.mrid IS NOT NULL"]
+    params: list[Any] = []
+    if status:
+        filters.append("e.status = %s::dq_exception_status")
+        params.append(status)
+    if severity:
+        filters.append("e.severity = %s::dq_severity")
+        params.append(severity)
+    if domain:
+        filters.append("r.domain = %s")
+        params.append(domain)
+    if record_mrid:
+        filters.append("e.record_mrid = %s::uuid")
+        params.append(record_mrid)
     return filters, params
 
 
@@ -862,21 +916,83 @@ def count_exceptions(
     record_mrid: str | None = None,
     queue: str | None = "dq",
 ) -> int:
-    filters, params = _exception_filters(
-        status=status,
-        severity=severity,
-        domain=domain,
-        record_mrid=record_mrid,
-        queue=queue,
-    )
+    if queue == "all":
+        staging_filters, staging_params = _staging_exception_filters(
+            status=status,
+            severity=severity,
+            domain=domain,
+            record_mrid=record_mrid,
+            queue=None,
+        )
+        master_filters, master_params = _master_exception_filters(
+            status=status,
+            severity=severity,
+            domain=domain,
+            record_mrid=record_mrid,
+        )
+        total = 0
+        for exc_table, filters, params, join_sql in (
+            (
+                STAGING_EXCEPTIONS,
+                staging_filters,
+                staging_params,
+                "JOIN staging.identified_objects sio ON sio.mrid = e.record_mrid",
+            ),
+            (
+                PUBLIC_EXCEPTIONS,
+                master_filters,
+                master_params,
+                "JOIN public.identified_objects pio ON pio.mrid = e.record_mrid",
+            ),
+        ):
+            where = f"WHERE {' AND '.join(filters)}" if filters else ""
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {exc_table} e
+                    JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
+                    {join_sql}
+                    {where}
+                    """,
+                    params,
+                )
+                row = cur.fetchone()
+            total += int(row[0]) if row and row[0] is not None else 0
+        return total
+
+    if queue == "master":
+        filters, params = _master_exception_filters(
+            status=status,
+            severity=severity,
+            domain=domain,
+            record_mrid=record_mrid,
+        )
+        exc_table = PUBLIC_EXCEPTIONS
+        join_sql = """
+            JOIN public.identified_objects pio ON pio.mrid = e.record_mrid
+        """
+    else:
+        filters, params = _staging_exception_filters(
+            status=status,
+            severity=severity,
+            domain=domain,
+            record_mrid=record_mrid,
+            queue=queue or "dq",
+        )
+        exc_table = STAGING_EXCEPTIONS
+        join_sql = """
+            JOIN staging.identified_objects sio ON sio.mrid = e.record_mrid
+        """
+
     where = f"WHERE {' AND '.join(filters)}" if filters else ""
     with conn.cursor() as cur:
         cur.execute(
             f"""
             SELECT COUNT(*)
-            FROM public.data_quality_exceptions e
+            FROM {exc_table} e
             JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
-            LEFT JOIN staging.identified_objects sio ON sio.mrid = e.record_mrid
+            {join_sql}
             {where}
             """,
             params,
@@ -896,15 +1012,50 @@ def list_exceptions(
     limit: int = 100,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
-    filters, params = _exception_filters(
-        status=status,
-        severity=severity,
-        domain=domain,
-        record_mrid=record_mrid,
-        queue=queue,
-    )
+    if queue == "all":
+        fetch_n = limit + offset
+        combined = list_exceptions(
+            conn,
+            status=status,
+            severity=severity,
+            domain=domain,
+            record_mrid=record_mrid,
+            queue="staging_all",
+            limit=fetch_n,
+            offset=0,
+        ) + list_exceptions(
+            conn,
+            status=status,
+            severity=severity,
+            domain=domain,
+            record_mrid=record_mrid,
+            queue="master",
+            limit=fetch_n,
+            offset=0,
+        )
+        combined.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+        return combined[offset : offset + limit]
+
+    if queue == "master":
+        exc_table = PUBLIC_EXCEPTIONS
+        record_tier = "master"
+        filters, params = _master_exception_filters(
+            status=status,
+            severity=severity,
+            domain=domain,
+            record_mrid=record_mrid,
+        )
+    else:
+        exc_table = STAGING_EXCEPTIONS
+        record_tier = "staging"
+        filters, params = _staging_exception_filters(
+            status=status,
+            severity=severity,
+            domain=domain,
+            record_mrid=record_mrid,
+            queue=None if queue == "staging_all" else (queue or "dq"),
+        )
     where = f"WHERE {' AND '.join(filters)}" if filters else ""
-    params.extend([limit, offset])
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -949,7 +1100,7 @@ def list_exceptions(
                    sio.validation::text AS staging_validation,
                    (
                      SELECT COUNT(*)::int
-                     FROM public.data_quality_exceptions e2
+                     FROM {exc_table} e2
                      JOIN public.data_quality_rules r2 ON r2.rule_code = e2.rule_code
                      WHERE e2.record_mrid = e.record_mrid
                        AND e2.status = 'OPEN'
@@ -966,12 +1117,8 @@ def list_exceptions(
                    COALESCE(sga.operating_utility, pga.operating_utility)::text AS operating_utility,
                    COALESCE(sga.substation_name, pga.substation_name) AS substation_name,
                    COALESCE(scn.boundary_feeder_id, pcn.boundary_feeder_id) AS boundary_feeder_id,
-                   CASE
-                     WHEN sio.mrid IS NOT NULL THEN 'staging'
-                     WHEN pio.mrid IS NOT NULL THEN 'master'
-                     ELSE NULL
-                   END AS record_tier
-            FROM public.data_quality_exceptions e
+                   %s AS record_tier
+            FROM {exc_table} e
             JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
             LEFT JOIN staging.identified_objects sio ON sio.mrid = e.record_mrid
             LEFT JOIN public.identified_objects pio ON pio.mrid = e.record_mrid
@@ -983,7 +1130,7 @@ def list_exceptions(
             ORDER BY e.created_at DESC
             LIMIT %s OFFSET %s
             """,
-            params,
+            [record_tier, *params, limit, offset],
         )
         rows = cur.fetchall()
     out: list[dict[str, Any]] = []
@@ -1056,7 +1203,7 @@ _DQ_DUPLICATES_ONLY_SQL = """
   )
   OR EXISTS (
     SELECT 1
-    FROM public.data_quality_exceptions e
+    FROM staging.data_quality_exceptions e
     WHERE e.record_mrid = cn.mrid
       AND e.status = 'OPEN'
       AND e.rule_code = 'ASSET_DUPLICATE_NEAR'
@@ -1096,7 +1243,7 @@ def _dq_queue_asset_filters(
         filters.append(
             """
             NOT EXISTS (
-              SELECT 1 FROM public.data_quality_exceptions e
+              SELECT 1 FROM staging.data_quality_exceptions e
               WHERE e.record_mrid = cn.mrid AND e.status = 'OPEN'
             )
             """
@@ -1106,7 +1253,7 @@ def _dq_queue_asset_filters(
             f"""
             EXISTS (
               SELECT 1
-              FROM public.data_quality_exceptions e
+              FROM staging.data_quality_exceptions e
               JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
               WHERE e.record_mrid = cn.mrid
                 AND {' AND '.join(exc_parts)}
@@ -1234,12 +1381,12 @@ def list_dq_queue(
               ) AS colocated_staging_peers,
               (
                 SELECT COUNT(*)::int
-                FROM public.data_quality_exceptions e
+                FROM staging.data_quality_exceptions e
                 WHERE e.record_mrid = cn.mrid AND e.status = 'OPEN'
               ) AS open_exception_count,
               (
                 SELECT COUNT(*)::int
-                FROM public.data_quality_exceptions e
+                FROM staging.data_quality_exceptions e
                 JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
                 WHERE e.record_mrid = cn.mrid
                   AND e.status = 'OPEN'
@@ -1280,7 +1427,7 @@ def list_dq_queue(
                     e.created_at,
                     r.description AS rule_description,
                     r.blocks_promotion
-                  FROM public.data_quality_exceptions e
+                  FROM staging.data_quality_exceptions e
                   JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
                   WHERE e.record_mrid = cn.mrid
                     {nested_where}
@@ -1406,44 +1553,38 @@ def list_rules(conn) -> list[dict[str, Any]]:
 
 
 def summary(conn, *, tier: str | None = None) -> dict[str, Any]:
-    tier_filter = ""
     if tier == "staging":
-        tier_filter = """
-            AND EXISTS (
-              SELECT 1 FROM staging.identified_objects sio
-              WHERE sio.mrid = e.record_mrid
-                AND sio.validation NOT IN ('REJECTED', 'APPROVED')
-            )
-        """
+        tables = [STAGING_EXCEPTIONS]
     elif tier == "master":
-        tier_filter = """
-            AND EXISTS (
-              SELECT 1 FROM public.identified_objects pio
-              WHERE pio.mrid = e.record_mrid
-            )
-        """
+        tables = [PUBLIC_EXCEPTIONS]
+    else:
+        tables = [STAGING_EXCEPTIONS, PUBLIC_EXCEPTIONS]
+
+    by_sev: dict[str, int] = {}
+    by_domain: dict[str, int] = {}
     with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT e.severity::text, COUNT(*)
-            FROM public.data_quality_exceptions e
-            WHERE e.status = 'OPEN'
-            {tier_filter}
-            GROUP BY e.severity
-            """
-        )
-        by_sev = {r[0]: int(r[1]) for r in cur.fetchall()}
-        cur.execute(
-            f"""
-            SELECT r.domain, COUNT(*)
-            FROM public.data_quality_exceptions e
-            JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
-            WHERE e.status = 'OPEN'
-            {tier_filter}
-            GROUP BY r.domain
-            """
-        )
-        by_domain = {r[0]: int(r[1]) for r in cur.fetchall()}
+        for table in tables:
+            cur.execute(
+                f"""
+                SELECT e.severity::text, COUNT(*)
+                FROM {table} e
+                WHERE e.status = 'OPEN'
+                GROUP BY e.severity
+                """
+            )
+            for sev, count in cur.fetchall():
+                by_sev[sev] = by_sev.get(sev, 0) + int(count)
+            cur.execute(
+                f"""
+                SELECT r.domain, COUNT(*)
+                FROM {table} e
+                JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
+                WHERE e.status = 'OPEN'
+                GROUP BY r.domain
+                """
+            )
+            for domain, count in cur.fetchall():
+                by_domain[domain] = by_domain.get(domain, 0) + int(count)
     return {
         "open_by_severity": by_sev,
         "open_by_domain": by_domain,
@@ -1465,20 +1606,26 @@ def resolve_exception(
 ) -> dict[str, Any]:
     if status not in _VALID_RESOLUTIONS:
         raise ValueError(f"status must be one of {sorted(_VALID_RESOLUTIONS)}")
+    row = None
+    resolved_table = PUBLIC_EXCEPTIONS
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE public.data_quality_exceptions
-            SET status = %s::dq_exception_status,
-                resolution_note = COALESCE(%s, resolution_note),
-                resolved_by = COALESCE(%s, resolved_by),
-                resolved_at = CASE WHEN %s IN ('RESOLVED','REJECTED') THEN NOW() ELSE resolved_at END
-            WHERE id = %s::uuid
-            RETURNING record_mrid::text, rule_code, status::text
-            """,
-            (status, note, operator, status, exception_id),
-        )
-        row = cur.fetchone()
+        for table in (STAGING_EXCEPTIONS, PUBLIC_EXCEPTIONS):
+            cur.execute(
+                f"""
+                UPDATE {table}
+                SET status = %s::dq_exception_status,
+                    resolution_note = COALESCE(%s, resolution_note),
+                    resolved_by = COALESCE(%s, resolved_by),
+                    resolved_at = CASE WHEN %s IN ('RESOLVED','REJECTED') THEN NOW() ELSE resolved_at END
+                WHERE id = %s::uuid
+                RETURNING record_mrid::text, rule_code, status::text
+                """,
+                (status, note, operator, status, exception_id),
+            )
+            row = cur.fetchone()
+            if row:
+                resolved_table = table
+                break
         if not row:
             raise ValueError("Exception not found")
     log_lineage(
@@ -1487,7 +1634,7 @@ def resolve_exception(
         source_type="MANUAL_EDIT",
         action_type=f"DQ_{status}",
         operator_id=operator,
-        provenance_ref=f"data_quality_exceptions:{exception_id}",
+        provenance_ref=f"{resolved_table}:{exception_id}",
         after_state={"rule_code": row[1], "status": row[2], "note": note},
     )
     return {"id": exception_id, "record_mrid": row[0], "status": row[2]}
@@ -1507,7 +1654,7 @@ def release_staging_to_operations(
   """
     if run_checks:
         run_asset_checks(conn, mrid, "staging")
-    blocking = count_blocking_open(conn, mrid)
+    blocking = count_blocking_open(conn, mrid, tier="staging")
     if blocking:
         raise ValueError(
             f"Cannot release to Operations: {len(blocking)} blocking open exception(s)"

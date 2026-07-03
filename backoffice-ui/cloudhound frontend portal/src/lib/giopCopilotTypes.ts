@@ -1,4 +1,5 @@
 import type { GiopPortalTab } from '../lib/giopPortalRouting';
+import type { FeederHighlightGeoJson } from '../lib/giopFeederHighlight';
 import type { TerritoryGeoJson } from '../lib/giopTerritoryHighlight';
 
 export interface MapBboxContext {
@@ -28,6 +29,7 @@ export type GiopCopilotUiAction =
       bbox: MapBboxContext;
       district?: string;
       region?: string;
+      max_zoom?: number;
     }
   | {
       type: 'fly_to';
@@ -43,6 +45,24 @@ export type GiopCopilotUiAction =
       region?: string;
       label?: string;
       geojson?: TerritoryGeoJson;
+    }
+  | {
+      type: 'highlight_feeder';
+      tab?: GiopPortalTab | string;
+      feeder_id: string;
+      label?: string;
+      bbox?: MapBboxContext;
+      geojson: FeederHighlightGeoJson;
+    }
+  | {
+      type: 'highlight_node';
+      tab?: GiopPortalTab | string;
+      mrid: string;
+      label?: string;
+      center: { lon: number; lat: number };
+      zoom?: number;
+      /** Amber pulse — AI is guessing which node the user means. */
+      tentative?: boolean;
     };
 
 /** Human-readable "here's what I did" line for a UI action the copilot ran. */
@@ -60,6 +80,12 @@ export function describeCopilotUiAction(action: GiopCopilotUiAction): string {
       return 'Moved the map to the location';
     case 'highlight_territory':
       return `Highlighted ${action.label ?? action.district ?? action.region ?? 'the territory'} on the map`;
+    case 'highlight_feeder':
+      return `Highlighted feeder ${action.label ?? action.feeder_id} on the map`;
+    case 'highlight_node':
+      return action.tentative
+        ? `Highlighted ${action.label ?? 'a node'} on the map for confirmation`
+        : `Highlighted ${action.label ?? 'the node'} on the map`;
     default:
       return 'Updated the map';
   }
@@ -79,6 +105,7 @@ export interface GiopCopilotPortalContext {
   active_tab: GiopPortalTab;
   focus_mrid?: string | null;
   selection_name?: string | null;
+  boundary_feeder_id?: string | null;
   staging_pending_count?: number;
   viewport?: MapViewportContext | null;
   selected_district?: string | null;
@@ -87,7 +114,10 @@ export interface GiopCopilotPortalContext {
 
 export const COPILOT_SUGGESTIONS = [
   'How many poles are in the current map view?',
+  'What work orders are in view?',
+  'Tell me about the node in view',
+  'Show connections on the Mallam feeder',
   'How many staging captures in this district?',
   'Highlight Accra on the map',
-  'Show staging counts by district',
+  'Show nodes on this feeder',
 ] as const;

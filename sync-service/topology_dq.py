@@ -284,7 +284,7 @@ def _open_staging_topology_exception_counts(
         cur.execute(
             f"""
             SELECT e.rule_code, COUNT(*)
-            FROM public.data_quality_exceptions e
+            FROM staging.data_quality_exceptions e
             JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
             JOIN staging.connectivity_nodes cn ON cn.mrid = e.record_mrid
             JOIN staging.identified_objects sio ON sio.mrid = e.record_mrid
@@ -301,7 +301,7 @@ def _open_staging_topology_exception_counts(
         cur.execute(
             f"""
             SELECT e.rule_code, COUNT(*)
-            FROM public.data_quality_exceptions e
+            FROM staging.data_quality_exceptions e
             JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
             JOIN staging.ac_line_segments als ON als.mrid = e.record_mrid
             JOIN staging.identified_objects sio ON sio.mrid = e.record_mrid

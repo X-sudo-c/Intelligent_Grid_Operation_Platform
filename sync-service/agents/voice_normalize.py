@@ -32,6 +32,9 @@ _MISHEARING_MAP: dict[str, str] = {
     "ka soa": "Kasoa",
     "gbawe": "Gbawe",
     "g bawe": "Gbawe",
+    "roman ridge": "Roman Ridge",
+    "romanridge": "Roman Ridge",
+    "roman rich": "Roman Ridge",
     "takoradi": "Takoradi",
     "tako radi": "Takoradi",
     "cape coast": "Cape Coast",
@@ -100,7 +103,7 @@ DEFAULT_STT_INITIAL_PROMPT = (
     "Ghana ECG GIS voice commands. Districts and cities: "
     "Accra, Kumasi, Tamale, Tema, Takoradi, Cape Coast, Sunyani, Ho, "
     "Pokuase, Madina, Kasoa, Gbawe, Ablekuma, Ashaiman, Legon, Osu, "
-    "Adenta, Teshie, Nungua, La, Spintex, East Legon. "
+    "Adenta, Teshie, Nungua, La, Spintex, East Legon, Roman Ridge, Kotobabi. "
     "Terms: feeder, district, region, poles, transformers, staging, "
     "work order, trace feeder, show on map, how many assets."
 )
@@ -170,6 +173,7 @@ def _title_case_places(text: str) -> str:
         "Ablekuma",
         "Ashaiman",
         "Ho",
+        "Roman Ridge",
     }:
         out = re.sub(rf"\b{re.escape(canonical)}\b", canonical, out, flags=re.IGNORECASE)
     return out

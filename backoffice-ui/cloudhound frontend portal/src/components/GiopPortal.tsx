@@ -25,6 +25,7 @@ import { GiopMapErrorBoundary } from './GiopMapErrorBoundary';
 import { GiopWorkspaceLayout } from './GiopWorkspaceLayout';
 import { GiopSelectionProvider, useGiopSelection } from '../context/GiopSelectionContext';
 import { GiopMapOverlayProvider, useGiopMapOverlay } from '../context/GiopMapOverlayContext';
+import { GiopVoiceModeProvider } from '../context/GiopVoiceModeContext';
 import { useGiopTopology } from '../hooks/useGiopTopology';
 import { useGiopRealtime } from '../hooks/useGiopRealtime';
 import { useGiopFieldTechnicians } from '../hooks/useGiopFieldTechnicians';
@@ -44,12 +45,16 @@ import { giopLog } from '../lib/giopDebugLog';
 import { useGiopNavBadges } from '../hooks/useGiopNavBadges';
 import type { PortalNavGroup } from './EnhancedPortalShell';
 import { EnhancedCopilotPanel } from './EnhancedCopilotPanel';
+import { GiopRealtimeCopilot } from './GiopRealtimeCopilot';
+
+const REALTIME_VOICE_ENABLED = import.meta.env.VITE_GIOP_REALTIME === '1';
 import { isGiopPortalTab } from './GiopCopilotPanel';
 import type {
   GiopCopilotPortalContext,
   GiopCopilotUiAction,
   MapViewportContext,
 } from '../lib/giopCopilotTypes';
+import { buildCopilotContext, defaultMapViewport } from '../lib/giopMapViewport';
 import type { MapBbox } from '../hooks/useGiopGraphChunk';
 
 const OPS_TOPOLOGY_GRAPH_QUERY_OPTIONS = GIOP_GRAPH_QUERY_OPTIONS.filter(
@@ -187,12 +192,14 @@ function GiopPortalInner() {
   const [sideMapEpoch, setSideMapEpoch] = useState(0);
   const [opsRefreshToken, setOpsRefreshToken] = useState(0);
   const [liveStatus, setLiveStatus] = useState<'idle' | 'loading' | 'live'>('idle');
-  const [mapViewport, setMapViewport] = useState<MapViewportContext | null>(null);
-  const mapViewportRef = useRef<MapViewportContext | null>(null);
+  const [mapViewport, setMapViewport] = useState<MapViewportContext | null>(() => defaultMapViewport());
+  const mapViewportRef = useRef<MapViewportContext | null>(defaultMapViewport());
   const [selectedTerritory, setSelectedTerritory] = useState<{
     district?: string;
     region?: string;
   } | null>(null);
+  const [boundaryFeederId, setBoundaryFeederId] = useState<string | null>(null);
+  const [copilotTentativeHighlight, setCopilotTentativeHighlight] = useState(false);
   const stagingTopologyTimerRef = useRef<number | undefined>(undefined);
   /** Guards against an older async territory-geojson fetch overwriting a newer one. */
   const territoryHighlightSeqRef = useRef(0);
@@ -200,6 +207,7 @@ function GiopPortalInner() {
   const { selection, setSelection } = useGiopSelection();
   const {
     impactOverlay,
+    feederHighlight,
     sideMap,
     closeSideMap,
     focusOnMap,
@@ -208,6 +216,10 @@ function GiopPortalInner() {
     clearMapIdentifyFocus,
     queueMapViewportCommand,
     setTerritoryHighlight,
+    clearTerritoryHighlight,
+    setFeederHighlight,
+    clearFeederHighlight,
+    getLiveMapViewport,
   } = useGiopMapOverlay();
   const navBadges = useGiopNavBadges(opsRefreshToken);
   const [workOrders, setWorkOrders] = useState<GiopWorkOrder[]>([]);
@@ -228,6 +240,28 @@ function GiopPortalInner() {
       .then(setStagingSeedRows)
       .catch(() => setStagingSeedRows([]));
   }, [opsRefreshToken]);
+
+  const focusMridForCopilot = selection.mrid ?? route.focusMrid ?? null;
+  useEffect(() => {
+    const mrid = focusMridForCopilot;
+    if (!mrid) {
+      setBoundaryFeederId(null);
+      return;
+    }
+    let cancelled = false;
+    void getAssetLocation(mrid)
+      .then((loc) => {
+        if (!cancelled) {
+          setBoundaryFeederId(loc.boundary_feeder_id ?? null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setBoundaryFeederId(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [focusMridForCopilot]);
 
   const topologyStartMrid = useMemo(
     () => resolveTopologyStartMrid(route.tab, route.startMrid, stagingSeedRows),
@@ -367,23 +401,26 @@ function GiopPortalInner() {
 
   const copilotContext = useMemo((): GiopCopilotPortalContext => {
     const pending = staging.filter((a) => a.validation !== 'REJECTED').length;
-    return {
+    const base: GiopCopilotPortalContext = {
       active_tab: route.tab,
-      focus_mrid: selection.mrid ?? route.focusMrid ?? null,
+      focus_mrid: focusMridForCopilot,
       selection_name: selection.name ?? null,
+      boundary_feeder_id: boundaryFeederId,
       staging_pending_count: pending,
       viewport: mapViewport ?? mapViewportRef.current,
       selected_district: selectedTerritory?.district ?? null,
       selected_region: selectedTerritory?.region ?? null,
     };
+    return buildCopilotContext(base, getLiveMapViewport);
   }, [
     route.tab,
-    route.focusMrid,
-    selection.mrid,
+    focusMridForCopilot,
     selection.name,
+    boundaryFeederId,
     staging,
     mapViewport,
     selectedTerritory,
+    getLiveMapViewport,
   ]);
 
   const ensureMapVisible = useCallback(
@@ -457,7 +494,11 @@ function GiopPortalInner() {
         if (action.district || action.region) {
           setSelectedTerritory({ district: action.district, region: action.region });
         }
-        queueMapViewportCommand({ type: 'fit_bounds', bbox: action.bbox });
+        queueMapViewportCommand({
+          type: 'fit_bounds',
+          bbox: action.bbox,
+          max_zoom: action.max_zoom,
+        });
         refreshMap();
         return;
       }
@@ -473,8 +514,27 @@ function GiopPortalInner() {
         return;
       }
 
+      if (action.type === 'highlight_node') {
+        ensureMapVisible(action.tab ? String(action.tab) : 'map');
+        setCopilotTentativeHighlight(action.tentative ?? true);
+        void focusOnMap(action.mrid, {
+          name: action.label,
+          coordinates: [action.center.lon, action.center.lat],
+          navigateTab: true,
+          tab: 'map',
+        });
+        queueMapViewportCommand({
+          type: 'fly_to',
+          center: action.center,
+          zoom: action.zoom ?? 17,
+        });
+        refreshMap();
+        return;
+      }
+
       if (action.type === 'highlight_territory') {
         ensureMapVisible(action.tab ? String(action.tab) : 'map');
+        clearFeederHighlight();
         if (action.district || action.region) {
           setSelectedTerritory({ district: action.district, region: action.region });
         }
@@ -502,6 +562,22 @@ function GiopPortalInner() {
         })();
         queueMapViewportCommand({ type: 'fit_bounds', bbox: action.bbox });
         refreshMap();
+        return;
+      }
+
+      if (action.type === 'highlight_feeder') {
+        ensureMapVisible(action.tab ? String(action.tab) : 'map');
+        clearTerritoryHighlight();
+        setFeederHighlight({
+          feederId: action.feeder_id,
+          label: action.label ?? action.feeder_id,
+          geojson: action.geojson,
+          bbox: action.bbox,
+        });
+        if (action.bbox) {
+          queueMapViewportCommand({ type: 'fit_bounds', bbox: action.bbox });
+        }
+        refreshMap();
       }
     },
     [
@@ -513,6 +589,9 @@ function GiopPortalInner() {
       refreshMap,
       setSelection,
       setTerritoryHighlight,
+      setFeederHighlight,
+      clearFeederHighlight,
+      clearTerritoryHighlight,
       startMrid,
     ],
   );
@@ -739,10 +818,12 @@ function GiopPortalInner() {
 
   const mapPulseFocus =
     mapIdentifyFocusMrid != null && selection.mrid === mapIdentifyFocusMrid;
+  const mapPulseTentative = copilotTentativeHighlight && mapPulseFocus;
 
   const handleMapNodeClick = useCallback(
     (mrid: string, coordinates?: [number, number]) => {
       clearMapIdentifyFocus();
+      setCopilotTentativeHighlight(false);
       setSelection(mrid, { coordinates: coordinates ?? null, source: 'map' });
     },
     [clearMapIdentifyFocus, setSelection],
@@ -804,6 +885,7 @@ function GiopPortalInner() {
           mapRefreshToken={mapRefreshToken}
           startMrid={topologyStartMrid}
           impactOverlay={impactOverlay}
+          feederHighlight={feederHighlight}
           opsRefreshToken={opsRefreshToken}
           onRefreshTopology={() => void refreshTopology()}
           onMapRefresh={refreshMap}
@@ -824,6 +906,7 @@ function GiopPortalInner() {
             focusCoordinates={focusCoordinates}
             focusLabel={mapPulseFocus ? (selection.name ?? null) : null}
             pulseFocus={mapPulseFocus}
+            pulseFocusTentative={mapPulseTentative}
             stagingAssets={staging}
             fieldTechnicians={technicians}
             fieldCrews={fieldCrewsPanel}
@@ -835,6 +918,7 @@ function GiopPortalInner() {
             onTerritorySelect={handleTerritorySelect}
             workOrders={workOrders}
             impactOverlay={impactOverlay}
+            feederHighlight={feederHighlight}
           />
         </div>
       )}
@@ -870,9 +954,7 @@ function GiopPortalInner() {
           stagingAssets={staging}
           mapRefreshToken={mapRefreshToken}
           startMrid={topologyStartMrid}
-          onMapNodeClick={(mrid, coordinates) =>
-            setSelection(mrid, { coordinates: coordinates ?? null, source: 'map' })
-          }
+          onMapNodeClick={handleMapNodeClick}
           onMapViewportChange={handleMapViewportChange}
           onTerritorySelect={handleTerritorySelect}
           fieldTechnicians={technicians}
@@ -880,6 +962,10 @@ function GiopPortalInner() {
           fieldCrews={fieldCrewsPanel}
           workOrders={workOrders}
           impactOverlay={impactOverlay}
+          feederHighlight={feederHighlight}
+          focusLabel={mapPulseFocus ? (selection.name ?? null) : null}
+          pulseFocus={mapPulseFocus}
+          pulseFocusTentative={mapPulseTentative}
         />
       )}
 
@@ -953,6 +1039,13 @@ function GiopPortalInner() {
         portalContext={copilotContext}
         onUiAction={handleCopilotUiAction}
       />
+      {REALTIME_VOICE_ENABLED && (
+        <GiopRealtimeCopilot
+          isLightMode={isLightMode}
+          portalContext={copilotContext}
+          onUiAction={handleCopilotUiAction}
+        />
+      )}
     </EnhancedPortalShell>
   );
 }
@@ -961,7 +1054,9 @@ export function GiopPortal() {
   return (
     <GiopSelectionProvider>
       <GiopMapOverlayProvider>
-        <GiopPortalInner />
+        <GiopVoiceModeProvider>
+          <GiopPortalInner />
+        </GiopVoiceModeProvider>
       </GiopMapOverlayProvider>
     </GiopSelectionProvider>
   );

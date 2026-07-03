@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 from geocode import geocode_map_places
@@ -53,6 +54,30 @@ def _district_row_to_result(
     }
 
 
+def _pin_locality_center(
+    result: dict[str, Any],
+    lon: float,
+    lat: float,
+    *,
+    matched_as: str | None = None,
+    source: str | None = None,
+    query: str | None = None,
+    confidence: float | None = None,
+) -> dict[str, Any]:
+    """Ensure navigation targets the locality point, not an admin polygon centroid."""
+    out = dict(result)
+    out["center"] = {"lon": float(lon), "lat": float(lat)}
+    if matched_as is not None:
+        out["matched_as"] = matched_as
+    if source is not None:
+        out["source"] = source
+    if query is not None:
+        out["query"] = query
+    if confidence is not None:
+        out["confidence"] = confidence
+    return out
+
+
 def _lookup_alias_exact(conn, query: str) -> dict[str, Any] | None:
     with conn.cursor() as cur:
         cur.execute(
@@ -68,23 +93,45 @@ def _lookup_alias_exact(conn, query: str) -> dict[str, Any] | None:
     if not row:
         return None
     alias, district, region, lon, lat = row
-    if district and region and lon is not None and lat is not None:
+    if lon is None or lat is None:
+        return None
+    if district and region:
         terr = _territory_for_names(conn, district=district, region=region)
         if terr:
-            terr["matched_as"] = alias
-            terr["confidence"] = CONFIDENCE_ALIAS_EXACT
-            terr["source"] = "alias"
-            terr["query"] = query
-            return terr
-    if lon is not None and lat is not None:
-        contained = _district_at_point(conn, float(lon), float(lat))
-        if contained:
-            contained["matched_as"] = alias
-            contained["confidence"] = CONFIDENCE_ALIAS_EXACT
-            contained["source"] = "alias"
-            contained["query"] = query
-            return contained
-    return None
+            return _pin_locality_center(
+                terr,
+                lon,
+                lat,
+                matched_as=alias,
+                source="alias_exact",
+                query=query,
+                confidence=CONFIDENCE_ALIAS_EXACT,
+            )
+    contained = _district_at_point(conn, float(lon), float(lat))
+    if contained:
+        return _pin_locality_center(
+            contained,
+            lon,
+            lat,
+            matched_as=alias,
+            source="alias_exact",
+            query=query,
+            confidence=CONFIDENCE_ALIAS_EXACT,
+        )
+    return _pin_locality_center(
+        {
+            "query": query,
+            "matched_as": alias,
+            "confidence": CONFIDENCE_ALIAS_EXACT,
+            "source": "alias_exact",
+            "district": district,
+            "region": region,
+            "bbox": None,
+            "candidates": [],
+        },
+        lon,
+        lat,
+    )
 
 
 def _lookup_alias_fuzzy(conn, query: str, limit: int = 5) -> list[dict[str, Any]]:
@@ -262,11 +309,40 @@ def _lookup_district_fuzzy(conn, query: str, limit: int = 5) -> list[dict[str, A
     ]
 
 
-def _resolve_osm(conn, query: str) -> dict[str, Any] | None:
-    hits = geocode_map_places(query, limit=3)
+def _pick_osm_hit(query: str, hits: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not hits:
         return None
-    best = hits[0]
+    q_norm = re.sub(r"\s+", " ", (query or "").strip().lower())
+    q_compact = q_norm.replace(" ", "")
+    best: dict[str, Any] | None = None
+    best_rank = 99
+    for hit in hits:
+        title = str(hit.get("title") or "").strip().lower()
+        title_compact = title.replace(" ", "")
+        rank = 99
+        if title == q_norm or title_compact == q_compact:
+            rank = 0
+        elif q_norm and q_norm in title:
+            rank = 1
+        elif q_compact and q_compact in title_compact:
+            rank = 2
+        elif title and title in q_norm:
+            rank = 3
+        if best is None or rank < best_rank:
+            best = hit
+            best_rank = rank
+    return best or hits[0]
+
+
+def _resolve_osm(conn, query: str) -> dict[str, Any] | None:
+    hits = geocode_map_places(query, limit=5)
+    if not hits and "," not in query:
+        hits = geocode_map_places(f"{query}, Accra, Ghana", limit=5)
+    if not hits:
+        return None
+    best = _pick_osm_hit(query, hits)
+    if not best:
+        return None
     lon = best.get("longitude")
     lat = best.get("latitude")
     if lon is None or lat is None:
@@ -364,6 +440,12 @@ def resolve_place(
     if hit:
         return hit
 
+    # Geocode localities before fuzzy district match (Roman Ridge, East Legon, romanridge).
+    if geocode:
+        hit = _resolve_osm(conn, q)
+        if hit:
+            return hit
+
     alias_fuzzy = _lookup_alias_fuzzy(conn, q)
     district_fuzzy = _lookup_district_fuzzy(conn, q)
     merged_candidates: list[dict[str, Any]] = []
@@ -390,17 +472,25 @@ def resolve_place(
                     terr["confidence"] = max(CONFIDENCE_DISTRICT_FUZZY, min(0.88, sim))
                     terr["source"] = best.get("source") or "fuzzy"
                     terr["candidates"] = merged_candidates[1:4]
+                    lon, lat = best.get("lon"), best.get("lat")
+                    if lon is not None and lat is not None:
+                        return _pin_locality_center(terr, float(lon), float(lat))
                     return terr
             lon, lat = best.get("lon"), best.get("lat")
             if lon is not None and lat is not None:
                 contained = _district_at_point(conn, float(lon), float(lat))
                 if contained:
-                    contained["query"] = q
-                    contained["matched_as"] = best.get("label") or q
-                    contained["confidence"] = max(CONFIDENCE_DISTRICT_FUZZY, min(0.88, sim))
-                    contained["source"] = "alias_fuzzy"
-                    contained["candidates"] = merged_candidates[1:4]
-                    return contained
+                    pinned = _pin_locality_center(
+                        contained,
+                        float(lon),
+                        float(lat),
+                        matched_as=best.get("label") or q,
+                        source="alias_fuzzy",
+                        query=q,
+                        confidence=max(CONFIDENCE_DISTRICT_FUZZY, min(0.88, sim)),
+                    )
+                    pinned["candidates"] = merged_candidates[1:4]
+                    return pinned
 
     if geocode:
         hit = _resolve_osm(conn, q)
@@ -421,3 +511,99 @@ def resolve_place(
         }
 
     raise ValueError(f"Place not found: {q}")
+
+
+LOCALITY_FLY_ZOOM = 16.5
+DISTRICT_CLOSE_FLY_ZOOM = 15.0
+LOCALITY_PAN_ZOOM = 15.5
+LOCALITY_FIT_MAX_ZOOM = 17.0
+# Metro regions and wide districts — fit the bbox instead of flying to a centroid.
+LARGE_TERRITORY_SPAN_DEG = 0.12
+METRO_FIT_MAX_ZOOM = 14.5
+LOCALITY_SOURCES = frozenset(
+    {"osm", "alias_exact", "alias", "alias_fuzzy", "point_in_polygon"}
+)
+
+
+def _bbox_span_deg(bbox: dict[str, Any]) -> tuple[float, float]:
+    return (
+        float(bbox["east"]) - float(bbox["west"]),
+        float(bbox["north"]) - float(bbox["south"]),
+    )
+
+
+def place_viewport_ui_action(
+    resolved: dict[str, Any],
+    *,
+    mode: str = "pan",
+    tab: str = "map",
+) -> dict[str, Any] | None:
+    """
+    Pick a map camera action for a resolved place.
+
+    Localities (OSM, aliases) and explicit zoom requests fly in close instead of
+    framing an entire ECG district.
+    """
+    source = str(resolved.get("source") or "")
+    center = resolved.get("center")
+    bbox = resolved.get("bbox")
+    wants_close = mode == "zoom"
+    navigate = mode in ("pan", "zoom")
+
+    # Named localities — always center the map on the resolved point, not a wide bbox edge.
+    if navigate and source in LOCALITY_SOURCES and isinstance(center, dict):
+        lon = center.get("lon")
+        lat = center.get("lat")
+        if lon is not None and lat is not None:
+            zoom = LOCALITY_FLY_ZOOM if wants_close else LOCALITY_PAN_ZOOM
+            return {
+                "type": "fly_to",
+                "tab": tab,
+                "center": {"lon": float(lon), "lat": float(lat)},
+                "zoom": zoom,
+            }
+
+    if bbox and all(bbox.get(k) is not None for k in ("west", "south", "east", "north")):
+        w, h = _bbox_span_deg(bbox)
+        if source == "metro_region" or max(w, h) >= LARGE_TERRITORY_SPAN_DEG:
+            action: dict[str, Any] = {
+                "type": "fit_bounds",
+                "tab": tab,
+                "bbox": bbox,
+            }
+            if wants_close:
+                action["max_zoom"] = METRO_FIT_MAX_ZOOM
+            return action
+
+    if center and isinstance(center, dict):
+        lon = center.get("lon")
+        lat = center.get("lat")
+        if lon is not None and lat is not None:
+            use_fly = wants_close or source in ("osm", "alias_exact")
+            if use_fly and bbox and all(bbox.get(k) is not None for k in ("west", "south", "east", "north")):
+                w, h = _bbox_span_deg(bbox)
+                # Large district polygon — still fly to center when zooming in.
+                if source == "district_exact" and max(w, h) > 0.07 and not wants_close:
+                    use_fly = False
+            if use_fly:
+                zoom = LOCALITY_FLY_ZOOM
+                if source == "district_exact":
+                    zoom = DISTRICT_CLOSE_FLY_ZOOM
+                return {
+                    "type": "fly_to",
+                    "tab": tab,
+                    "center": {"lon": float(lon), "lat": float(lat)},
+                    "zoom": zoom,
+                }
+
+    if bbox and all(bbox.get(k) is not None for k in ("west", "south", "east", "north")):
+        w, h = _bbox_span_deg(bbox)
+        if wants_close or max(w, h) < 0.12:
+            return {
+                "type": "fit_bounds",
+                "tab": tab,
+                "bbox": bbox,
+                "max_zoom": LOCALITY_FIT_MAX_ZOOM,
+            }
+
+    return None

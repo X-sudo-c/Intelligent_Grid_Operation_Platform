@@ -48,18 +48,27 @@ def collect_badge_counts(conn) -> dict[str, int]:
         (list(STAGING_ACTIONABLE),),
     )
 
-    # Open data-quality exceptions (all domains).
+    # Open data-quality exceptions (staging field queue + master queue).
     counts["data-quality"] = _scalar(
-        "SELECT COUNT(*) FROM public.data_quality_exceptions WHERE status = 'OPEN'"
+        """
+        SELECT
+          (SELECT COUNT(*) FROM staging.data_quality_exceptions WHERE status = 'OPEN')
+        + (SELECT COUNT(*) FROM public.data_quality_exceptions WHERE status = 'OPEN')
+        """
     )
 
     # Open topology exceptions = "work on the map". Indexed on status; cheap.
     counts["map"] = _scalar(
         """
-        SELECT COUNT(*)
-        FROM public.data_quality_exceptions e
-        JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
-        WHERE e.status = 'OPEN' AND r.domain = 'topology'
+        SELECT
+          (SELECT COUNT(*)
+           FROM staging.data_quality_exceptions e
+           JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
+           WHERE e.status = 'OPEN' AND r.domain = 'topology')
+        + (SELECT COUNT(*)
+           FROM public.data_quality_exceptions e
+           JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
+           WHERE e.status = 'OPEN' AND r.domain = 'topology')
         """
     )
 

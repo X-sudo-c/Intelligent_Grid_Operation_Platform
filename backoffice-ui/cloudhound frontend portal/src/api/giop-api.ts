@@ -1060,6 +1060,11 @@ export interface GiopAgentsStatus {
   engine: string;
   llm_configured: boolean;
   llm_model?: string | null;
+  llm_base_url?: string | null;
+  llm_tools?: string[];
+  llm_tool_count?: number;
+  llm_reachable?: boolean;
+  llm_error?: string | null;
   agents: string[];
 }
 
@@ -1216,6 +1221,7 @@ export async function portalAiChat(options: {
 export interface GiopVoiceStatus {
   stt: {
     mode?: string;
+    provider?: string;
     available?: boolean;
     model?: string;
     beam_size?: number;
@@ -1248,7 +1254,80 @@ export async function portalAiTranscribe(blob: Blob): Promise<{
     const detail = (err as { detail?: string }).detail || res.statusText;
     throw new Error(detail || `HTTP ${res.status}`);
   }
-  return res.json() as Promise<{ text: string }>;
+  return res.json() as Promise<{ text: string; raw?: string; fixes?: string[] }>;
+}
+
+export interface GiopRealtimeSessionToken {
+  value: string;
+  expires_at?: number;
+  model: string;
+}
+
+/** Mint an ephemeral OpenAI Realtime client secret (live-voice PoC). */
+export async function createRealtimeSession(options?: {
+  operatorId?: string;
+}): Promise<GiopRealtimeSessionToken> {
+  return fetchJson(`${SYNC_BASE}/portal/ai/realtime/session`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ operator_id: options?.operatorId }),
+  });
+}
+
+export async function portalAiVoiceAudioTurn(options: {
+  audio: Blob;
+  sessionId?: string;
+  exceptionId?: string;
+  mrid?: string;
+  operatorId?: string;
+  context?: Record<string, unknown>;
+}): Promise<{
+  content: string;
+  findings: string[];
+  actions: string[];
+  ui_actions?: Array<Record<string, unknown>>;
+  agent?: Record<string, unknown> & {
+    speak?: string;
+    session_id?: string;
+    transcript?: string;
+    fast_path?: boolean;
+    voice?: boolean;
+    tts?: GiopVoiceStatus['tts'];
+  };
+}> {
+  const form = new FormData();
+  const name = options.audio.type.includes('ogg') ? 'recording.ogg' : 'recording.webm';
+  form.append('audio', options.audio, name);
+  if (options.sessionId) form.append('session_id', options.sessionId);
+  if (options.exceptionId) form.append('exception_id', options.exceptionId);
+  if (options.mrid) form.append('mrid', options.mrid);
+  if (options.operatorId) form.append('operator_id', options.operatorId);
+  if (options.context && Object.keys(options.context).length > 0) {
+    form.append('context', JSON.stringify(options.context));
+  }
+  const res = await fetch(`${SYNC_BASE}/portal/ai/voice-audio-turn`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    const detail = (err as { detail?: string }).detail || res.statusText;
+    throw new Error(detail || `HTTP ${res.status}`);
+  }
+  return res.json() as Promise<{
+    content: string;
+    findings: string[];
+    actions: string[];
+    ui_actions?: Array<Record<string, unknown>>;
+    agent?: Record<string, unknown> & {
+      speak?: string;
+      session_id?: string;
+      transcript?: string;
+      fast_path?: boolean;
+      voice?: boolean;
+      tts?: GiopVoiceStatus['tts'];
+    };
+  }>;
 }
 
 export async function portalAiVoiceTurn(options: {

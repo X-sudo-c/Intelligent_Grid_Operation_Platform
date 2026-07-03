@@ -47,26 +47,6 @@ export function chunkToEdgeGeoJson(chunk: GiopGraphChunkResponse | null) {
   return { type: 'FeatureCollection' as const, features };
 }
 
-export function chunkToTracedNodeGeoJson(chunk: GiopGraphChunkResponse | null) {
-  if (!chunk) {
-    return { type: 'FeatureCollection' as const, features: [] };
-  }
-
-  return {
-    type: 'FeatureCollection' as const,
-    features: chunk.nodes
-      .filter((node) => node.traced)
-      .map((node) => ({
-        type: 'Feature' as const,
-        properties: { mrid: node.mrid, name: node.name },
-        geometry: {
-          type: 'Point' as const,
-          coordinates: [node.lon, node.lat] as [number, number],
-        },
-      })),
-  };
-}
-
 /** All nodes in the viewport chunk — used when Martin tiles are unavailable. */
 export function chunkToNodeGeoJson(chunk: GiopGraphChunkResponse | null) {
   if (!chunk) {

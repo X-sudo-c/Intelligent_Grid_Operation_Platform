@@ -29,6 +29,20 @@ def _row_to_dict(cur, row) -> dict[str, Any]:
     return out
 
 
+WORK_ORDER_CLOSED = ("COMPLETED", "CANCELLED")
+
+_WORK_ORDER_SELECT = """
+        SELECT wo.id::text, wo.reference, wo.work_type::text, wo.priority, wo.status::text,
+               wo.assigned_crew, wo.assigned_user, wo.due_at, wo.account_mrid::text, wo.asset_mrid::text,
+               wo.feeder_mrid::text, wo.source_ticket_id::text, wo.source_case_id::text,
+               wo.summary, wo.notes, wo.created_by, wo.created_at, wo.updated_at,
+               COALESCE(ST_X(wo.geom), ST_X(cn.geom)) AS longitude,
+               COALESCE(ST_Y(wo.geom), ST_Y(cn.geom)) AS latitude
+        FROM work_orders wo
+        LEFT JOIN public.connectivity_nodes cn ON cn.mrid = wo.asset_mrid
+"""
+
+
 def list_work_orders(
     conn,
     *,
@@ -50,14 +64,7 @@ def list_work_orders(
         params.append(assigned_crew)
     params.append(limit)
     sql = f"""
-        SELECT id::text, reference, work_type::text, priority, status::text,
-               assigned_crew, assigned_user, due_at, account_mrid::text, asset_mrid::text,
-               feeder_mrid::text, source_ticket_id::text, source_case_id::text,
-               summary, notes, created_by, created_at, updated_at,
-               COALESCE(ST_X(wo.geom), ST_X(cn.geom)) AS longitude,
-               COALESCE(ST_Y(wo.geom), ST_Y(cn.geom)) AS latitude
-        FROM work_orders wo
-        LEFT JOIN public.connectivity_nodes cn ON cn.mrid = wo.asset_mrid
+        {_WORK_ORDER_SELECT.strip()}
         WHERE {' AND '.join(clauses)}
         ORDER BY wo.created_at DESC
         LIMIT %s
@@ -65,6 +72,51 @@ def list_work_orders(
     with conn.cursor() as cur:
         cur.execute(sql, params)
         return [_row_to_dict(cur, row) for row in cur.fetchall()]
+
+
+def list_work_orders_in_bbox(
+    conn,
+    *,
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+    status: Optional[str] = None,
+    open_only: bool = True,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Open work orders whose location (WO geom or linked asset) falls in the map bbox."""
+    clauses = [
+        "COALESCE(wo.geom, cn.geom) IS NOT NULL",
+        "ST_Intersects("
+        "COALESCE(wo.geom, cn.geom), "
+        "ST_MakeEnvelope(%s, %s, %s, %s, 4326)"
+        ")",
+    ]
+    params: list[Any] = [west, south, east, north]
+    if status:
+        clauses.append("wo.status = %s::work_order_status")
+        params.append(status)
+    elif open_only:
+        clauses.append("wo.status::text <> ALL(%s)")
+        params.append(list(WORK_ORDER_CLOSED))
+    params.append(limit)
+    sql = f"""
+        {_WORK_ORDER_SELECT.strip()}
+        WHERE {' AND '.join(clauses)}
+        ORDER BY wo.priority ASC, wo.created_at DESC
+        LIMIT %s
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = [_row_to_dict(cur, row) for row in cur.fetchall()]
+    return {
+        "count": len(rows),
+        "open_only": open_only and not status,
+        "status_filter": status,
+        "bbox": {"west": west, "south": south, "east": east, "north": north},
+        "work_orders": rows,
+    }
 
 
 def get_work_order(conn, work_order_id: str) -> dict[str, Any]:

@@ -4,16 +4,17 @@ import { MARTIN_URL, getAssetLocation, getH3Coverage, probeGisOverviewAvailable,
 import type { GiopReferenceMapLayerConfig } from '../api/giop-api';
 import type { GiopStagingAsset, GiopGraphChunkResponse, GiopFieldTechnician, GiopWorkOrder, GiopTopologyPayload } from '../api/giop-api';
 import { useGiopGraphChunk } from '../hooks/useGiopGraphChunk';
-import { chunkToNodeGeoJson, chunkToTracedNodeGeoJson } from '../lib/giopChunkGeoJson';
+import { chunkToNodeGeoJson } from '../lib/giopChunkGeoJson';
 import type { MapBbox } from '../hooks/useGiopGraphChunk';
+import type { MapViewportContext } from '../lib/giopCopilotTypes';
 import {
   buildGiopMapStyle,
   applyStagingMapLayersPaint,
   stagingPointCirclePaint,
   workOrderPinCirclePaint,
   impactNodeCirclePaint,
-  tracedHighlightCirclePaint,
   focusIdentifyCirclePaint,
+  focusTentativeCirclePaint,
   mapSymbolLabelPaint,
   syncGiopMapTheme,
   tileNodeCirclePaint,
@@ -53,6 +54,15 @@ import {
   applyTerritoryHighlight,
   clearTerritoryHighlight as removeTerritoryHighlightLayers,
 } from '../lib/giopTerritoryHighlight';
+import {
+  FEEDER_HIGHLIGHT_EDGE_LAYER,
+  FEEDER_HIGHLIGHT_EDGE_SOURCE,
+  FEEDER_HIGHLIGHT_NODE_LAYER,
+  FEEDER_HIGHLIGHT_NODE_SOURCE,
+  feederHighlightEdgePaint,
+  feederHighlightNodePaint,
+  type FeederHighlightState,
+} from '../lib/giopFeederHighlight';
 import {
   applyEcgBoundaryTheme,
   ecgBoundaryPopupHtml,
@@ -107,8 +117,11 @@ interface GiopMapViewProps {
   };
   workOrders?: GiopWorkOrder[];
   impactOverlay?: GiopTopologyPayload | null;
+  feederHighlight?: FeederHighlightState | null;
   /** Pulsing ripple on the focused node (side-map identify only). */
   pulseFocus?: boolean;
+  /** Amber pulse when the copilot is asking the user to confirm a node guess. */
+  pulseFocusTentative?: boolean;
   /** Full map chrome (overlays, legend, crews) vs minimal steward desk map. */
   mapChrome?: 'full' | 'operations';
   /** Apple-style spotlight search at top-center (default: on except ops desk). */
@@ -264,13 +277,11 @@ function chunkOverlayData(
 ): {
   edges: typeof EMPTY_FC;
   nodes: ReturnType<typeof chunkToNodeGeoJson>;
-  traced: ReturnType<typeof chunkToTracedNodeGeoJson>;
 } {
   const showNodes = zoom >= CHUNK_NODE_MIN_ZOOM && zoom < NODE_DETAIL_ZOOM;
   return {
     edges: EMPTY_FC,
     nodes: showNodes ? chunkToNodeGeoJson(chunk) : EMPTY_FC,
-    traced: showNodes ? chunkToTracedNodeGeoJson(chunk) : EMPTY_FC,
   };
 }
 
@@ -294,7 +305,9 @@ export function GiopMapView({
   fieldCrews,
   workOrders = [],
   impactOverlay = null,
+  feederHighlight = null,
   pulseFocus = false,
+  pulseFocusTentative = false,
   mapChrome = 'full',
   showSearchBar: showSearchBarProp,
   flyRequest = null,
@@ -329,7 +342,7 @@ export function GiopMapView({
   const handledViewportCommandIdRef = useRef(0);
   const stagingAssetsRef = useRef(stagingAssets);
   const chunkRef = useRef(graphChunkExternal);
-  const { focusCameraRequest, clearFocusCamera, mapViewportCommand, clearMapViewportCommand, territoryHighlight, clearTerritoryHighlight, repairPreviewLayers, duplicateClusterOverlay, focusOnMap, queueMapViewportCommand } =
+  const { focusCameraRequest, clearFocusCamera, mapViewportCommand, clearMapViewportCommand, territoryHighlight, clearTerritoryHighlight, repairPreviewLayers, duplicateClusterOverlay, focusOnMap, queueMapViewportCommand, registerMapViewportReader } =
     useGiopMapOverlay();
 
   const { placeCatalog, opsCatalog, placesReady } = useGiopMapSearchCatalog({
@@ -590,21 +603,42 @@ export function GiopMapView({
     const map = mapRef.current;
     if (!map) return;
 
-    const emitViewport = () => {
+    const readViewport = (): MapViewportContext | null => {
+      if (!map.isStyleLoaded()) return null;
       const bounds = map.getBounds();
+      const zoom = map.getZoom();
+      const c = map.getCenter();
       const bbox: MapBbox = {
         west: bounds.getWest(),
         south: bounds.getSouth(),
         east: bounds.getEast(),
         north: bounds.getNorth(),
       };
-      const zoom = map.getZoom();
-      const c = map.getCenter();
-      onViewportChangeRef.current?.(bbox, zoom, { lon: c.lng, lat: c.lat });
-      if (streamGraphChunk && zoom >= CHUNK_NODE_MIN_ZOOM && zoom < NODE_DETAIL_ZOOM) {
-        void loadBbox(bbox, zoom);
+      return {
+        bbox,
+        zoom,
+        center: { lon: c.lng, lat: c.lat },
+      };
+    };
+
+    const emitViewport = () => {
+      const viewport = readViewport();
+      if (!viewport) return;
+      onViewportChangeRef.current?.(
+        viewport.bbox,
+        viewport.zoom,
+        viewport.center,
+      );
+      if (
+        streamGraphChunk &&
+        viewport.zoom >= CHUNK_NODE_MIN_ZOOM &&
+        viewport.zoom < NODE_DETAIL_ZOOM
+      ) {
+        void loadBbox(viewport.bbox, viewport.zoom);
       }
     };
+
+    const unregisterViewportReader = registerMapViewportReader(readViewport);
 
     let debounceTimer: number | undefined;
     const scheduleSync = () => {
@@ -626,13 +660,14 @@ export function GiopMapView({
     }
 
     return () => {
+      unregisterViewportReader();
       window.clearTimeout(debounceTimer);
       map.off('load', emitViewport);
       map.off('styledata', onStyleReady);
       map.off('moveend', scheduleSync);
       map.off('zoomend', scheduleSync);
     };
-  }, [loadBbox, mapReady, streamGraphChunk]);
+  }, [loadBbox, mapReady, registerMapViewportReader, streamGraphChunk]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -727,10 +762,13 @@ export function GiopMapView({
 
     const applyChunkLayers = () => {
       const zoom = map.getZoom();
-      const { edges: edgeData, nodes: nodeData, traced: tracedData } = chunkOverlayData(chunk, zoom);
+      const { edges: edgeData, nodes: nodeData } = chunkOverlayData(chunk, zoom);
       const edgeSourceId = 'graph-chunk-edges';
       const nodeSourceId = 'graph-chunk-nodes';
-      const tracedSourceId = 'graph-chunk-traced';
+
+      // Legacy orange trace highlight layer (removed — trace stays in topology graph).
+      if (map.getLayer('graph-chunk-traced-layer')) map.removeLayer('graph-chunk-traced-layer');
+      if (map.getSource('graph-chunk-traced')) map.removeSource('graph-chunk-traced');
 
       if (map.getSource(nodeSourceId)) {
         (map.getSource(nodeSourceId) as maplibregl.GeoJSONSource).setData(nodeData);
@@ -770,17 +808,6 @@ export function GiopMapView({
         );
       }
 
-      if (map.getSource(tracedSourceId)) {
-        (map.getSource(tracedSourceId) as maplibregl.GeoJSONSource).setData(tracedData);
-      } else if (tracedData.features.length > 0) {
-        map.addSource(tracedSourceId, { type: 'geojson', data: tracedData });
-        map.addLayer({
-          id: 'graph-chunk-traced-layer',
-          type: 'circle',
-          source: tracedSourceId,
-          paint: tracedHighlightCirclePaint(),
-        });
-      }
     };
 
     return scheduleMapLayerWork(map, applyChunkLayers);
@@ -1035,9 +1062,9 @@ export function GiopMapView({
     try {
       map.resize();
       if (cmd.type === 'fit_bounds' && cmd.bbox) {
-        fitMapBounds(map, cmd.bbox);
+        fitMapBounds(map, cmd.bbox, { maxZoom: cmd.max_zoom ?? 14 });
       } else if (cmd.type === 'fly_to' && cmd.center) {
-        flyToLatLon(map, cmd.center.lon, cmd.center.lat, cmd.zoom ?? 14);
+        flyToLatLon(map, cmd.center.lon, cmd.center.lat, cmd.zoom ?? 16.5);
       }
       handledViewportCommandIdRef.current = cmd.id;
       clearMapViewportCommand();
@@ -1188,6 +1215,68 @@ export function GiopMapView({
       whenMapCanAddLayers(map, applyImpact);
     }
   }, [impactOverlay, mapBusy]);
+
+  // Copilot feeder trace highlight.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || mapBusy) return;
+
+    const nodes = feederHighlight?.geojson.nodes ?? EMPTY_FC;
+    const edges = feederHighlight?.geojson.edges ?? EMPTY_FC;
+
+    const applyFeederHighlight = () => {
+      if (!feederHighlight) {
+        if (map.getLayer(FEEDER_HIGHLIGHT_EDGE_LAYER)) map.removeLayer(FEEDER_HIGHLIGHT_EDGE_LAYER);
+        if (map.getLayer(FEEDER_HIGHLIGHT_NODE_LAYER)) map.removeLayer(FEEDER_HIGHLIGHT_NODE_LAYER);
+        if (map.getSource(FEEDER_HIGHLIGHT_EDGE_SOURCE)) map.removeSource(FEEDER_HIGHLIGHT_EDGE_SOURCE);
+        if (map.getSource(FEEDER_HIGHLIGHT_NODE_SOURCE)) map.removeSource(FEEDER_HIGHLIGHT_NODE_SOURCE);
+        return;
+      }
+
+      if (map.getSource(FEEDER_HIGHLIGHT_NODE_SOURCE)) {
+        (map.getSource(FEEDER_HIGHLIGHT_NODE_SOURCE) as maplibregl.GeoJSONSource).setData(nodes);
+      } else if (nodes.features.length > 0) {
+        map.addSource(FEEDER_HIGHLIGHT_NODE_SOURCE, { type: 'geojson', data: nodes });
+      }
+
+      if (nodes.features.length > 0 && map.getSource(FEEDER_HIGHLIGHT_NODE_SOURCE)) {
+        if (!map.getLayer(FEEDER_HIGHLIGHT_NODE_LAYER)) {
+          map.addLayer({
+            id: FEEDER_HIGHLIGHT_NODE_LAYER,
+            type: 'circle',
+            source: FEEDER_HIGHLIGHT_NODE_SOURCE,
+            paint: feederHighlightNodePaint(isLightMode),
+          });
+        } else {
+          const nodePaint = feederHighlightNodePaint(isLightMode);
+          for (const key of Object.keys(nodePaint) as Array<keyof typeof nodePaint>) {
+            map.setPaintProperty(FEEDER_HIGHLIGHT_NODE_LAYER, key, nodePaint[key]);
+          }
+        }
+      }
+
+      if (map.getSource(FEEDER_HIGHLIGHT_EDGE_SOURCE)) {
+        (map.getSource(FEEDER_HIGHLIGHT_EDGE_SOURCE) as maplibregl.GeoJSONSource).setData(edges);
+      } else if (edges.features.length > 0) {
+        map.addSource(FEEDER_HIGHLIGHT_EDGE_SOURCE, { type: 'geojson', data: edges });
+        map.addLayer(
+          {
+            id: FEEDER_HIGHLIGHT_EDGE_LAYER,
+            type: 'line',
+            source: FEEDER_HIGHLIGHT_EDGE_SOURCE,
+            paint: feederHighlightEdgePaint(isLightMode),
+          },
+          map.getLayer(FEEDER_HIGHLIGHT_NODE_LAYER) ? FEEDER_HIGHLIGHT_NODE_LAYER : undefined,
+        );
+      }
+    };
+
+    if (map.isStyleLoaded()) {
+      applyFeederHighlight();
+    } else {
+      whenMapCanAddLayers(map, applyFeederHighlight);
+    }
+  }, [feederHighlight, isLightMode, mapBusy]);
 
   // FR-005 topology repair preview (before/after segment snap).
   useEffect(() => {
@@ -1587,6 +1676,10 @@ export function GiopMapView({
           const existing = map.getSource(sourceId) as maplibregl.GeoJSONSource | undefined;
           if (existing) {
             existing.setData(geojson);
+            const paint = pulseFocusTentative ? focusTentativeCirclePaint() : focusIdentifyCirclePaint();
+            if (map.getLayer(pointLayerId)) {
+              map.setPaintProperty(pointLayerId, 'circle-color', paint['circle-color']!);
+            }
             return;
           }
 
@@ -1601,7 +1694,7 @@ export function GiopMapView({
             id: pointLayerId,
             type: 'circle',
             source: sourceId,
-            paint: focusIdentifyCirclePaint(),
+            paint: pulseFocusTentative ? focusTentativeCirclePaint() : focusIdentifyCirclePaint(),
           });
 
           map.addLayer({
@@ -1662,7 +1755,7 @@ export function GiopMapView({
       cancelPendingApply?.();
       teardown();
     };
-  }, [pulseFocus, focusMrid, focusCoordinates, focusLabel, gisOverviewAvailable, flyRequest?.id, duplicateClusterOverlay, isLightMode]);
+  }, [pulseFocus, pulseFocusTentative, focusMrid, focusCoordinates, focusLabel, gisOverviewAvailable, flyRequest?.id, duplicateClusterOverlay, isLightMode]);
 
   // De-emphasise neighbouring poles while side-map identify is active.
   useEffect(() => {

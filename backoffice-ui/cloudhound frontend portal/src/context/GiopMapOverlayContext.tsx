@@ -13,9 +13,11 @@ import { DUPLICATE_CLUSTER_ZOOM } from '../lib/giopMapLayers';
 import { giopLog } from '../lib/giopDebugLog';
 import { writeGiopRouteToLocation, type GiopPortalTab } from '../lib/giopPortalRouting';
 import type { GiopMapFlyRequest } from '../lib/giopMapFlyRequest';
+import type { MapViewportContext } from '../lib/giopCopilotTypes';
 import type { TerritoryHighlightState } from '../lib/giopTerritoryHighlight';
 import type { GiopRepairPreviewLayers } from '../lib/giopRepairPreviewGeojson';
 import type { DuplicateClusterOverlay } from '../lib/giopDuplicateFan';
+import type { FeederHighlightState } from '../lib/giopFeederHighlight';
 import { useGiopSelection } from './GiopSelectionContext';
 
 export type { TerritoryHighlightState };
@@ -43,6 +45,7 @@ export interface MapViewportCommand {
   bbox?: { west: number; south: number; east: number; north: number };
   center?: { lon: number; lat: number };
   zoom?: number;
+  max_zoom?: number;
 }
 
 interface GiopMapOverlayContextValue {
@@ -60,12 +63,15 @@ interface GiopMapOverlayContextValue {
   focusCameraRequest: FocusCameraRequest | null;
   mapViewportCommand: MapViewportCommand | null;
   territoryHighlight: TerritoryHighlightState | null;
+  feederHighlight: FeederHighlightState | null;
   /** MRID highlighted on the full Map tab after Full map / navigateTab (cleared on next map click). */
   mapIdentifyFocusMrid: string | null;
   clearFocusCamera: () => void;
   clearMapViewportCommand: () => void;
   setTerritoryHighlight: (highlight: TerritoryHighlightState | null) => void;
   clearTerritoryHighlight: () => void;
+  setFeederHighlight: (highlight: FeederHighlightState | null) => void;
+  clearFeederHighlight: () => void;
   clearMapIdentifyFocus: () => void;
   closeSideMap: () => void;
   queueMapViewportCommand: (cmd: Omit<MapViewportCommand, 'id'>) => void;
@@ -89,6 +95,9 @@ interface GiopMapOverlayContextValue {
     },
   ) => Promise<void>;
   bumpSidePanelFly: (coordinates: [number, number], boostZoom?: boolean, targetZoom?: number) => void;
+  /** Map instances register a synchronous bounds reader for hands-free voice. */
+  registerMapViewportReader: (reader: () => MapViewportContext | null) => () => void;
+  getLiveMapViewport: () => MapViewportContext | null;
 }
 
 const GiopMapOverlayContext = createContext<GiopMapOverlayContextValue | null>(null);
@@ -115,6 +124,7 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
   const [territoryHighlight, setTerritoryHighlightState] = useState<TerritoryHighlightState | null>(
     null,
   );
+  const [feederHighlight, setFeederHighlightState] = useState<FeederHighlightState | null>(null);
   const [mapIdentifyFocusMrid, setMapIdentifyFocusMrid] = useState<string | null>(null);
   const focusCameraRequestIdRef = useRef(0);
   const mapViewportCommandIdRef = useRef(0);
@@ -123,6 +133,28 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
   const sideMapRef = useRef(sideMap);
   sideMapRef.current = sideMap;
   const sidePanelFlyIdRef = useRef(0);
+  const mapViewportReadersRef = useRef(new Set<() => MapViewportContext | null>());
+
+  const registerMapViewportReader = useCallback((reader: () => MapViewportContext | null) => {
+    mapViewportReadersRef.current.add(reader);
+    return () => {
+      mapViewportReadersRef.current.delete(reader);
+    };
+  }, []);
+
+  const getLiveMapViewport = useCallback((): MapViewportContext | null => {
+    for (const reader of mapViewportReadersRef.current) {
+      try {
+        const viewport = reader();
+        if (viewport?.bbox || (viewport?.center && viewport.zoom != null)) {
+          return viewport;
+        }
+      } catch {
+        /* best-effort */
+      }
+    }
+    return null;
+  }, []);
 
   const bumpSidePanelFly = useCallback(
     (coordinates: [number, number], boostZoom = true, targetZoom?: number) => {
@@ -180,6 +212,14 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
 
   const clearTerritoryHighlight = useCallback(() => {
     setTerritoryHighlightState(null);
+  }, []);
+
+  const setFeederHighlight = useCallback((highlight: FeederHighlightState | null) => {
+    setFeederHighlightState(highlight);
+  }, []);
+
+  const clearFeederHighlight = useCallback(() => {
+    setFeederHighlightState(null);
   }, []);
 
   const clearMapIdentifyFocus = useCallback(() => {
@@ -347,17 +387,22 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
       focusCameraRequest,
       mapViewportCommand,
       territoryHighlight,
+      feederHighlight,
       mapIdentifyFocusMrid,
       clearFocusCamera,
       clearMapViewportCommand,
       setTerritoryHighlight,
       clearTerritoryHighlight,
+      setFeederHighlight,
+      clearFeederHighlight,
       clearMapIdentifyFocus,
       closeSideMap,
       queueMapViewportCommand,
       queueFocusCamera,
       focusOnMap,
       bumpSidePanelFly,
+      registerMapViewportReader,
+      getLiveMapViewport,
     }),
     [
       impactOverlay,
@@ -374,17 +419,22 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
       focusCameraRequest,
       mapViewportCommand,
       territoryHighlight,
+      feederHighlight,
       mapIdentifyFocusMrid,
       clearFocusCamera,
       clearMapViewportCommand,
       setTerritoryHighlight,
       clearTerritoryHighlight,
+      setFeederHighlight,
+      clearFeederHighlight,
       clearMapIdentifyFocus,
       closeSideMap,
       queueMapViewportCommand,
       queueFocusCamera,
       focusOnMap,
       bumpSidePanelFly,
+      registerMapViewportReader,
+      getLiveMapViewport,
     ],
   );
 

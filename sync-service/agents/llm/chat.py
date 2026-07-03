@@ -6,7 +6,13 @@ import json
 from typing import Any
 
 from agents.audit import log_agent_step
-from agents.portal_context import portal_selected_territory, portal_viewport_bbox
+from agents.portal_context import (
+    portal_boundary_feeder_id,
+    portal_focus_mrid,
+    portal_selected_territory,
+    portal_spatial_bbox,
+    portal_viewport_bbox,
+)
 from agents.llm.react import run_tool_loop
 from agents.models import AgentChatRequest, AgentChatResponse
 from agents.voice_router import try_copilot_fast_path
@@ -15,12 +21,16 @@ from agents.voice_router import try_copilot_fast_path
 SYSTEM_PROMPT = """You are the GIOP GIS data quality steward copilot for Ghana ECG/NEDCo.
 You help stewards review field captures in **staging** before they are promoted to the national master GIS.
 
-You are **spatially aware**: portal context may include map viewport (bbox, center, zoom),
-selected_district, and selected_region. When the user says "here", "this area", or "this district",
-use viewport bbox or selected_district/selected_region from context — do not guess.
+You are **spatially aware**: portal context always includes a map viewport (bbox, center, zoom) —
+even before the user pans. When they say "here", "in view", or "on the map", use that viewport
+bbox directly; never ask them to pan or zoom first.
 
 Use tools to inspect staging queues, asset inventory counts (poles, transformers), territory bounds,
-DQ checks, and topology. For counts always call asset_inventory_counts or staging tools before answering.
+work orders in the current map view, DQ checks, topology, and overall health KPIs. For counts always
+call asset_inventory_counts or staging tools before answering. For open work orders on the map or
+in view call list_work_orders_in_view with the viewport bbox from context. For "how healthy is the
+data", DQ scores, or status overviews call kpi_snapshot.
+Never fabricate numbers — every count, percentage, or status must come from a tool result.
 
 When the user names a geographic place (district, region, town, or locality like Pokuase or Gbawe),
 call resolve_place first to get the canonical ECG district and bbox. If confidence is low or multiple
@@ -28,7 +38,25 @@ candidates are returned, ask the user to confirm before pan_map or counts.
 
 When the user asks to show, pan, zoom, highlight, or go to a place, call pan_map
 (fit_district, highlight_district, fit_bounds, or fly_to) and navigate to the map tab when helpful.
+For towns and localities (Pokuase, Dome, Gbawe) or when they say zoom into, prefer fly_to at zoom 16–17
+or fit_bounds with max_zoom 17 — do not frame the whole ECG district unless they named a district or region.
 Use highlight_district when they say highlight, show, or emphasize a territory on the map.
+
+When the user asks about a specific node/asset ("tell me about this node", "the node in view",
+"what am I looking at", "what connects to it") call inspect_node WITHOUT an mrid — it
+auto-resolves from the selected map asset or the node nearest the map center. Only pass mrid
+when the user gives an explicit UUID. Add show_on_map=true if they want to see it on the map.
+When inspect_node returns confirmation_needed=true, tell the user you've highlighted your best
+guess on the map (amber pin) and ask them to confirm — do not state details as certain until
+they agree or pick another node.
+
+When the user asks to trace/show/highlight the connection path, line, or link from a node
+(use trace_connection_path with show_on_map=true). Use the selected focus_mrid or the node
+they just inspected. Do NOT use trace_feeder for that — trace_feeder is for an entire feeder.
+
+When the user asks to show, highlight, or trace feeder nodes on the map, call trace_feeder with
+show_on_map=true. Use focus_mrid from portal context when they say "this feeder" and boundary_feeder_id
+is not explicit. Use feeder_id when they name a feeder code or locality (e.g. Mallam feeder → Mallam).
 
 Never claim to have promoted assets or moved the map unless tools confirm it.
 You cannot approve staging or publish to master — only recommend and navigate.
@@ -42,22 +70,47 @@ def _seed_context(conn, request: AgentChatRequest) -> list[dict[str, Any]]:
         parts.append(f"Portal UI context: {json.dumps(ctx, default=str)}")
         viewport = ctx.get("viewport")
         bbox = portal_viewport_bbox(ctx) if isinstance(viewport, dict) else None
+        if bbox is None:
+            bbox = portal_spatial_bbox(conn, ctx)
         if bbox:
             parts.append(
                 "When user says 'here' or 'this view', use asset_inventory_counts with "
                 f"west={bbox['west']}, south={bbox['south']}, "
+                f"east={bbox['east']}, north={bbox['north']}. "
+                "For work orders in view / on the map / here, call list_work_orders_in_view with "
+                f"the same west={bbox['west']}, south={bbox['south']}, "
                 f"east={bbox['east']}, north={bbox['north']}."
             )
         sel_d, sel_r = portal_selected_territory(ctx)
         if sel_d or sel_r:
             parts.append(
-                "When user says 'this area' or 'this district' and no viewport bbox applies, "
-                f"use asset_inventory_counts with district={sel_d!r}, region={sel_r!r}."
+                "When user says 'this area', 'here', or 'this district', "
+                f"use asset_inventory_counts with district={sel_d!r}, region={sel_r!r}. "
+                "Do not mention this territory unless the user asks about counts or staging here."
             )
-        elif ctx.get("selected_district"):
+        focus = portal_focus_mrid(ctx)
+        if focus:
             parts.append(
-                f"Selected map district: {ctx.get('selected_district')} "
-                f"(region: {ctx.get('selected_region') or 'unknown'})."
+                f"Selected asset MRID: {focus}. When the user says 'this node' or 'this asset', "
+                "call inspect_node() with no mrid — selection is used automatically."
+            )
+        else:
+            center = ctx.get("viewport", {}).get("center") if isinstance(ctx.get("viewport"), dict) else None
+            if center:
+                parts.append(
+                    "No asset selected. For 'node in view' / 'what am I looking at', call "
+                    "inspect_node() with no mrid — the nearest node to map center is resolved "
+                    "automatically."
+                )
+        feeder = portal_boundary_feeder_id(ctx)
+        if feeder:
+            parts.append(
+                f"Selected asset boundary feeder: {feeder!r} — use trace_feeder(show_on_map=true, "
+                f"feeder_id={feeder!r}) when user says 'this feeder'."
+            )
+        elif focus:
+            parts.append(
+                "When user says 'this feeder', call trace_feeder with focus_mrid from context."
             )
     if request.exception_id:
         from agents import tools
@@ -133,12 +186,20 @@ def run_steward_chat(
     )
     messages = _seed_context(conn, req)
 
+    portal_ctx = dict(req.context or {})
+    if req.mrid and not portal_ctx.get("focus_mrid"):
+        portal_ctx["focus_mrid"] = req.mrid
+    if session.get("last_mrid"):
+        portal_ctx.setdefault("last_mrid", session["last_mrid"])
+        portal_ctx.setdefault("focus_mrid", portal_ctx.get("focus_mrid") or session["last_mrid"])
+
     if use_tools:
         result = run_tool_loop(
             conn,
             messages,
             run_id=run_id,
             agent_name="StewardCopilot",
+            portal_context=portal_ctx,
         )
     else:
         from agents.llm.provider import complete_chat, llm_configured

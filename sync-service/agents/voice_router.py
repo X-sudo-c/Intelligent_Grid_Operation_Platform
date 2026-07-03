@@ -6,7 +6,15 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from agents.portal_context import portal_count_scope, portal_selected_territory, portal_viewport_bbox
+from agents.portal_context import (
+    portal_boundary_feeder_id,
+    portal_count_scope,
+    portal_focus_mrid,
+    portal_selected_territory,
+    portal_spatial_bbox,
+    portal_viewport_bbox,
+    portal_viewport_center,
+)
 from redis_cache import get_json, set_json
 
 _COUNT_CACHE_TTL_SEC = int(__import__("os").getenv("VOICE_COUNT_CACHE_TTL_SEC", "900"))
@@ -48,13 +56,19 @@ _ASSET_ALIASES: dict[str, str] = {
 
 @dataclass
 class VoiceIntent:
-    kind: str  # count | highlight | pan
+    kind: str  # count | highlight | pan | zoom_map | trace_feeder | trace_connection_path | work_orders_in_view | inspect_node | pan_work_order
     asset_kind: str | None = None
     tier: str = "master"
     district: str | None = None
     region: str | None = None
+    feeder_id: str | None = None
     use_viewport: bool = False
+    """User said here / this view / visible area — may use map bbox or selected territory."""
+    viewport_explicit: bool = False
     territory_bbox: dict[str, float] | None = None
+    resolved_place: dict[str, Any] | None = None
+    zoom_close: bool = False
+    zoom_delta: float = 0.0
 
 
 def _clean_place(raw: str | None) -> str | None:
@@ -109,9 +123,79 @@ def _extract_count_place(place_raw: str | None) -> str | None:
     return place
 
 
+def _zoom_step_from_phrase(phrase: str | None) -> float:
+    text = (phrase or "").strip().lower()
+    if not text:
+        return 1.5
+    if "way" in text:
+        return 3.0
+    if re.search(r"a\s+(?:bit|little)\s+more", text) or "further" in text:
+        return 2.4
+    if "a bit" in text or "little" in text or "slight" in text:
+        return 0.8
+    if "more" in text:
+        return 2.4
+    return 1.5
+
+
+_ZOOM_INTENSITY = (
+    r"(?:\s+(?P<intensity>a\s+bit(?:\s+more)?|a\s+little(?:\s+more)?|little|slightly|more|further|way))?"
+)
+_ZOOM_MAP_SUFFIX = r"(?:\s+(?:on|at)\s+(?:the\s+)?map)?[\?.!]*"
+
+
+def _normalize_zoom_command_text(lower: str) -> str:
+    text = lower.strip()
+    text = re.sub(
+        r"^(?:please\s+|(?:(?:can|could|would)\s+you\s+(?:please\s+)?)+)+",
+        "",
+        text,
+        flags=re.I,
+    ).strip()
+    text = re.sub(r"\s+please[\?.!]*$", "", text, flags=re.I).strip()
+    return text
+
+
+def _parse_zoom_relative_intent(lower: str) -> VoiceIntent | None:
+    """Relative zoom on the current viewport (zoom in/out), not zoom-to-place."""
+    text = _normalize_zoom_command_text(lower)
+
+    zoom_relative = re.fullmatch(
+        r"zoom\s+"
+        r"(?:(?:the|this)\s+map\s+)?"
+        r"(?P<dir>in|out)"
+        f"{_ZOOM_INTENSITY}"
+        f"{_ZOOM_MAP_SUFFIX}",
+        text,
+        flags=re.I,
+    )
+    if not zoom_relative:
+        zoom_relative = re.search(
+            r"\bzoom\s+"
+            r"(?:(?:the|this)\s+map\s+)?"
+            r"(?P<dir>in|out)\b"
+            f"{_ZOOM_INTENSITY}"
+            f"{_ZOOM_MAP_SUFFIX}",
+            text,
+            flags=re.I,
+        )
+    if not zoom_relative:
+        return None
+
+    direction = (zoom_relative.group("dir") or "").lower()
+    intensity = zoom_relative.group("intensity")
+    step = _zoom_step_from_phrase(intensity)
+    return VoiceIntent(
+        kind="zoom_map",
+        use_viewport=True,
+        viewport_explicit=True,
+        zoom_delta=step if direction == "in" else -step,
+    )
+
+
 def _count_intent_from_text(lower: str) -> VoiceIntent | None:
     """Parse 'how many … in/at …' including 'staging elements are in X'."""
-    count = re.search(
+    count = re.match(
         r"(?:how many|count|number of)\s+"
         r"(?:"
         r"(?P<asset>poles?|transformers?|nodes?|captures?|staging(?:\s+(?:elements?|assets?))?)"
@@ -142,10 +226,12 @@ def _count_intent_from_text(lower: str) -> VoiceIntent | None:
     elif tier == "staging":
         asset_kind = None
 
-    use_viewport = _is_viewport_scope(lower)
+    viewport_explicit = _is_viewport_scope(lower)
+    use_viewport = viewport_explicit
     place_raw = _extract_count_place(count.group("place"))
     if place_raw and _is_viewport_scope(place_raw):
         use_viewport = True
+        viewport_explicit = True
         place_raw = None
     if use_viewport or not place_raw:
         return VoiceIntent(
@@ -153,6 +239,7 @@ def _count_intent_from_text(lower: str) -> VoiceIntent | None:
             asset_kind=asset_kind,
             tier=tier,
             use_viewport=True,
+            viewport_explicit=viewport_explicit,
         )
     district, region = _place_slots(place_raw)
     return VoiceIntent(
@@ -161,6 +248,212 @@ def _count_intent_from_text(lower: str) -> VoiceIntent | None:
         tier=tier,
         district=district,
         region=region,
+    )
+
+
+def _clean_feeder_query(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    q = raw.strip().strip("?.!,")
+    q = re.sub(r"^(?:the|feeder|boundary feeder)\s+", "", q, flags=re.I).strip()
+    q = re.sub(r"\s+(?:feeder|boundary feeder)$", "", q, flags=re.I).strip()
+    return q or None
+
+
+def _parse_trace_connection_path_intent(lower: str) -> VoiceIntent | None:
+    if not re.search(r"\b(?:trace|show|highlight|display|draw)\b", lower):
+        return None
+    if re.search(r"\bfeeder\b", lower):
+        return None
+    if not re.search(r"\b(?:connection|connections|path|line|link)\b", lower):
+        return None
+    return VoiceIntent(kind="trace_connection_path")
+
+
+def _parse_trace_feeder_intent(raw: str, lower: str) -> VoiceIntent | None:
+    explicit = re.search(
+        r"(?:show|highlight|trace|display|tell me about|what(?:'s| is)|see)"
+        r"(?:\s+me)?(?:\s+(?:the\s+)?(?:nodes|assets|network|connections?|connectivity))?"
+        r"(?:\s+(?:on|of|for))?"
+        r"(?:\s+(?:the\s+)?(?:feeder|boundary feeder))?\s+"
+        r"(?P<feeder>FEEDER[\w-]+)",
+        raw,
+        flags=re.I,
+    )
+    if explicit:
+        feeder = explicit.group("feeder").strip()
+        if feeder:
+            return VoiceIntent(kind="trace_feeder", feeder_id=feeder)
+
+    named = re.search(
+        r"(?:"
+        r"(?:show|highlight|trace|display|tell me about|what(?:'s| is)|see|pan to)"
+        r"|(?:connections?|connectivity|network|nodes?|assets?)"
+        r")"
+        r"(?:\s+(?:me|the|about))?"
+        r"(?:\s+(?:connections?|connectivity|network|nodes?|assets?))?"
+        r"(?:\s+(?:on|of|for|to))?"
+        r"(?:\s+the)?\s+"
+        r"(?P<name>[\w][\w\s-]*?)\s+feeder\b",
+        lower,
+        flags=re.I,
+    )
+    if named:
+        feeder = _clean_feeder_query(named.group("name"))
+        if feeder and feeder.lower() not in {"this", "selected", "current", "the"}:
+            return VoiceIntent(kind="trace_feeder", feeder_id=feeder)
+
+    legacy = re.search(
+        r"(?:show|highlight|trace|display)(?:\s+me)?(?:\s+(?:the\s+)?(?:nodes|assets|network))?"
+        r"(?:\s+on)?(?:\s+(?:feeder|boundary feeder))\s+(?P<feeder>[\w-]+)",
+        raw,
+        flags=re.I,
+    )
+    if legacy:
+        feeder = _clean_feeder_query(legacy.group("feeder"))
+        if feeder:
+            return VoiceIntent(kind="trace_feeder", feeder_id=feeder)
+
+    this_feeder = re.search(
+        r"(?:show|highlight|trace|display)(?:\s+me)?(?:\s+(?:the\s+)?(?:nodes|assets|network|connections?))?"
+        r"(?:\s+on)?(?:\s+(?:this|the|selected))?\s+feeder",
+        lower,
+        flags=re.I,
+    )
+    if this_feeder:
+        return VoiceIntent(kind="trace_feeder")
+
+    return None
+
+
+def _extract_work_orders_place(lower: str) -> str | None:
+    """Named territory for work-order queries, e.g. 'work orders in Accra'."""
+    patterns = (
+        r"\bwork\s*orders?\s+(?:are\s+)?(?:in|at|for|around|near)\s+(?P<place>.+?)[\?.!]*$",
+        r"\b(?:open|active|current)\s+work\s*orders?\s+(?:in|at|for)\s+(?P<place>.+?)[\?.!]*$",
+        r"\b(?:tell me about|what|which|list|show|any|are there).+?"
+        r"work\s*orders?.+?\b(?:in|at|for)\s+(?P<place>.+?)[\?.!]*$",
+    )
+    for pat in patterns:
+        match = re.search(pat, lower, flags=re.I)
+        if not match:
+            continue
+        place = _clean_place(match.group("place"))
+        if not place:
+            continue
+        if place.lower() in {"view", "screen", "map"} or _is_viewport_scope(
+            place
+        ) or _is_viewport_scope(f"in {place}"):
+            continue
+        return place
+    return None
+
+
+def _parse_work_orders_in_view_intent(lower: str) -> VoiceIntent | None:
+    if not re.search(r"\bwork\s*orders?\b", lower):
+        return None
+
+    place = _extract_work_orders_place(lower)
+    if place:
+        district, region = _place_slots(place)
+        return VoiceIntent(
+            kind="work_orders_in_view",
+            district=district,
+            region=region,
+        )
+
+    viewport_explicit = _is_viewport_scope(lower)
+    on_map = bool(re.search(r"\b(?:on the map|map view|visible area|on screen)\b", lower))
+    asks_list = bool(
+        re.search(
+            r"(?:what|which|list|show|tell me|any|are there)"
+            r"(?:\s+(?:are|about|the))?\s+(?:the\s+)?"
+            r"(?:open\s+|active\s+|current\s+)?work\s*orders?",
+            lower,
+        )
+        or re.search(r"work\s*orders?\s+(?:in|on)\s+(?:view|the\s+map|screen)", lower)
+        or re.search(r"(?:open|active|current)\s+work\s*orders?", lower)
+    )
+    if not asks_list:
+        return None
+    if not viewport_explicit and not on_map and not re.search(r"\b(?:current|here|this)\b", lower):
+        return None
+    return VoiceIntent(
+        kind="work_orders_in_view",
+        use_viewport=True,
+        viewport_explicit=viewport_explicit or on_map,
+    )
+
+
+def _parse_pan_work_order_intent(lower: str) -> VoiceIntent | None:
+    if not re.search(r"\bwork\s*orders?\b", lower):
+        return None
+    if not re.search(r"\b(?:pan|go|fly|zoom|show|take me|open|navigate)\b", lower):
+        return None
+    if _extract_work_orders_place(lower):
+        return None
+    targets_work_order = bool(
+        re.search(
+            r"\b(?:pan|go|fly|zoom|show|take me|open)\s+(?:to|into)?\s+"
+            r"(?:the\s+)?(?:work\s*order|work\s*order\s+(?:node|nodes|pin|pins|location|site))",
+            lower,
+        )
+        or re.search(
+            r"\bwork\s*order\s+(?:node|nodes|pin|pins|location|site)s?\b.*"
+            r"\b(?:on the map|in view|here|on screen)\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:pan|show|go|fly|zoom)\b.*\bwork\s*order\s+(?:node|nodes|pin|pins)\b",
+            lower,
+        )
+    )
+    if not targets_work_order:
+        return None
+    viewport_explicit = _is_viewport_scope(lower) or bool(
+        re.search(r"\b(?:on the map|in view|here|on screen|the map)\b", lower)
+    )
+    return VoiceIntent(
+        kind="pan_work_order",
+        use_viewport=True,
+        viewport_explicit=viewport_explicit,
+    )
+
+
+def _parse_inspect_node_intent(lower: str) -> VoiceIntent | None:
+    node_words = r"\b(?:node|asset|pole|transformer|substation|bsp)\b"
+    if not re.search(node_words, lower) and "looking at" not in lower:
+        return None
+
+    viewport_explicit = _is_viewport_scope(lower)
+    on_map = bool(re.search(r"\b(?:in view|on screen|on the map|visible|here|this|selected)\b", lower))
+
+    asks_about = bool(
+        re.search(
+            r"(?:tell me about|what is|what's|describe|info on|information about|"
+            r"what am i looking at|what do i see|details on|about the)",
+            lower,
+        )
+        or re.search(rf"(?:this|the|selected)\s+{node_words}", lower)
+        or re.search(rf"{node_words}\s+(?:in view|on screen|here|selected|in the view)", lower)
+        or re.search(r"what connects to (?:it|this|the node)", lower)
+    )
+    if not asks_about:
+        return None
+    if re.search(r"what am i looking at|what do i see", lower):
+        return VoiceIntent(
+            kind="inspect_node",
+            use_viewport=True,
+            viewport_explicit=True,
+        )
+    if not viewport_explicit and not on_map and not re.search(r"\b(?:this|selected|it)\b", lower):
+        if not re.search(rf"what(?:'s| is) (?:this|the) {node_words}", lower):
+            return None
+
+    return VoiceIntent(
+        kind="inspect_node",
+        use_viewport=True,
+        viewport_explicit=viewport_explicit or on_map,
     )
 
 
@@ -177,10 +470,14 @@ def parse_intent(
 
     # Follow-up: "and in Kumasi?", "what about Ashanti region?"
     follow = re.match(
-        r"^(?:and\s+)?(?:what about|how about)\s+(?P<place>.+?)[\?.!]*$",
+        r"^(?:what about|how about)\s+(?P<place>.+?)[\?.!]*$",
         lower,
         flags=re.I,
-    ) or re.match(r"^(?:and\s+)?(?:in|at|for)\s+(?P<place>.+?)[\?.!]*$", lower, flags=re.I)
+    ) or re.match(
+        r"^and\s+(?:in|at|for)\s+(?P<place>.+?)[\?.!]*$",
+        lower,
+        flags=re.I,
+    )
     if follow and session.get("last_kind"):
         place = _clean_place(follow.group("place"))
         district, region = _place_slots(place)
@@ -196,35 +493,81 @@ def parse_intent(
     if count_intent:
         return count_intent
 
+    work_orders_intent = _parse_work_orders_in_view_intent(lower)
+    if work_orders_intent:
+        return work_orders_intent
+
+    pan_work_order_intent = _parse_pan_work_order_intent(lower)
+    if pan_work_order_intent:
+        return pan_work_order_intent
+
+    inspect_node_intent = _parse_inspect_node_intent(lower)
+    if inspect_node_intent:
+        return inspect_node_intent
+
+    trace_connection_intent = _parse_trace_connection_path_intent(lower)
+    if trace_connection_intent:
+        return trace_connection_intent
+
+    trace_feeder_intent = _parse_trace_feeder_intent(raw, lower)
+    if trace_feeder_intent:
+        return trace_feeder_intent
+
+    zoom_relative_intent = _parse_zoom_relative_intent(lower)
+    if zoom_relative_intent:
+        return zoom_relative_intent
+
     pan_map = re.search(
-        r"(?:pan|go to|zoom to|fly to|open|show)(?:\s+me)?\s+(?:the\s+)?map\s+to\s+(?P<place>.+?)[\?.!]*$",
+        r"(?:pan|go to|take me to|zoom to|fly to|open|show)(?:\s+me)?\s+(?:the\s+)?map\s+to\s+(?P<place>.+?)[\?.!]*$",
         lower,
         flags=re.I,
     )
     if pan_map and "how many" not in lower:
         place = _clean_place(pan_map.group("place"))
         district, region = _place_slots(place)
-        return VoiceIntent(kind="pan", district=district, region=region)
+        return VoiceIntent(
+            kind="pan",
+            district=district,
+            region=region,
+            zoom_close="zoom" in lower,
+        )
+
+    zoom_into = re.search(r"zoom\s+into\s+(?P<place>.+?)[\?.!]*$", lower, flags=re.I)
+    if zoom_into:
+        place = _clean_place(zoom_into.group("place"))
+        district, region = _place_slots(place)
+        return VoiceIntent(kind="pan", district=district, region=region, zoom_close=True)
 
     highlight = re.search(
         r"(?:highlight|show|emphasize|display)(?:\s+me)?\s+(?P<place>.+?)(?:\s+on\s+the\s+map)?[\?.!]*$",
         lower,
         flags=re.I,
     )
-    if highlight:
+    if highlight and not re.search(r"\bwork\s*orders?\b", lower) and _parse_trace_feeder_intent(raw, lower) is None:
         place = _clean_place(highlight.group("place"))
         district, region = _place_slots(place)
         return VoiceIntent(kind="highlight", district=district, region=region)
 
     pan = re.search(
-        r"(?:pan|go to|zoom to|fly to)(?:\s+to)?\s+(?:me\s+)?(?P<place>.+?)[\?.!]*$",
+        r"(?:pan|go to|take me to|zoom(?:\s+to|\s+into)?|fly to)(?:\s+to|\s+into)?\s+(?:me\s+)?(?P<place>.+?)[\?.!]*$",
         lower,
         flags=re.I,
     )
-    if pan and "how many" not in lower:
+    if (
+        pan
+        and "how many" not in lower
+        and _parse_zoom_relative_intent(lower) is None
+        and _parse_pan_work_order_intent(lower) is None
+        and not re.search(r"\bwork\s*orders?\b", lower)
+    ):
         place = _clean_place(pan.group("place"))
         district, region = _place_slots(place)
-        return VoiceIntent(kind="pan", district=district, region=region)
+        return VoiceIntent(
+            kind="pan",
+            district=district,
+            region=region,
+            zoom_close="zoom" in lower,
+        )
 
     return None
 
@@ -296,6 +639,119 @@ def _format_count_speech(result: dict[str, Any], intent: VoiceIntent, place_labe
     else:
         noun = "asset" if total == 1 else "assets"
     return f"About {total:,} {noun} in {place_label}."
+
+
+def _format_work_orders_speech(result: dict[str, Any], *, place_label: str | None = None) -> str:
+    orders = result.get("work_orders") or []
+    count = int(result.get("count") or len(orders))
+    scope = place_label or "the current map view"
+    if count == 0:
+        return f"There are no open work orders in {scope}."
+    if count == 1:
+        wo = orders[0]
+        ref = wo.get("reference") or wo.get("id") or "work order"
+        summary = (wo.get("summary") or "").strip()
+        status = wo.get("status") or ""
+        detail = f"{ref} ({status})"
+        if summary:
+            detail += f" — {summary}"
+        return f"There is 1 open work order in {scope}: {detail}."
+    previews: list[str] = []
+    for wo in orders[:5]:
+        ref = wo.get("reference") or wo.get("id") or "work order"
+        status = wo.get("status") or ""
+        previews.append(f"{ref} ({status})")
+    joined = ", ".join(previews)
+    if count > 5:
+        return f"There are {count} open work orders in {scope}, including {joined}, and others."
+    return f"There are {count} open work orders in {scope}: {joined}."
+
+
+def _work_orders_scope_label(intent: VoiceIntent) -> str | None:
+    if intent.use_viewport and not intent.district and not intent.region:
+        return None
+    raw = (
+        (intent.resolved_place or {}).get("matched_as")
+        or intent.region
+        or intent.district
+    )
+    if not raw:
+        return None
+    label = str(raw)
+    return label.title() if label.islower() else label
+
+
+def _work_orders_query_bbox(
+    conn,
+    intent: VoiceIntent,
+    context: dict[str, Any],
+) -> dict[str, float]:
+    if intent.territory_bbox:
+        return intent.territory_bbox
+    if intent.district or intent.region:
+        from agents import spatial
+
+        return spatial.resolve_territory(
+            conn,
+            district=intent.district,
+            region=intent.region,
+        )["bbox"]
+    return portal_spatial_bbox(conn, context)
+
+
+def _pick_work_order_nearest(
+    orders: list[dict[str, Any]],
+    center: dict[str, float] | None,
+) -> dict[str, Any] | None:
+    located = [
+        wo
+        for wo in orders
+        if wo.get("longitude") is not None and wo.get("latitude") is not None
+    ]
+    if not located:
+        return None
+    if not center:
+        return located[0]
+    best = located[0]
+    best_dist = float("inf")
+    for wo in located:
+        lon = float(wo["longitude"])
+        lat = float(wo["latitude"])
+        dist = (lon - center["lon"]) ** 2 + (lat - center["lat"]) ** 2
+        if dist < best_dist:
+            best = wo
+            best_dist = dist
+    return best
+
+
+def _format_inspect_node_speech(result: dict[str, Any]) -> str:
+    if result.get("error"):
+        return str(result["error"])
+    name = result.get("name") or "This node"
+    validation = result.get("validation") or "unknown status"
+    feeder = result.get("boundary_feeder_id")
+    district = result.get("district")
+    region = result.get("region")
+    degree = int(result.get("degree") or 0)
+    where = district or region
+    parts = [f"{name} is {validation.replace('_', ' ').lower()}"]
+    if feeder:
+        parts.append(f"on feeder {feeder}")
+    if where:
+        parts.append(f"in {where}")
+    conn = "connection" if degree == 1 else "connections"
+    parts.append(f"with {degree} {conn}")
+    if result.get("connections"):
+        neighbor = result["connections"][0].get("neighbor_name")
+        if neighbor and degree == 1:
+            parts.append(f"linked to {neighbor}")
+    body = ". ".join(parts) + "."
+    if result.get("confirmation_needed"):
+        return (
+            f"I think you mean {name}. I've highlighted it on the map so you can check. "
+            f"{body} Is this the node you mean?"
+        )
+    return body
 
 
 def _viewport_bbox(context: dict[str, Any]) -> dict[str, float] | None:
@@ -392,7 +848,10 @@ def _apply_resolved_place(
         district=resolved_district,
         region=resolved_region,
         use_viewport=intent.use_viewport,
+        viewport_explicit=intent.viewport_explicit,
         territory_bbox=territory_bbox,
+        resolved_place=meta,
+        zoom_close=intent.zoom_close,
     ), None
 
 
@@ -404,9 +863,10 @@ def execute_fast_path(
 ) -> dict[str, Any] | None:
     from agents.llm.react import _execute_tool
 
-    intent, clarify = _apply_resolved_place(conn, intent)
-    if clarify:
-        return clarify
+    if intent.resolved_place is None:
+        intent, clarify = _apply_resolved_place(conn, intent)
+        if clarify:
+            return clarify
 
     ui_actions: list[dict[str, Any]] = []
     session_patch: dict[str, Any] = {
@@ -424,23 +884,10 @@ def execute_fast_path(
             district=intent.district,
             region=intent.region,
             context=context,
+            allow_selected_territory=intent.viewport_explicit,
         )
         if intent.use_viewport and not bbox and not count_district and not count_region:
-            tab = str(context.get("active_tab") or "").lower()
-            if tab in ("map", "combined", "operations"):
-                speak = (
-                    "I don't have the current map bounds yet — pan or zoom the map once, "
-                    "then ask again."
-                )
-            else:
-                speak = "Open the map tab and pan to an area, then ask how many are here."
-            return {
-                "content": speak,
-                "speak": speak,
-                "ui_actions": [],
-                "session_patch": session_patch,
-                "fast_path": True,
-            }
+            bbox = portal_spatial_bbox(conn, context)
         if not intent.use_viewport and not count_district and not count_region and not bbox:
             return None
 
@@ -471,11 +918,262 @@ def execute_fast_path(
             "data": result,
         }
 
+    if intent.kind == "work_orders_in_view":
+        bbox = _work_orders_query_bbox(conn, intent, context)
+        from agents import tools
+
+        result = tools.tool_list_work_orders_in_view(
+            conn,
+            west=bbox["west"],
+            south=bbox["south"],
+            east=bbox["east"],
+            north=bbox["north"],
+            open_only=True,
+        )
+        speak = _format_work_orders_speech(
+            result,
+            place_label=_work_orders_scope_label(intent),
+        )
+        return {
+            "content": speak,
+            "speak": speak,
+            "ui_actions": ui_actions,
+            "session_patch": {**session_patch, "last_kind": intent.kind},
+            "fast_path": True,
+            "data": result,
+        }
+
+    if intent.kind == "pan_work_order":
+        bbox = portal_spatial_bbox(conn, context)
+        from agents import tools
+
+        result = tools.tool_list_work_orders_in_view(
+            conn,
+            west=bbox["west"],
+            south=bbox["south"],
+            east=bbox["east"],
+            north=bbox["north"],
+            open_only=True,
+        )
+        wo = _pick_work_order_nearest(
+            result.get("work_orders") or [],
+            portal_viewport_center(context),
+        )
+        if not wo:
+            speak = "There are no work orders with map locations in the current view."
+            return {
+                "content": speak,
+                "speak": speak,
+                "ui_actions": [],
+                "session_patch": {**session_patch, "last_kind": intent.kind},
+                "fast_path": True,
+                "data": result,
+            }
+        lon = float(wo["longitude"])
+        lat = float(wo["latitude"])
+        ui_actions.append(
+            {
+                "type": "fly_to",
+                "tab": "map",
+                "center": {"lon": lon, "lat": lat},
+                "zoom": 17,
+            }
+        )
+        ref = wo.get("reference") or wo.get("id") or "work order"
+        summary = (wo.get("summary") or "").strip()
+        speak = f"Showing work order {ref} on the map."
+        if summary:
+            speak += f" {summary}."
+        return {
+            "content": speak,
+            "speak": speak,
+            "ui_actions": ui_actions,
+            "session_patch": {**session_patch, "last_kind": intent.kind},
+            "fast_path": True,
+            "data": {"work_order": wo, **result},
+        }
+
+    if intent.kind == "inspect_node":
+        from agents import tools
+
+        result = tools.tool_inspect_node(
+            conn,
+            context=dict(context),
+            show_on_map=True,
+        )
+        speak = _format_inspect_node_speech(result)
+        ui = result.get("ui_action")
+        if ui:
+            ui_actions.append(ui)
+        return {
+            "content": speak,
+            "speak": speak,
+            "ui_actions": ui_actions,
+            "session_patch": {
+                **session_patch,
+                "last_kind": intent.kind,
+                "last_mrid": result.get("mrid"),
+            },
+            "fast_path": True,
+            "data": result,
+        }
+
+    if intent.kind == "trace_connection_path":
+        from agents import graph_tools
+
+        exec_ctx = dict(context)
+
+        result = graph_tools.trace_connection_path(
+            conn,
+            context=exec_ctx,
+            show_on_map=True,
+        )
+        if result.get("error") and not result.get("ui_action"):
+            speak = str(result["error"])
+            return {
+                "content": speak,
+                "speak": speak,
+                "ui_actions": [],
+                "session_patch": session_patch,
+                "fast_path": True,
+                "data": result,
+            }
+
+        ui = result.get("ui_action")
+        if ui:
+            ui_actions.append(ui)
+        name = result.get("name") or "this node"
+        neighbors = result.get("neighbor_names") or []
+        edge_count = int(result.get("connection_count") or 0)
+        if neighbors:
+            joined = ", ".join(neighbors[:3])
+            if len(neighbors) > 3:
+                joined += ", and others"
+            speak = (
+                f"Showing {edge_count} connection line{'s' if edge_count != 1 else ''} "
+                f"from {name} to {joined} on the map."
+            )
+        else:
+            speak = f"Showing connections at {name} on the map."
+        return {
+            "content": speak,
+            "speak": speak,
+            "ui_actions": ui_actions,
+            "session_patch": {**session_patch, "last_kind": intent.kind, "last_mrid": result.get("mrid")},
+            "fast_path": True,
+            "data": result,
+        }
+
+    if intent.kind == "zoom_map":
+        viewport = context.get("viewport") if isinstance(context.get("viewport"), dict) else {}
+        center = viewport.get("center") if isinstance(viewport, dict) else None
+        bbox = viewport.get("bbox") if isinstance(viewport, dict) else None
+        zoom_raw = viewport.get("zoom") if isinstance(viewport, dict) else None
+        try:
+            current_zoom = float(zoom_raw) if zoom_raw is not None else 13.0
+        except (TypeError, ValueError):
+            current_zoom = 13.0
+
+        lon = lat = None
+        if isinstance(center, dict):
+            lon = center.get("lon")
+            lat = center.get("lat")
+        if (lon is None or lat is None) and isinstance(bbox, dict):
+            if all(bbox.get(k) is not None for k in ("west", "south", "east", "north")):
+                lon = (float(bbox["west"]) + float(bbox["east"])) / 2.0
+                lat = (float(bbox["south"]) + float(bbox["north"])) / 2.0
+        if lon is None or lat is None:
+            return None
+
+        next_zoom = max(3.0, min(20.0, current_zoom + float(intent.zoom_delta or 0.0)))
+        ui_actions.append(
+            {
+                "type": "fly_to",
+                "tab": "map",
+                "center": {"lon": float(lon), "lat": float(lat)},
+                "zoom": round(next_zoom, 1),
+            }
+        )
+        direction = "in" if intent.zoom_delta >= 0 else "out"
+        strength = abs(float(intent.zoom_delta or 0.0))
+        if strength < 1.0:
+            speak = f"Zooming {direction} a bit on the current map view."
+        elif strength > 2.0:
+            speak = f"Zooming {direction} more on the current map view."
+        else:
+            speak = f"Zooming {direction} on the current map view."
+        return {
+            "content": speak,
+            "speak": speak,
+            "ui_actions": ui_actions,
+            "session_patch": {**session_patch, "last_kind": "pan"},
+            "fast_path": True,
+        }
+
     if intent.kind in ("highlight", "pan"):
         if not intent.district and not intent.region and not intent.territory_bbox:
             return None
+
+        from agents.place_resolve import place_viewport_ui_action
+
         action = "highlight_district" if intent.kind == "highlight" else "fit_district"
         tool_result: dict[str, Any] | None = None
+
+        # Localities (OSM) and explicit zoom — fly in close, not whole district.
+        if intent.resolved_place:
+            mode = "zoom" if intent.zoom_close else intent.kind
+            local_ui = place_viewport_ui_action(
+                intent.resolved_place,
+                mode="zoom" if intent.zoom_close else mode,
+                tab="map",
+            )
+            if local_ui and (
+                intent.kind == "pan"
+                or intent.zoom_close
+                or intent.resolved_place.get("source")
+                in ("osm", "alias_exact", "alias", "alias_fuzzy", "point_in_polygon")
+            ):
+                if intent.kind == "highlight" and intent.district:
+                    try:
+                        tool_result = _execute_tool(
+                            conn,
+                            "pan_map",
+                            {
+                                "action": "highlight_district",
+                                "district": intent.district,
+                                "region": intent.region,
+                                "tab": "map",
+                            },
+                        )
+                    except ValueError:
+                        tool_result = None
+                ui_actions.append(local_ui)
+                if tool_result and tool_result.get("ui_action"):
+                    ui_actions.insert(0, tool_result["ui_action"])
+                raw_label = (
+                    intent.resolved_place.get("matched_as")
+                    or intent.district
+                    or intent.region
+                    or "that area"
+                )
+                place_label = str(raw_label).title() if str(raw_label).islower() else str(raw_label)
+                session_patch["last_district"] = intent.district
+                session_patch["last_region"] = intent.region
+                if intent.zoom_close:
+                    speak = f"Zooming into {place_label} on the map."
+                elif intent.kind == "highlight":
+                    speak = f"Highlighting {place_label} on the map."
+                else:
+                    speak = f"Showing {place_label} on the map."
+                return {
+                    "content": speak,
+                    "speak": speak,
+                    "ui_actions": ui_actions,
+                    "session_patch": session_patch,
+                    "fast_path": True,
+                    "data": intent.resolved_place,
+                }
+
         if intent.district or intent.region:
             try:
                 tool_result = _execute_tool(
@@ -540,6 +1238,113 @@ def execute_fast_path(
             "data": terr,
         }
 
+    if intent.kind == "trace_feeder":
+        from agents import graph_tools
+
+        feeder_query = (intent.feeder_id or "").strip() or None
+        feeder_id = portal_boundary_feeder_id(context) if not feeder_query else None
+        focus_mrid = None
+
+        if feeder_query and not feeder_id:
+            resolved = graph_tools.resolve_feeder_query(conn, feeder_query)
+            if resolved.get("feeder_id"):
+                feeder_id = str(resolved["feeder_id"])
+            elif resolved.get("candidates"):
+                labels = [
+                    str(c.get("feeder_id"))
+                    for c in resolved["candidates"][:4]
+                    if c.get("feeder_id")
+                ]
+                options = ", ".join(labels) if labels else "a feeder id like FEEDER-ECG-MALLAM-04"
+                speak = (
+                    f"I'm not sure which feeder you mean for {feeder_query!r}. "
+                    f"Did you mean {options}?"
+                )
+                return {
+                    "content": speak,
+                    "speak": speak,
+                    "ui_actions": [],
+                    "session_patch": session_patch,
+                    "fast_path": True,
+                    "data": resolved,
+                }
+            elif resolved.get("error"):
+                speak = str(resolved["error"])
+                return {
+                    "content": speak,
+                    "speak": speak,
+                    "ui_actions": [],
+                    "session_patch": session_patch,
+                    "fast_path": True,
+                    "data": resolved,
+                }
+            elif re.match(r"FEEDER[\w-]*", feeder_query, flags=re.I):
+                feeder_id = feeder_query
+            else:
+                speak = f"I couldn't find a feeder matching {feeder_query!r}."
+                return {
+                    "content": speak,
+                    "speak": speak,
+                    "ui_actions": [],
+                    "session_patch": session_patch,
+                    "fast_path": True,
+                    "data": resolved,
+                }
+
+        if not feeder_id:
+            focus_mrid = portal_focus_mrid(context)
+
+        if not feeder_id and not focus_mrid:
+            speak = (
+                "Select an asset on the map first, or name a feeder — "
+                "for example show connections on the Mallam feeder."
+            )
+            return {
+                "content": speak,
+                "speak": speak,
+                "ui_actions": [],
+                "session_patch": session_patch,
+                "fast_path": True,
+            }
+
+        result = graph_tools.trace_feeder(
+            feeder_id,
+            conn=conn,
+            focus_mrid=focus_mrid,
+            show_on_map=True,
+        )
+        if result.get("error") and not result.get("ui_action"):
+            speak = str(result["error"])
+            return {
+                "content": speak,
+                "speak": speak,
+                "ui_actions": [],
+                "session_patch": session_patch,
+                "fast_path": True,
+            }
+
+        ui = result.get("ui_action")
+        if ui:
+            ui_actions.append(ui)
+        resolved = result.get("feeder_id") or feeder_id or "feeder"
+        count = int(result.get("reachable_nodes") or 0)
+        edge_count = int(result.get("map_edge_count") or 0)
+        speak = (
+            f"Showing {count:,} nodes and {edge_count:,} line connections "
+            f"on feeder {resolved} on the map."
+        )
+        if result.get("truncated"):
+            speak += " Trace was truncated for performance."
+        session_patch["last_feeder_id"] = resolved
+        return {
+            "content": speak,
+            "speak": speak,
+            "ui_actions": ui_actions,
+            "session_patch": session_patch,
+            "fast_path": True,
+            "data": result,
+        }
+
     return None
 
 
@@ -560,8 +1365,21 @@ def try_copilot_fast_path(
     message = text
     if normalize:
         message, _ = normalize_transcript(text)
+    # Speaker echo — assistant TTS picked up as user speech.
+    if re.match(
+        r"^about\s+[\d,]+\s+staging\s+captures?\s+in\s+",
+        message.strip(),
+        flags=re.I,
+    ):
+        return None, None
     intent = parse_intent(message, session=session or {}, context=context)
     if not intent:
         return None, None
-    fast = execute_fast_path(conn, intent, context=context)
+    exec_ctx = dict(context)
+    if session:
+        if session.get("last_mrid"):
+            exec_ctx.setdefault("last_mrid", session["last_mrid"])
+        if session.get("last_feeder_id"):
+            exec_ctx.setdefault("last_feeder_id", session["last_feeder_id"])
+    fast = execute_fast_path(conn, intent, context=exec_ctx)
     return intent, fast

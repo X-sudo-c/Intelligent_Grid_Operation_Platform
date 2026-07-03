@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Clear all staging field captures (fresh trial queue).
 #
+# TRUNCATE staging.identified_objects CASCADE also drops staging.data_quality_exceptions
+# (FK ON DELETE CASCADE). Busts Redis caches so the portal map + DQ nav badge update immediately.
+#
 # Usage:
 #   TRIAL_CONFIRM=1 ./scripts/trial/clear_staging.sh
 
@@ -13,10 +16,13 @@ trial_load_env
 trial_require_psql
 trial_db_ping
 
-trial_confirm "This will TRUNCATE all staging.identified_objects (field trial data)."
+trial_confirm \
+  "This will TRUNCATE all staging.identified_objects (field trial data + staging DQ exceptions) and invalidate portal Redis caches."
 
 psql "${SUPABASE_DB_URI}" -v ON_ERROR_STOP=1 -c \
   "TRUNCATE staging.identified_objects CASCADE;"
 
-echo "Staging cleared."
+echo "Staging cleared (field captures and staging DQ exceptions)."
+
+trial_invalidate_portal_cache
 trial_print_counts

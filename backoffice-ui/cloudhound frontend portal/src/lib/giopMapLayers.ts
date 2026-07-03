@@ -89,10 +89,27 @@ export function fitMapBounds(
   bbox: MapBoundsLike,
   opts?: { padding?: number; duration?: number; maxZoom?: number },
 ): void {
+  const minSpan = 0.008;
+  let west = bbox.west;
+  let south = bbox.south;
+  let east = bbox.east;
+  let north = bbox.north;
+  const lonSpan = east - west;
+  const latSpan = north - south;
+  if (lonSpan < minSpan || latSpan < minSpan) {
+    const cx = (west + east) / 2;
+    const cy = (south + north) / 2;
+    const halfLon = Math.max(lonSpan / 2, minSpan / 2);
+    const halfLat = Math.max(latSpan / 2, minSpan / 2);
+    west = cx - halfLon;
+    east = cx + halfLon;
+    south = cy - halfLat;
+    north = cy + halfLat;
+  }
   map.fitBounds(
     [
-      [bbox.west, bbox.south],
-      [bbox.east, bbox.north],
+      [west, south],
+      [east, north],
     ],
     {
       padding: opts?.padding ?? 48,
@@ -389,8 +406,6 @@ export function chunkNodeCirclePaint(light: boolean): CirclePaint {
       'case',
       ['==', ['get', 'validation'], 'IN_CONFLICT'],
       CONFLICT_NODE_FILL,
-      ['boolean', ['get', 'traced'], false],
-      '#f97316',
       ['==', ['get', 'validation'], 'PENDING_FIELD'],
       '#f59e0b',
       ['boolean', ['get', 'connected'], false],
@@ -519,17 +534,6 @@ export function workOrderPinCirclePaint(): CirclePaint {
   };
 }
 
-/** Traced / start node highlight on chunk overlay. */
-export function tracedHighlightCirclePaint(): CirclePaint {
-  return {
-    'circle-radius': ['interpolate', ['linear'], ['zoom'], 5, 1.6, 8, 2.2, 12, 3.8, 14, 5, 18, 6.5],
-    'circle-color': '#f97316',
-    'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 5, 0.8, 12, 1.2, 18, 1.6],
-    'circle-stroke-color': '#ffffff',
-    'circle-opacity': 0.92,
-  };
-}
-
 /** Subtle ripple anchor — same scale as grid nodes. */
 export function focusIdentifyRipplePinRadius(zoom: number): number {
   return mapNodeRadiusAtZoom(zoom);
@@ -540,6 +544,17 @@ export function focusIdentifyCirclePaint(): CirclePaint {
   return {
     'circle-radius': radiusExpressionFromStops(MAP_NODE_RADIUS_STOPS),
     'circle-color': '#06b6d4',
+    'circle-opacity': 0.95,
+    'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 6, 0.65, 11, 1, 14, 1.35, 18, 1.7],
+    'circle-stroke-color': '#ffffff',
+  };
+}
+
+/** Copilot tentative node pick — amber so the user can confirm or correct. */
+export function focusTentativeCirclePaint(): CirclePaint {
+  return {
+    'circle-radius': radiusExpressionFromStops(MAP_NODE_RADIUS_STOPS),
+    'circle-color': '#f59e0b',
     'circle-opacity': 0.95,
     'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 6, 0.65, 11, 1, 14, 1.35, 18, 1.7],
     'circle-stroke-color': '#ffffff',
@@ -1116,7 +1131,6 @@ export const GIOP_LAYER_ZOOM_RANGE: Record<string, { min?: number; max?: number 
   'nodes-transformers-dt': { min: TRANSFORMER_ICON_MIN_ZOOM },
   'nodes-transformers-pt': { min: TRANSFORMER_ICON_MIN_ZOOM },
   'graph-chunk-nodes-layer': { min: CHUNK_NODE_MIN_ZOOM, max: NODE_DETAIL_ZOOM },
-  'graph-chunk-traced-layer': { min: CHUNK_NODE_MIN_ZOOM, max: NODE_DETAIL_ZOOM },
   'staging-points': { min: 0 },
   'field-technician-halo': { min: 0 },
   'field-technician-points': { min: 0 },
@@ -1196,7 +1210,7 @@ export function buildGiopLegendGroups(
     },
     {
       id: 'poles',
-      label: 'Pole / node',
+      label: 'Pole / node (red = in conflict)',
       color: isLightMode ? '#64748b' : '#94a3b8',
       dot: true,
       layerIds: ['nodes', 'graph-chunk-nodes-layer'],
@@ -1214,13 +1228,6 @@ export function buildGiopLegendGroups(
       color: '#22d3ee',
       dot: true,
       layerIds: ['field-technician-halo', 'field-technician-points'],
-    },
-    {
-      id: 'conflict',
-      label: 'In conflict',
-      color: CONFLICT_NODE_FILL,
-      dot: true,
-      layerIds: ['graph-chunk-traced-layer'],
     },
   ];
 
@@ -1340,7 +1347,6 @@ export function applyGiopLegendVisibility(
     ['poles', ['nodes', 'graph-chunk-nodes-layer']],
     ['staging-pending', ['staging-points']],
     ['field-tech', ['field-technician-halo', 'field-technician-points']],
-    ['conflict', ['graph-chunk-traced-layer']],
   ];
   for (const [groupId, layerIds] of exclusiveByGroup) {
     const visible = giopLegendGroupOn(state, groupId);

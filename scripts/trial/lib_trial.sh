@@ -73,6 +73,8 @@ SELECT 'public.connectivity_nodes', COUNT(*)::text FROM public.connectivity_node
 UNION ALL SELECT 'public.ac_line_segments', COUNT(*)::text FROM public.ac_line_segments
 UNION ALL SELECT 'public.identified_objects', COUNT(*)::text FROM public.identified_objects
 UNION ALL SELECT 'staging.identified_objects', COUNT(*)::text FROM staging.identified_objects
+UNION ALL SELECT 'staging.data_quality_exceptions_open', COUNT(*)::text
+  FROM staging.data_quality_exceptions WHERE status = 'OPEN'
 UNION ALL SELECT 'public.data_quality_exceptions_open', COUNT(*)::text
   FROM public.data_quality_exceptions WHERE status = 'OPEN'
 UNION ALL SELECT 'gis.asset_id_map', COUNT(*)::text FROM gis.asset_id_map;
@@ -84,6 +86,42 @@ trial_print_counts() {
   trial_counts_sql | while IFS=$'\t' read -r label count; do
     printf "    %-40s %s\n" "${label}" "${count}"
   done
+}
+
+# Bust sync-service Redis caches so map staging pins and nav badges refresh immediately
+# after a direct psql TRUNCATE (bypasses API invalidation hooks).
+trial_invalidate_portal_cache() {
+  trial_load_env
+  local py="${_TRIAL_ROOT}/.venv/bin/python"
+  if [[ ! -x "${py}" ]]; then
+    py="$(command -v python3 2>/dev/null || true)"
+  fi
+  if [[ -z "${py}" ]]; then
+    echo "Note: python not found — skip Redis cache invalidation (wait ~60s or restart sync-service)."
+    return 0
+  fi
+  if ! TRIAL_ROOT="${_TRIAL_ROOT}" "${py}" - <<'PY'
+import os
+import sys
+
+root = os.environ["TRIAL_ROOT"]
+sys.path.insert(0, os.path.join(root, "sync-service"))
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(os.path.join(root, ".env"))
+except ImportError:
+    pass
+
+from redis_cache import invalidate_h3_cache, invalidate_ops_cache, invalidate_staging_cache
+
+n = invalidate_staging_cache() + invalidate_ops_cache() + invalidate_h3_cache()
+print(f"==> Redis cache invalidated ({n} key(s): staging lists, DQ summaries, nav badges, H3)")
+PY
+  then
+    echo "Note: Redis cache invalidation failed (is Redis running? wait ~60s for TTL expiry)."
+    return 0
+  fi
 }
 
 trial_latest_backup() {

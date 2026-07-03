@@ -27,7 +27,9 @@ TRIAL_CONFIRM=1 ./scripts/trial/restore_from_backup.sh
 | `backup_before_trial.sh` | `pg_dump` → `.giop/backups/trial/giop-pre-trial-<ts>.dump` |
 | `restore_from_backup.sh` | `pg_restore --clean` from dump |
 | `clear_master_network.sh` | Deletes `public` nodes/lines only; keeps `gis.*` |
-| `clear_staging.sh` | `TRUNCATE staging.*` |
+| `clear_staging.sh` | `TRUNCATE staging.*` (cascades staging DQ exceptions), invalidate Redis cache |
+
+After `clear_staging.sh`, the portal should drop staging map pins and the Data Quality nav badge within seconds. Field-capture validation issues live in `staging.data_quality_exceptions` and are removed automatically when staging rows are truncated. Master DQ issues remain in `public.data_quality_exceptions`.
 | `prep_trial.sh` | Backup + optional clears |
 | `reimport_master_from_gis.sh` | `gis.post_import_refresh()` after trial |
 | `simulate_field_captures.py` | POST good/bad captures to sync-service |

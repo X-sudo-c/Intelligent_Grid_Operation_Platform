@@ -2,7 +2,7 @@
 
 Track improvements so voice/chat reliably understands Ghana localities (e.g. **Accra** not “a car”, **Pokuase**) and can drive the map + feeder queries.
 
-**Status:** Not implemented (planning doc only).
+**Status:** Phases 1–3 implemented; Phase 4 (multi-company reference layers) deferred.
 
 ---
 

@@ -1081,8 +1081,13 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
                 {' · '}
                 LLM:{' '}
                 {agentsStatus.llm_configured
-                  ? `connected (${agentsStatus.llm_model})`
+                  ? agentsStatus.llm_reachable === false
+                    ? `configured but unreachable (${agentsStatus.llm_model})`
+                    : `connected (${agentsStatus.llm_model})`
                   : 'rules-only (no API key)'}
+                {agentsStatus.llm_configured && agentsStatus.llm_tool_count
+                  ? ` · ${agentsStatus.llm_tool_count} tools`
+                  : ''}
               </p>
             )}
             <div className="flex gap-2 ml-auto">

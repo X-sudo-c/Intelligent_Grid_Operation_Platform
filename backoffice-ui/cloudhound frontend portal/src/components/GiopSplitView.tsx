@@ -7,6 +7,7 @@ import type { GiopFieldTechnician, GiopStagingAsset, GiopWorkOrder, GiopTopology
 import { useGiopGraphChunk } from '../hooks/useGiopGraphChunk';
 import { chunkToPortalGraph } from '../lib/giopGraphAdapter';
 import type { MapBbox } from '../hooks/useGiopGraphChunk';
+import type { FeederHighlightState } from '../lib/giopFeederHighlight';
 
 export interface GiopSplitViewProps {
   graph: PortalGraphResponse | null;
@@ -40,8 +41,10 @@ export interface GiopSplitViewProps {
   };
   workOrders?: GiopWorkOrder[];
   impactOverlay?: GiopTopologyPayload | null;
+  feederHighlight?: FeederHighlightState | null;
   focusLabel?: string | null;
   pulseFocus?: boolean;
+  pulseFocusTentative?: boolean;
   mapChrome?: 'full' | 'operations';
   /** Ops desk: topology highlight is independent of map/table focus. */
   topologyFocusMrid?: string | null;
@@ -85,8 +88,10 @@ export function GiopSplitView({
   fieldCrews,
   workOrders = [],
   impactOverlay = null,
+  feederHighlight = null,
   focusLabel,
   pulseFocus = false,
+  pulseFocusTentative = false,
   mapChrome = 'full',
   topologyFocusMrid,
   flyRequest = null,
@@ -123,6 +128,7 @@ export function GiopSplitView({
           focusCoordinates={focusCoordinates}
           focusLabel={focusLabel}
           pulseFocus={pulseFocus}
+          pulseFocusTentative={pulseFocusTentative}
           mapChrome={mapChrome}
           flyRequest={flyRequest}
           stagingAssets={stagingAssets}
@@ -140,6 +146,7 @@ export function GiopSplitView({
           chunkErrorExternal={chunkError}
           workOrders={workOrders}
           impactOverlay={impactOverlay}
+          feederHighlight={feederHighlight}
         />
       </div>
       <div className="min-h-0 flex-1">

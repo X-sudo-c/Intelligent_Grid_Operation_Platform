@@ -87,6 +87,71 @@ def _tool_schemas() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "inspect_node",
+                "description": (
+                    "Describe ONE connectivity node (grid node): name, lifecycle/validation, "
+                    "feeder, location, district, connections. Call WITHOUT mrid when the user "
+                    "says 'this node', 'the node in view', or 'what am I looking at' — it "
+                    "auto-resolves from the selected map asset or the node nearest map center. "
+                    "Only pass mrid when the user gives a specific UUID. When confirmation_needed "
+                    "is true in the result, the map shows an amber highlight — ask the user to confirm."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mrid": {
+                            "type": "string",
+                            "description": "Optional UUID. Omit for 'this node' / 'node in view'.",
+                        },
+                        "tier": {
+                            "type": "string",
+                            "enum": ["master", "staging"],
+                            "default": "master",
+                        },
+                        "show_on_map": {
+                            "type": "boolean",
+                            "description": "Fly the map camera to the node",
+                            "default": False,
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_work_orders_in_view",
+                "description": (
+                    "List open work orders visible in the current map viewport (bbox). "
+                    "Use when the user asks about work orders here, in view, on the map, "
+                    "or in the current area. Pass west/south/east/north from portal viewport "
+                    "context. Returns reference, summary, status, priority, assignee, and location."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "west": {"type": "number", "description": "Map bbox west longitude"},
+                        "south": {"type": "number", "description": "Map bbox south latitude"},
+                        "east": {"type": "number", "description": "Map bbox east longitude"},
+                        "north": {"type": "number", "description": "Map bbox north latitude"},
+                        "status": {
+                            "type": "string",
+                            "description": "Optional status filter e.g. DISPATCHED, IN_PROGRESS",
+                        },
+                        "open_only": {
+                            "type": "boolean",
+                            "description": "Exclude completed/cancelled (default true)",
+                            "default": True,
+                        },
+                        "limit": {"type": "integer", "default": 50},
+                    },
+                    "required": ["west", "south", "east", "north"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "dq_summary",
                 "description": "Summary counts of open exceptions by severity and domain.",
                 "parameters": {"type": "object", "properties": {}},
@@ -135,12 +200,57 @@ def _tool_schemas() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
-                "name": "trace_feeder",
-                "description": "Bounded BFS trace from nodes matching a boundary feeder id.",
+                "name": "trace_connection_path",
+                "description": (
+                    "Highlight the line segments directly connected to one node "
+                    "(1-hop neighbors). Use when the user asks to trace/show the "
+                    "connection path, line, or link from the selected node or the "
+                    "node they just inspected — NOT for whole-feeder traces."
+                ),
                 "parameters": {
                     "type": "object",
-                    "properties": {"feeder_id": {"type": "string"}},
-                    "required": ["feeder_id"],
+                    "properties": {
+                        "mrid": {
+                            "type": "string",
+                            "description": "Optional node UUID. Omit to use selection or last inspected node.",
+                        },
+                        "show_on_map": {
+                            "type": "boolean",
+                            "default": True,
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "trace_feeder",
+                "description": (
+                    "Trace ALL reachable nodes on a boundary feeder (BFS). "
+                    "Use show_on_map=true when the user asks to show, highlight, or display "
+                    "feeder nodes on the map. Pass focus_mrid when they say 'this feeder' "
+                    "and portal context includes a selected asset. "
+                    "Do NOT use for 'trace the connection path' from one node — use trace_connection_path."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "feeder_id": {
+                            "type": "string",
+                            "description": "boundary_feeder_id or spoken name e.g. FEEDER-ECG-MALLAM-04 or Mallam",
+                        },
+                        "focus_mrid": {
+                            "type": "string",
+                            "description": "Selected asset MRID — resolves feeder when feeder_id omitted",
+                        },
+                        "show_on_map": {
+                            "type": "boolean",
+                            "description": "Emit highlight_feeder map overlay + fit bounds",
+                            "default": False,
+                        },
+                        "max_hops": {"type": "integer", "default": 500},
+                    },
                 },
             },
         },
@@ -330,8 +440,8 @@ def _tool_schemas() -> list[dict[str, Any]]:
                 "name": "pan_map",
                 "description": (
                     "Move the steward map camera: fly to point, fit district bounds, highlight district, "
-                    "or fit bbox. Use highlight_district when user asks to highlight/show/emphasize a place. "
-                    "Always use when user asks to show/go to/pan to an area. Returns a UI action."
+                    "or fit bbox. For towns/localities use fly_to (zoom 16–17) or fit_bounds with tight bbox. "
+                    "Use fit_district only for whole districts/regions. Returns a UI action."
                 ),
                 "parameters": {
                     "type": "object",
@@ -396,7 +506,36 @@ def _tool_schemas() -> list[dict[str, Any]]:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "kpi_snapshot",
+                "description": (
+                    "Overall data quality health KPIs: topology validity %, completeness %, "
+                    "open critical exceptions, pending approvals, export-blocked status. "
+                    "Use for 'how healthy is the data', 'what's our DQ score', or status overviews."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "topology_batch_scan",
+                "description": (
+                    "Run a topology DQ batch scan over master data and return fresh metrics. "
+                    "Heavier than topology_dq_summary — only use when the user explicitly asks "
+                    "to re-scan or refresh topology checks."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
     ]
+
+
+def tool_names() -> list[str]:
+    """Names of every tool the steward copilot can call (for status/introspection)."""
+    return [s["function"]["name"] for s in _tool_schemas()]
 
 
 def _execute_tool(
@@ -406,6 +545,7 @@ def _execute_tool(
     *,
     run_id: str | None = None,
     agent_name: str = "StewardAssistant",
+    portal_context: dict[str, Any] | None = None,
 ) -> Any:
     if name == "list_exceptions":
         return tools.tool_list_exceptions(
@@ -420,6 +560,25 @@ def _execute_tool(
         return tools.tool_run_asset_checks(
             conn, arguments["mrid"], arguments.get("tier") or "master"
         )
+    if name == "inspect_node":
+        return tools.tool_inspect_node(
+            conn,
+            arguments.get("mrid"),
+            context=portal_context,
+            tier=arguments.get("tier") or "master",
+            show_on_map=bool(arguments.get("show_on_map", False)),
+        )
+    if name == "list_work_orders_in_view":
+        return tools.tool_list_work_orders_in_view(
+            conn,
+            west=float(arguments["west"]),
+            south=float(arguments["south"]),
+            east=float(arguments["east"]),
+            north=float(arguments["north"]),
+            status=arguments.get("status"),
+            open_only=bool(arguments.get("open_only", True)),
+            limit=int(arguments.get("limit") or 50),
+        )
     if name == "dq_summary":
         return tools.tool_dq_summary(conn)
     if name == "list_rules":
@@ -432,8 +591,34 @@ def _execute_tool(
         return graph_tools.detect_cycles()
     if name == "detect_islands":
         return graph_tools.detect_islands()
+    if name == "trace_connection_path":
+        portal_ctx = dict(portal_context or {})
+        if arguments.get("mrid"):
+            portal_ctx["focus_mrid"] = arguments["mrid"]
+        elif portal_ctx.get("last_mrid"):
+            portal_ctx.setdefault("focus_mrid", portal_ctx["last_mrid"])
+        return graph_tools.trace_connection_path(
+            conn,
+            mrid=arguments.get("mrid"),
+            context=portal_ctx,
+            show_on_map=bool(arguments.get("show_on_map", True)),
+        )
     if name == "trace_feeder":
-        return graph_tools.trace_feeder(arguments["feeder_id"])
+        feeder_arg = (arguments.get("feeder_id") or "").strip() or None
+        focus_mrid = arguments.get("focus_mrid")
+        if feeder_arg and not focus_mrid:
+            resolved = graph_tools.resolve_feeder_query(conn, feeder_arg)
+            if resolved.get("feeder_id"):
+                feeder_arg = str(resolved["feeder_id"])
+            elif resolved.get("candidates") and not resolved.get("feeder_id"):
+                return resolved
+        return graph_tools.trace_feeder(
+            feeder_arg,
+            conn=conn,
+            focus_mrid=focus_mrid,
+            show_on_map=bool(arguments.get("show_on_map", False)),
+            max_hops=int(arguments.get("max_hops") or 500),
+        )
     if name == "propose_cleanup":
         plan = generate_cleanup_plan(conn, arguments["exception_id"])
         return plan.model_dump()
@@ -471,6 +656,12 @@ def _execute_tool(
         )
     if name == "review_staging_asset":
         return tools.tool_review_staging_asset(conn, arguments["mrid"])
+    if name == "kpi_snapshot":
+        from agents import kpi
+
+        return kpi.compute_kpis(conn)
+    if name == "topology_batch_scan":
+        return tools.tool_topology_batch_scan(conn, requested_by=agent_name)
     if name == "resolve_place":
         return spatial_tools.tool_resolve_place(
             conn,
@@ -506,13 +697,28 @@ def _execute_tool(
         region = arguments.get("region")
         place_query = (arguments.get("place") or "").strip()
         if place_query and not district and not region:
-            from agents.place_resolve import resolve_place
+            from agents.place_resolve import place_viewport_ui_action, resolve_place
 
             try:
                 resolved = resolve_place(conn, place_query)
                 district = resolved.get("district") or district
                 region = resolved.get("region") or region
                 arguments = {**arguments, "district": district, "region": region}
+                if action in ("fit_district", "highlight_district", "fit_bounds", "fly_to"):
+                    local_ui = place_viewport_ui_action(
+                        resolved,
+                        mode="zoom" if float(arguments.get("zoom") or 0) >= 15 else "pan",
+                        tab=tab,
+                    )
+                    if local_ui and resolved.get("source") in (
+                        "osm",
+                        "alias_exact",
+                        "alias_fuzzy",
+                    ):
+                        if action == "highlight_district" and district:
+                            pass  # fall through to highlight_district below
+                        else:
+                            return {"ok": True, "resolved": resolved, "ui_action": local_ui}
             except ValueError:
                 pass
 
@@ -564,6 +770,8 @@ def _execute_tool(
                 "north": float(arguments["north"]),
             }
             ui = {"type": "fit_bounds", "tab": tab, "bbox": bbox}
+            if arguments.get("max_zoom") is not None:
+                ui["max_zoom"] = float(arguments["max_zoom"])
             return {"ok": True, "ui_action": ui}
         if action == "fly_to":
             ui = {
@@ -573,7 +781,7 @@ def _execute_tool(
                     "lon": float(arguments["lon"]),
                     "lat": float(arguments["lat"]),
                 },
-                "zoom": float(arguments.get("zoom") or 14),
+                "zoom": float(arguments.get("zoom") or 16.5),
             }
             return {"ok": True, "ui_action": ui}
         return {"error": f"Unknown pan_map action {action!r}"}
@@ -616,6 +824,7 @@ def run_tool_loop(
     agent_name: str = "StewardAssistant",
     max_turns: int = MAX_TOOL_TURNS,
     tool_filter: Callable[[str], bool] | None = None,
+    portal_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Multi-turn OpenAI-compatible tool loop until final assistant message."""
     schemas = _tool_schemas()
@@ -659,7 +868,12 @@ def run_tool_loop(
 
             try:
                 output = _execute_tool(
-                    conn, tool_name, args, run_id=run_id, agent_name=agent_name
+                    conn,
+                    tool_name,
+                    args,
+                    run_id=run_id,
+                    agent_name=agent_name,
+                    portal_context=portal_context,
                 )
             except Exception as exc:
                 # Broken tool call must not 500 the whole chat — feed the error

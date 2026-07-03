@@ -20,7 +20,7 @@ def main() -> int:
         print("FAIL: set GIOP_LLM_API_KEY in .env")
         return 1
 
-    model = os.getenv("GIOP_LLM_MODEL") or "qwen-plus"
+    model = os.getenv("GIOP_LLM_MODEL") or "gpt-4o-mini"
     print(f"Testing model={model} …")
     try:
         result = complete_chat(

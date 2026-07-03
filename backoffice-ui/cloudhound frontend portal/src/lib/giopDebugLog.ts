@@ -3,7 +3,7 @@
  * in the browser console. Set localStorage `giop.debug.log` to `0` to silence.
  */
 
-export type GiopLogScope = 'map' | 'ops' | 'portal' | 'overlay' | 'audit';
+export type GiopLogScope = 'map' | 'ops' | 'portal' | 'overlay' | 'audit' | 'realtime';
 
 const STORAGE_KEY = 'giop.debug.log';
 
@@ -52,4 +52,5 @@ export const giopLog = {
   portal: scopeLogger('portal'),
   overlay: scopeLogger('overlay'),
   audit: scopeLogger('audit'),
+  realtime: scopeLogger('realtime'),
 };

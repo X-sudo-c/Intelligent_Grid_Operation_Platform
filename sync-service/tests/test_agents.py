@@ -294,9 +294,49 @@ class VoiceSttTests(unittest.TestCase):
         from agents import voice_stt
 
         st = voice_stt.status()
-        self.assertEqual(st["mode"], "local")
+        self.assertIn(st["mode"], ("openai", "local"))
         self.assertIn("available", st)
+        self.assertIn("provider", st)
 
+    def test_auto_provider_prefers_openai_with_key(self):
+        from agents import voice_stt
+
+        with patch.dict(
+            os.environ,
+            {
+                "VOICE_STT_PROVIDER": "auto",
+                "GIOP_LLM_API_KEY": "sk-test",
+                "VOICE_STT_API_KEY": "",
+                "OPENAI_API_KEY": "",
+            },
+            clear=False,
+        ):
+            self.assertEqual(voice_stt.active_provider(), "openai")
+
+    def test_run_voice_turn_from_audio(self):
+        from agents.voice import run_voice_turn_from_audio
+        from unittest.mock import MagicMock, patch
+
+        conn = MagicMock()
+        with patch("agents.voice.voice_stt.transcribe_audio", return_value="zoom into Dome"):
+            with patch("agents.voice.try_copilot_fast_path") as fast:
+                fast.return_value = (
+                    MagicMock(kind="fly_to"),
+                    {
+                        "content": "Flying to Dome.",
+                        "speak": "Flying to Dome.",
+                        "ui_actions": [{"type": "fly_to", "lat": 1.0, "lng": -0.1}],
+                        "session_patch": {},
+                    },
+                )
+                result = run_voice_turn_from_audio(
+                    conn,
+                    data=b"fake-audio",
+                    content_type="audio/webm",
+                )
+        self.assertEqual(result.agent.get("transcript"), "zoom into Dome")
+        self.assertTrue(result.agent.get("fast_path"))
+        self.assertEqual(result.content, "Flying to Dome.")
 
 class VoiceRouterTests(unittest.TestCase):
     def test_normalize_akra_to_accra(self):
@@ -505,6 +545,169 @@ class VoiceRouterTests(unittest.TestCase):
         self.assertEqual(intent.asset_kind, "pole")
         self.assertEqual(intent.district, "accra")
 
+    def test_parse_work_orders_in_view(self):
+        from agents.voice_router import parse_intent
+
+        for text in (
+            "what work orders are in view",
+            "current work orders on the map",
+            "open work orders here",
+        ):
+            with self.subTest(text=text):
+                intent = parse_intent(text, session={}, context={})
+                self.assertIsNotNone(intent)
+                assert intent is not None
+                self.assertEqual(intent.kind, "work_orders_in_view")
+                self.assertTrue(intent.use_viewport)
+
+    def test_parse_work_orders_in_place(self):
+        from agents.voice_router import parse_intent
+
+        for text in (
+            "what work orders are in accra",
+            "tell me about the current work order nodes in accra",
+            "show open work orders in Accra",
+        ):
+            with self.subTest(text=text):
+                intent = parse_intent(text, session={}, context={})
+                self.assertIsNotNone(intent, msg=text)
+                assert intent is not None
+                self.assertEqual(intent.kind, "work_orders_in_view", msg=text)
+                self.assertEqual(intent.district, "accra", msg=text)
+                self.assertFalse(intent.use_viewport, msg=text)
+
+    def test_parse_pan_to_work_order_node(self):
+        from agents.voice_router import parse_intent
+
+        intent = parse_intent("pan to the work order node", session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "pan_work_order")
+
+    def test_metro_zoom_uses_fit_bounds_not_fly_to(self):
+        from agents.place_resolve import place_viewport_ui_action
+
+        resolved = {
+            "source": "metro_region",
+            "matched_as": "Accra",
+            "center": {"lon": -0.2, "lat": 5.6},
+            "bbox": {"west": -0.5, "south": 5.3, "east": 0.1, "north": 5.9},
+        }
+        ui = place_viewport_ui_action(resolved, mode="zoom", tab="map")
+        self.assertIsNotNone(ui)
+        assert ui is not None
+        self.assertEqual(ui["type"], "fit_bounds")
+        self.assertEqual(ui.get("max_zoom"), 14.5)
+
+    def test_osm_locality_pan_centers_with_fly_to(self):
+        from agents.place_resolve import place_viewport_ui_action
+
+        resolved = {
+            "source": "osm",
+            "matched_as": "Roman Ridge",
+            "center": {"lon": -0.185, "lat": 5.612},
+            "bbox": {"west": -0.5, "south": 5.3, "east": 0.1, "north": 5.9},
+        }
+        ui = place_viewport_ui_action(resolved, mode="pan", tab="map")
+        self.assertIsNotNone(ui)
+        assert ui is not None
+        self.assertEqual(ui["type"], "fly_to")
+        self.assertAlmostEqual(float(ui["center"]["lon"]), -0.185)
+        self.assertAlmostEqual(float(ui["center"]["lat"]), 5.612)
+
+    def test_parse_take_me_to_locality(self):
+        from agents.voice_router import parse_intent
+
+        intent = parse_intent("take me to roman ridge", session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "pan")
+        self.assertEqual(intent.district, "roman ridge")
+
+    def test_alias_exact_pins_locality_center(self):
+        from agents.place_resolve import _lookup_alias_exact
+
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        cur.fetchone.return_value = ("Roman Ridge", None, None, -0.1949429, 5.6041482)
+        cur.fetchone.side_effect = [
+            ("Roman Ridge", None, None, -0.1949429, 5.6041482),
+            ("Ayawaso West", "Greater Accra", -0.20, 5.60, -0.21, 5.59, -0.18, 5.61),
+        ]
+
+        hit = _lookup_alias_exact(conn, "Roman Ridge")
+        self.assertIsNotNone(hit)
+        assert hit is not None
+        self.assertEqual(hit["source"], "alias_exact")
+        self.assertAlmostEqual(float(hit["center"]["lon"]), -0.1949429, places=4)
+        self.assertAlmostEqual(float(hit["center"]["lat"]), 5.6041482, places=4)
+
+    def test_pick_osm_hit_prefers_name_match(self):
+        from agents.place_resolve import _pick_osm_hit
+
+        hits = [
+            {"title": "Kotobabi", "longitude": -0.204, "latitude": 5.599},
+            {"title": "Roman Ridge", "longitude": -0.195, "latitude": 5.604},
+        ]
+        best = _pick_osm_hit("roman ridge", hits)
+        self.assertIsNotNone(best)
+        assert best is not None
+        self.assertEqual(best["title"], "Roman Ridge")
+
+    def test_format_work_orders_speech_empty(self):
+        from agents.voice_router import _format_work_orders_speech
+
+        speak = _format_work_orders_speech({"count": 0, "work_orders": []})
+        self.assertIn("no open work orders", speak.lower())
+
+    def test_parse_inspect_node_in_view(self):
+        from agents.voice_router import parse_intent
+
+        for text in (
+            "tell me about the node in view",
+            "what is this node",
+            "what am I looking at",
+            "describe the node on screen",
+        ):
+            with self.subTest(text=text):
+                intent = parse_intent(text, session={}, context={})
+                self.assertIsNotNone(intent)
+                assert intent is not None
+                self.assertEqual(intent.kind, "inspect_node")
+
+    def test_node_pick_uncertain(self):
+        from agents.portal_context import _node_pick_uncertain
+
+        self.assertTrue(
+            _node_pick_uncertain(distance_m=50, zoom=12, runner_up_distance_m=60)
+        )
+        self.assertTrue(
+            _node_pick_uncertain(distance_m=50, zoom=15, runner_up_distance_m=55)
+        )
+        self.assertTrue(
+            _node_pick_uncertain(distance_m=200, zoom=16, runner_up_distance_m=None)
+        )
+        self.assertFalse(
+            _node_pick_uncertain(distance_m=40, zoom=16, runner_up_distance_m=100)
+        )
+
+    def test_format_inspect_node_speech_confirmation(self):
+        from agents.voice_router import _format_inspect_node_speech
+
+        speak = _format_inspect_node_speech(
+            {
+                "name": "Pokuaa BSP",
+                "validation": "VALID",
+                "degree": 2,
+                "confirmation_needed": True,
+            }
+        )
+        self.assertIn("highlighted", speak.lower())
+        self.assertIn("pokuaa bsp", speak.lower())
+        self.assertIn("is this the node", speak.lower())
+
     def test_parse_highlight(self):
         from agents.voice_router import parse_intent
 
@@ -525,6 +728,82 @@ class VoiceRouterTests(unittest.TestCase):
                 self.assertEqual(intent.district, "accra")
                 self.assertIsNone(intent.region)
 
+    def test_parse_trace_connection_path(self):
+        from agents.voice_router import parse_intent
+
+        intent = parse_intent("can you trace the connection path?", session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "trace_connection_path")
+
+    def test_parse_trace_feeder_explicit(self):
+        from agents.voice_router import parse_intent
+
+        intent = parse_intent("show nodes on feeder FEEDER-ACC-01", session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "trace_feeder")
+        self.assertEqual(intent.feeder_id, "FEEDER-ACC-01")
+
+    def test_parse_trace_this_feeder(self):
+        from agents.voice_router import parse_intent
+
+        intent = parse_intent("highlight this feeder on the map", session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "trace_feeder")
+        self.assertIsNone(intent.feeder_id)
+
+    def test_parse_trace_named_mallam_feeder(self):
+        from agents.voice_router import parse_intent
+
+        for text in (
+            "show connections on the mallam feeder",
+            "connection of the mallam feeder",
+            "trace the mallam feeder",
+            "highlight mallam feeder on the map",
+        ):
+            with self.subTest(text=text):
+                intent = parse_intent(text, session={}, context={})
+                self.assertIsNotNone(intent, msg=text)
+                assert intent is not None
+                self.assertEqual(intent.kind, "trace_feeder", msg=text)
+                self.assertEqual(intent.feeder_id, "mallam", msg=text)
+
+    def test_resolve_feeder_query_mallam(self):
+        from agents.graph_tools import resolve_feeder_query
+
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        cur.fetchall.return_value = [
+            ("FEEDER-ECG-MALLAM-04", 12, "Mallam Secondary Distribution Node"),
+        ]
+
+        resolved = resolve_feeder_query(conn, "mallam")
+        self.assertEqual(resolved["feeder_id"], "FEEDER-ECG-MALLAM-04")
+
+    def test_trace_feeder_bbox_from_geojson(self):
+        from agents.graph_tools import _bbox_from_geojson
+
+        bbox = _bbox_from_geojson(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {},
+                        "geometry": {"type": "Point", "coordinates": [-0.2, 5.6]},
+                    }
+                ],
+            }
+        )
+        self.assertIsNotNone(bbox)
+        assert bbox is not None
+        self.assertLess(bbox["west"], -0.2)
+        self.assertGreater(bbox["east"], -0.2)
+
     def test_show_map_to_accra_parses_pan(self):
         from agents.voice_router import parse_intent
 
@@ -533,6 +812,132 @@ class VoiceRouterTests(unittest.TestCase):
         assert intent is not None
         self.assertEqual(intent.kind, "pan")
         self.assertEqual(intent.district, "kumasi")
+
+    def test_zoom_in_without_place_parses_zoom_map(self):
+        from agents.voice_router import parse_intent
+
+        intent = parse_intent("zoom in", session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "zoom_map")
+        self.assertGreater(float(intent.zoom_delta), 0.0)
+
+    def test_zoom_in_a_bit_parses_smaller_zoom_delta(self):
+        from agents.voice_router import parse_intent
+
+        little = parse_intent("zoom in a bit", session={}, context={})
+        normal = parse_intent("zoom in", session={}, context={})
+        self.assertIsNotNone(little)
+        self.assertIsNotNone(normal)
+        assert little is not None
+        assert normal is not None
+        self.assertEqual(little.kind, "zoom_map")
+        self.assertLess(float(little.zoom_delta), float(normal.zoom_delta))
+
+    def test_zoom_in_more_parses_larger_zoom_delta(self):
+        from agents.voice_router import parse_intent
+
+        more = parse_intent("zoom in more", session={}, context={})
+        normal = parse_intent("zoom in", session={}, context={})
+        self.assertIsNotNone(more)
+        self.assertIsNotNone(normal)
+        assert more is not None
+        assert normal is not None
+        self.assertEqual(more.kind, "zoom_map")
+        self.assertGreater(float(more.zoom_delta), float(normal.zoom_delta))
+
+    def test_execute_fast_path_zoom_in_uses_current_center(self):
+        from agents.voice_router import execute_fast_path, parse_intent
+
+        intent = parse_intent("zoom in", session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+
+        result = execute_fast_path(
+            MagicMock(),
+            intent,
+            context={"viewport": {"zoom": 12, "center": {"lon": -0.2, "lat": 5.6}}},
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(result.get("fast_path"))
+        self.assertEqual(result["ui_actions"][0]["type"], "fly_to")
+        self.assertGreater(float(result["ui_actions"][0]["zoom"]), 12.0)
+
+    def test_execute_fast_path_zoom_in_more_moves_further_than_a_bit(self):
+        from agents.voice_router import execute_fast_path, parse_intent
+
+        more = parse_intent("zoom in more", session={}, context={})
+        little = parse_intent("zoom in a bit", session={}, context={})
+        self.assertIsNotNone(more)
+        self.assertIsNotNone(little)
+        assert more is not None
+        assert little is not None
+
+        base_ctx = {"viewport": {"zoom": 12, "center": {"lon": -0.2, "lat": 5.6}}}
+        more_result = execute_fast_path(MagicMock(), more, context=base_ctx)
+        little_result = execute_fast_path(MagicMock(), little, context=base_ctx)
+        self.assertIsNotNone(more_result)
+        self.assertIsNotNone(little_result)
+        assert more_result is not None
+        assert little_result is not None
+        self.assertGreater(float(more_result["ui_actions"][0]["zoom"]),
+            float(little_result["ui_actions"][0]["zoom"]),
+        )
+
+    def test_zoom_out_without_place_parses_zoom_map(self):
+        from agents.voice_router import parse_intent
+
+        intent = parse_intent("zoom out", session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "zoom_map")
+        self.assertLess(float(intent.zoom_delta), 0.0)
+
+    def test_zoom_out_paraphrases_parse_zoom_map(self):
+        from agents.voice_router import parse_intent
+
+        for phrase in (
+            "can you zoom out",
+            "zoom the map out",
+            "zoom out please",
+            "please zoom out on the map",
+        ):
+            with self.subTest(phrase=phrase):
+                intent = parse_intent(phrase, session={}, context={})
+                self.assertIsNotNone(intent, msg=phrase)
+                assert intent is not None
+                self.assertEqual(intent.kind, "zoom_map", msg=phrase)
+                self.assertLess(float(intent.zoom_delta), 0.0, msg=phrase)
+
+    def test_zoom_out_a_bit_more_uses_larger_step(self):
+        from agents.voice_router import parse_intent
+
+        little = parse_intent("zoom out a bit", session={}, context={})
+        more = parse_intent("zoom out a bit more", session={}, context={})
+        self.assertIsNotNone(little)
+        self.assertIsNotNone(more)
+        assert little is not None
+        assert more is not None
+        self.assertGreater(abs(float(more.zoom_delta)), abs(float(little.zoom_delta)))
+
+    def test_execute_fast_path_zoom_out_uses_current_center(self):
+        from agents.voice_router import execute_fast_path, parse_intent
+
+        intent = parse_intent("zoom out", session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+
+        result = execute_fast_path(
+            MagicMock(),
+            intent,
+            context={"viewport": {"zoom": 12, "center": {"lon": -0.2, "lat": 5.6}}},
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(result.get("fast_path"))
+        self.assertEqual(result["ui_actions"][0]["type"], "fly_to")
+        self.assertLess(float(result["ui_actions"][0]["zoom"]), 12.0)
 
     def test_follow_up_and_in(self):
         from agents.voice_router import parse_intent
@@ -546,6 +951,55 @@ class VoiceRouterTests(unittest.TestCase):
         assert intent is not None
         self.assertEqual(intent.district, "kumasi")
         self.assertEqual(intent.asset_kind, "pole")
+
+    def test_bare_in_place_not_follow_up(self):
+        from agents.voice_router import parse_intent
+
+        intent = parse_intent(
+            "in Kaneshie",
+            session={"last_kind": "count", "last_tier": "staging"},
+            context={},
+        )
+        self.assertIsNone(intent)
+
+    def test_count_scope_skips_selected_district_by_default(self):
+        from agents.portal_context import portal_count_scope
+
+        bbox, district, region = portal_count_scope(
+            use_viewport=True,
+            territory_bbox=None,
+            district=None,
+            region=None,
+            context={"selected_district": "Kaneshie", "selected_region": "Accra West"},
+            allow_selected_territory=False,
+        )
+        self.assertIsNone(bbox)
+        self.assertIsNone(district)
+        self.assertIsNone(region)
+
+        _bbox, district2, region2 = portal_count_scope(
+            use_viewport=True,
+            territory_bbox=None,
+            district=None,
+            region=None,
+            context={"selected_district": "Kaneshie", "selected_region": "Accra West"},
+            allow_selected_territory=True,
+        )
+        self.assertEqual(district2, "Kaneshie")
+        self.assertEqual(region2, "Accra West")
+
+    def test_echo_count_template_skips_fast_path(self):
+        from agents.voice_router import try_copilot_fast_path
+
+        conn = MagicMock()
+        intent, fast = try_copilot_fast_path(
+            conn,
+            "About 0 staging captures in Kaneshie.",
+            context={"selected_district": "Kaneshie"},
+            session={"last_kind": "count", "last_tier": "staging"},
+        )
+        self.assertIsNone(intent)
+        self.assertIsNone(fast)
 
 
 class StewardChatTests(unittest.TestCase):

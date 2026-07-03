@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { MessageSquare, Mic, MicOff, Send, Sparkles, X } from 'lucide-react';
-import { portalAiChat, portalAiVoiceTurn } from '../api/giop-api';
+import { portalAiChat, portalAiVoiceAudioTurn, portalAiVoiceTurn } from '../api/giop-api';
 import { useGiopVoiceSession } from '../hooks/useGiopVoiceSession';
 import { playCopilotSpeech, stopCopilotSpeech } from '../lib/giopVoicePlayback';
 import {
@@ -136,13 +136,51 @@ export function GiopCopilotPanel({
 
   const send = useCallback((text: string) => runTextTurn(text), [runTextTurn]);
 
-  const onVoiceUtterance = useCallback(
-    (text: string) => runTextTurn(text, { voice: true }),
-    [runTextTurn],
+  const onVoiceAudioTurn = useCallback(
+    async (blob: Blob) => {
+      if (busy) return;
+      setBusy(true);
+      const pendingId = newId();
+      setMessages((prev) => [
+        ...prev,
+        { id: pendingId, role: 'assistant', content: 'Processing…', pending: true },
+      ]);
+      try {
+        const resp = await portalAiVoiceAudioTurn({
+          audio: blob,
+          sessionId: voiceSessionIdRef.current,
+          mrid: portalContext.focus_mrid ?? undefined,
+          context: { ...portalContext },
+        });
+        const transcript = String(resp.agent?.transcript ?? '').trim();
+        if (transcript) {
+          setMessages((prev) => [
+            ...prev.filter((m) => m.id !== pendingId),
+            { id: newId(), role: 'user', content: transcript },
+            { id: pendingId, role: 'assistant', content: 'Thinking…', pending: true },
+          ]);
+        }
+        await applyResponse(resp, pendingId);
+        void playCopilotSpeech(resp.agent?.speak ?? resp.content);
+      } catch (err) {
+        setMessages((prev) =>
+          prev
+            .filter((m) => m.id !== pendingId)
+            .concat({
+              id: newId(),
+              role: 'assistant',
+              content: err instanceof Error ? err.message : 'Copilot request failed',
+            }),
+        );
+      } finally {
+        setBusy(false);
+      }
+    },
+    [applyResponse, busy, portalContext],
   );
 
   const voice = useGiopVoiceSession({
-    onUtterance: onVoiceUtterance,
+    onAudioTurn: onVoiceAudioTurn,
     enabled: open && !busy,
   });
 
@@ -191,7 +229,9 @@ export function GiopCopilotPanel({
                     ? 'Transcribing…'
                     : voice.recording
                       ? 'Recording… tap mic when done (max 12s)'
-                      : 'Tap mic · speak · tap again to send'}
+                      : voice.pendingUtterance
+                        ? 'Edit transcript, then Send'
+                        : 'Tap mic · speak · tap again to review'}
                 </p>
               </div>
             </div>
@@ -209,6 +249,55 @@ export function GiopCopilotPanel({
             <p className={`px-4 py-2 text-xs ${isLightMode ? 'text-amber-700 bg-amber-50' : 'text-amber-200 bg-amber-950/40'}`}>
               {voice.error}
             </p>
+          )}
+
+          {voice.pendingUtterance && (
+            <div
+              className={`mx-3 mt-2 rounded-lg border px-3 py-2 space-y-2 ${
+                isLightMode ? 'border-cyan-200 bg-cyan-50/80' : 'border-cyan-900/40 bg-cyan-950/30'
+              }`}
+            >
+              <p className={`text-xs font-medium ${isLightMode ? 'text-cyan-900' : 'text-cyan-200'}`}>
+                I heard:
+              </p>
+              <textarea
+                value={voice.pendingUtterance.text}
+                onChange={(e) => voice.updatePendingText(e.target.value)}
+                rows={2}
+                className={`w-full rounded border px-2 py-1.5 text-sm resize-none ${
+                  isLightMode
+                    ? 'border-slate-300 bg-white text-slate-900'
+                    : 'border-[#283246] bg-premium-card text-premium-text'
+                }`}
+              />
+              {voice.pendingUtterance.fixes && voice.pendingUtterance.fixes.length > 0 && (
+                <p className={`text-[10px] ${muted}`}>
+                  Auto-corrected: {voice.pendingUtterance.fixes.join(', ')}
+                </p>
+              )}
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  disabled={busy || !voice.pendingUtterance.text.trim()}
+                  onClick={() => void voice.confirmPending()}
+                  className="flex-1 rounded bg-cyan-700 hover:bg-cyan-600 text-white text-xs py-1.5 disabled:opacity-50"
+                >
+                  Send
+                </button>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={voice.discardPending}
+                  className={`rounded px-3 text-xs py-1.5 border ${
+                    isLightMode
+                      ? 'border-slate-300 text-slate-600 hover:bg-slate-50'
+                      : 'border-[#283246] text-premium-muted hover:bg-premium-hover'
+                  }`}
+                >
+                  Discard
+                </button>
+              </div>
+            </div>
           )}
 
           <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-3">
@@ -244,7 +333,7 @@ export function GiopCopilotPanel({
               <button
                 key={s}
                 type="button"
-                disabled={busy || voice.recording || voice.transcribing}
+                disabled={busy || voice.recording || voice.transcribing || Boolean(voice.pendingUtterance)}
                 onClick={() => void send(s)}
                 className={`text-[11px] px-2 py-0.5 rounded-full border disabled:opacity-50 ${
                   isLightMode
@@ -266,7 +355,7 @@ export function GiopCopilotPanel({
           >
             <button
               type="button"
-              disabled={busy || voice.transcribing}
+              disabled={busy || voice.recording || voice.transcribing || Boolean(voice.pendingUtterance)}
               onClick={() => voice.toggle()}
               title="Tap to record, speak, tap again to send (local Whisper STT)"
               className={`rounded-lg px-3 py-2 disabled:opacity-40 ${

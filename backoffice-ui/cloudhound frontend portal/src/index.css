@@ -162,12 +162,12 @@ html.giop-theme-transition *::after {
 }
 
 .giop-theme-toggle--light {
-  background: linear-gradient(180deg, #f8f6f1 0%, #ebe6dc 52%, #e2ddd2 100%);
-  border-color: rgba(180, 170, 155, 0.42);
+  background: linear-gradient(180deg, #ffffff 0%, #f1f5f9 52%, #e2e8f0 100%);
+  border-color: rgba(148, 163, 184, 0.45);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.72),
-    inset 0 -2px 4px rgba(148, 138, 122, 0.14),
-    0 2px 6px rgba(15, 23, 42, 0.08);
+    inset 0 1px 0 rgba(255, 255, 255, 0.85),
+    inset 0 -2px 4px rgba(100, 116, 139, 0.1),
+    0 2px 6px rgba(15, 23, 42, 0.06);
 }
 
 .giop-theme-toggle--dark {
@@ -187,10 +187,10 @@ html.giop-theme-transition *::after {
 }
 
 .giop-theme-toggle--light .giop-theme-toggle__well {
-  background: linear-gradient(180deg, rgba(120, 110, 95, 0.1) 0%, rgba(255, 255, 255, 0.08) 55%, rgba(255, 255, 255, 0.18) 100%);
+  background: linear-gradient(180deg, rgba(100, 116, 139, 0.08) 0%, rgba(255, 255, 255, 0.12) 55%, rgba(255, 255, 255, 0.22) 100%);
   box-shadow:
-    inset 0 2px 4px rgba(120, 110, 95, 0.16),
-    inset 0 -1px 0 rgba(255, 255, 255, 0.55);
+    inset 0 2px 4px rgba(100, 116, 139, 0.12),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.65);
 }
 
 .giop-theme-toggle__ambient {
@@ -202,8 +202,8 @@ html.giop-theme-transition *::after {
   opacity: 1;
   background: radial-gradient(
     circle at 22% 50%,
-    rgba(143, 164, 184, 0.28) 0%,
-    rgba(143, 164, 184, 0.08) 34%,
+    rgba(255, 255, 255, 0.1) 0%,
+    rgba(255, 255, 255, 0.03) 34%,
     transparent 62%
   );
 }
@@ -212,8 +212,8 @@ html.giop-theme-transition *::after {
   opacity: 1;
   background: radial-gradient(
     circle at 78% 50%,
-    rgba(251, 191, 36, 0.22) 0%,
-    rgba(251, 191, 36, 0.07) 34%,
+    rgba(100, 116, 139, 0.12) 0%,
+    rgba(100, 116, 139, 0.04) 34%,
     transparent 62%
   );
 }
@@ -234,30 +234,30 @@ html.giop-theme-transition *::after {
 }
 
 .giop-theme-toggle__led--on.giop-theme-toggle__led--left {
-  background: #8fa4b8;
-  box-shadow: 0 0 5px rgba(143, 164, 184, 0.75);
+  background: #858585;
+  box-shadow: 0 0 4px rgba(255, 255, 255, 0.25);
 }
 
 .giop-theme-toggle--light .giop-theme-toggle__led--on.giop-theme-toggle__led--right {
-  background: #d4a24a;
-  box-shadow: 0 0 5px rgba(212, 162, 74, 0.65);
+  background: #64748b;
+  box-shadow: 0 0 4px rgba(100, 116, 139, 0.35);
 }
 
 .giop-theme-toggle__fill--warm {
   background: linear-gradient(
     90deg,
-    rgba(212, 162, 74, 0.2) 0%,
-    rgba(212, 162, 74, 0.07) 72%,
-    rgba(212, 162, 74, 0) 100%
+    rgba(100, 116, 139, 0.14) 0%,
+    rgba(100, 116, 139, 0.05) 72%,
+    rgba(100, 116, 139, 0) 100%
   );
 }
 
 .giop-theme-toggle__fill--cool {
   background: linear-gradient(
     90deg,
-    rgba(143, 164, 184, 0.18) 0%,
-    rgba(143, 164, 184, 0.06) 72%,
-    rgba(143, 164, 184, 0) 100%
+    rgba(255, 255, 255, 0.12) 0%,
+    rgba(255, 255, 255, 0.04) 72%,
+    rgba(255, 255, 255, 0) 100%
   );
 }
 
@@ -269,24 +269,24 @@ html.giop-theme-transition *::after {
 
 .giop-theme-toggle__knob--light {
   background:
-    radial-gradient(circle at 32% 28%, #ffffff 0%, #f4f1ea 18%, #d8d2c6 52%, #b8b0a2 100%);
-  border: 1px solid rgba(255, 255, 255, 0.82);
+    radial-gradient(circle at 32% 28%, #ffffff 0%, #f8fafc 18%, #e2e8f0 52%, #cbd5e1 100%);
+  border: 1px solid rgba(255, 255, 255, 0.9);
   box-shadow:
-    0 3px 7px rgba(15, 23, 42, 0.16),
-    0 1px 2px rgba(15, 23, 42, 0.08),
-    inset 0 -2px 4px rgba(120, 110, 95, 0.18),
+    0 3px 7px rgba(15, 23, 42, 0.12),
+    0 1px 2px rgba(15, 23, 42, 0.06),
+    inset 0 -2px 4px rgba(100, 116, 139, 0.14),
     inset 0 1px 0 rgba(255, 255, 255, 0.95);
 }
 
 .giop-theme-toggle__knob--dark {
   background:
-    radial-gradient(circle at 34% 30%, #ffffff 0%, #eef2f7 16%, #c8d0db 48%, #8e98a8 100%);
-  border: 1px solid rgba(255, 255, 255, 0.55);
+    radial-gradient(circle at 34% 30%, #ffffff 0%, #e5e5e5 16%, #a3a3a3 48%, #737373 100%);
+  border: 1px solid rgba(255, 255, 255, 0.45);
   box-shadow:
     0 4px 10px rgba(0, 0, 0, 0.42),
     0 1px 2px rgba(0, 0, 0, 0.28),
-    inset 0 -2px 5px rgba(60, 70, 85, 0.35),
-    inset 0 1px 0 rgba(255, 255, 255, 0.82);
+    inset 0 -2px 5px rgba(0, 0, 0, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.75);
 }
 
 .giop-theme-toggle__knob-shine {
@@ -310,17 +310,21 @@ html.giop-theme-transition .giop-theme-toggle__knob {
 }
 
 .giop-theme-toggle__label--light {
-  color: #8a7d68;
-  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.45);
+  color: var(--giop-muted);
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.5);
 }
 
 .giop-theme-toggle__label--dark {
-  color: #a8b4c4;
+  color: #858585;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
 }
 
+.giop-theme-toggle__sun-icon {
+  color: var(--giop-muted);
+}
+
 .giop-theme-toggle--dark .giop-theme-toggle__label--dark {
-  color: #b8c4d4;
+  color: var(--giop-text-secondary);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -538,6 +542,66 @@ html.giop-theme-transition .giop-theme-toggle__knob {
 .giop-map-spotlight__filter-btn--active {
   color: #0ea5e9;
   border-color: rgba(14, 165, 233, 0.45);
+}
+
+.giop-map-spotlight__voice-btn {
+  position: relative;
+  overflow: hidden;
+  padding: 0;
+}
+
+.giop-map-spotlight__voice-canvas {
+  width: 34px;
+  height: 28px;
+  display: block;
+  pointer-events: none;
+}
+
+.giop-map-spotlight__voice-btn--active {
+  border-color: rgba(192, 132, 252, 0.55);
+  box-shadow: 0 0 0 3px rgba(192, 132, 252, 0.14);
+}
+
+.giop-voice-dock {
+  display: block;
+  /* Canvas is much larger than the visible ribbon so peaks and idle motion
+     never touch an edge — the wave floats freely over the map. */
+  width: 224px;
+  height: 148px;
+  padding: 0;
+  margin: 0;
+  box-sizing: border-box;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  overflow: visible;
+  appearance: none;
+  -webkit-appearance: none;
+  outline: none;
+  box-shadow: none;
+  filter: none;
+  opacity: 1;
+}
+
+.giop-voice-dock--passive {
+  cursor: default;
+  pointer-events: none;
+}
+
+.giop-voice-dock:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.giop-voice-dock__canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+}
+
+.giop-copilot-fab-slot {
+  pointer-events: auto;
 }
 
 .giop-map-spotlight__panel {

@@ -209,9 +209,9 @@ export function GiopThemeToggle({ isLightMode, onThemeChange }: GiopThemeToggleP
           transition={{ duration: reduceMotion ? 0.01 : 0.32, ease: TOGGLE_EASE }}
         >
           {visualLight ? (
-            <Sun className="h-3.5 w-3.5 text-amber-700/85" strokeWidth={2.1} />
+            <Sun className="giop-theme-toggle__sun-icon h-3.5 w-3.5" strokeWidth={2.1} />
           ) : (
-            <MoonStarsIcon className="h-3.5 w-3.5 text-slate-600/90" />
+            <MoonStarsIcon className="h-3.5 w-3.5 text-neutral-500" />
           )}
         </motion.span>
       </motion.span>
