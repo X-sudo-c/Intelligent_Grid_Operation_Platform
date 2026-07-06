@@ -203,6 +203,171 @@ def _aggregate_cells(conn, table: str, bbox, res: int, scan_limit: int) -> dict[
     return counts
 
 
+def _aggregate_cells_national(
+    conn,
+    table: str,
+    res: int,
+    scan_limit: int,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT ST_Y(geom) AS lat, ST_X(geom) AS lng
+            FROM {table}
+            WHERE geom IS NOT NULL
+            LIMIT %s
+            """,
+            (scan_limit,),
+        )
+        for lat, lng in cur.fetchall():
+            if lat is None or lng is None:
+                continue
+            cell = h3x.latlng_to_cell(lat, lng, res)
+            counts[cell] = counts.get(cell, 0) + 1
+    return counts
+
+
+def h3_rebuild_coverage_row_count(conn, resolution: int | None = None) -> int:
+    with conn.cursor() as cur:
+        if resolution is None:
+            cur.execute("SELECT COUNT(*) FROM public.h3_rebuild_coverage")
+        else:
+            cur.execute(
+                "SELECT COUNT(*) FROM public.h3_rebuild_coverage WHERE resolution = %s",
+                (resolution,),
+            )
+        return int(cur.fetchone()[0])
+
+
+def fetch_coverage_from_table(
+    conn,
+    *,
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+    res: int,
+) -> dict[str, Any] | None:
+    """BBox coverage from pre-aggregated Martin table. None when table empty for res."""
+    if h3_rebuild_coverage_row_count(conn, res) == 0:
+        return None
+    assignments = _assignment_lookup(conn, res)
+    features: list[dict[str, Any]] = []
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+              h3_index,
+              resolution,
+              verified_count,
+              staged_count,
+              reference_count,
+              ST_AsGeoJSON(geom)::json AS geom_json
+            FROM public.h3_rebuild_coverage
+            WHERE resolution = %s
+              AND geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
+            """,
+            (res, west, south, east, north),
+        )
+        rows = cur.fetchall()
+    for h3_index, resolution, verified, staged, reference, geom_json in rows:
+        assignment = assignments.get(h3_index, {})
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": geom_json,
+                "properties": {
+                    "h3": h3_index,
+                    "resolution": resolution,
+                    "verified_count": int(verified or 0),
+                    "staged_count": int(staged or 0),
+                    "reference_count": int(reference or 0),
+                    "assigned_to": assignment.get("assigned_to"),
+                    "status": assignment.get("status"),
+                },
+            }
+        )
+    return {
+        "type": "FeatureCollection",
+        "resolution": res,
+        "features": features,
+        "cell_count": len(features),
+        "source": "h3_rebuild_coverage_table",
+    }
+
+
+def refresh_h3_rebuild_coverage_table(
+    conn,
+    *,
+    resolutions: Iterable[int] = (6, 7, 8, 9),
+    scan_limit: int = 2_000_000,
+    include_reference: bool = True,
+) -> dict[str, Any]:
+    """Rebuild public.h3_rebuild_coverage for Martin tiles (national aggregate)."""
+    if not h3x.H3_AVAILABLE:
+        raise RuntimeError(h3x.H3_IMPORT_ERROR or "h3 not installed")
+
+    res_list = [h3x.clamp_resolution(r) for r in resolutions]
+    inserted = 0
+    with conn.cursor() as cur:
+        cur.execute("TRUNCATE public.h3_rebuild_coverage")
+
+    for res in res_list:
+        verified = _aggregate_cells_national(
+            conn, "public.connectivity_nodes", res, scan_limit
+        )
+        staged = _aggregate_cells_national(
+            conn, "staging.connectivity_nodes", res, scan_limit
+        )
+        reference: dict[str, int] = {}
+        if include_reference:
+            try:
+                reference = _aggregate_cells_national(
+                    conn, "gis.asset_id_map", res, scan_limit
+                )
+            except Exception:
+                reference = {}
+
+        all_cells = set(verified) | set(staged) | set(reference)
+        batch: list[tuple[Any, ...]] = []
+        for cell in all_cells:
+            wkt = h3x.cell_to_polygon_wkt(cell)
+            if not wkt:
+                continue
+            batch.append(
+                (
+                    cell,
+                    res,
+                    verified.get(cell, 0),
+                    staged.get(cell, 0),
+                    reference.get(cell, 0),
+                    wkt,
+                )
+            )
+        if not batch:
+            continue
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO public.h3_rebuild_coverage (
+                  h3_index, resolution, verified_count, staged_count, reference_count, geom
+                )
+                VALUES (
+                  %s, %s, %s, %s, %s, ST_SetSRID(ST_GeomFromText(%s), 4326)
+                )
+                """,
+                batch,
+            )
+        inserted += len(batch)
+    conn.commit()
+    return {
+        "status": "ok",
+        "resolutions": res_list,
+        "rows": inserted,
+    }
+
+
 def fetch_coverage(
     conn,
     *,
@@ -220,6 +385,16 @@ def fetch_coverage(
     staged_count   = field captures awaiting validation
     reference_count = original (inaccurate) GIS import, as a target/yardstick
     """
+    from_table = fetch_coverage_from_table(
+        conn, west=west, south=south, east=east, north=north, res=res
+    )
+    if from_table is not None:
+        if not include_reference:
+            for feature in from_table.get("features") or []:
+                props = feature.get("properties") or {}
+                props["reference_count"] = 0
+        return from_table
+
     bbox = (west, south, east, north)
 
     verified = _aggregate_cells(conn, "public.connectivity_nodes", bbox, res, scan_limit)

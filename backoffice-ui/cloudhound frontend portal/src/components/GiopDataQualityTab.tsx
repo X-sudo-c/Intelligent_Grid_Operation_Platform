@@ -16,8 +16,9 @@ import {
   runDqChecks,
   runTopologyDqScan,
   runValidationCycle,
+  getActiveTopologyScan,
+  type GiopTopologyScanProgress,
   type GiopValidationProgress,
-  listTopologyDqRuns,
   type GiopAgentsStatus,
   type GiopApprovalRequest,
   type GiopTopologyProposal,
@@ -65,6 +66,9 @@ import {
   collectDuplicatePhotos,
 } from '../lib/giopDqDuplicateDiff';
 import { DUPLICATE_CLUSTER_ZOOM } from '../lib/giopMapLayers';
+import { GiopImportQueuePanel } from './GiopImportQueuePanel';
+import { TopologyScanModal } from './TopologyScanModal';
+import { useTopologyScanProgress } from '../hooks/useTopologyScanProgress';
 
 function topoSummaryCacheKey(tier: DqDataTier, mode: 'snapshot' | 'live'): string {
   return `dq-topology-summary:${tier}:${mode}`;
@@ -167,6 +171,10 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [releaseBusyMrid, setReleaseBusyMrid] = useState<string | null>(null);
   const [scanBusy, setScanBusy] = useState(false);
+  const [scanRunId, setScanRunId] = useState<string | null>(null);
+  const [scanModalOpen, setScanModalOpen] = useState(false);
+  const [scanStartedMs, setScanStartedMs] = useState(0);
+  const scanTerminalHandledRef = useRef<string | null>(null);
   const [validationBusy, setValidationBusy] = useState(false);
   const [validationModalOpen, setValidationModalOpen] = useState(false);
   const [validationRunId, setValidationRunId] = useState<string | null>(null);
@@ -204,27 +212,19 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
     }
   }, []);
 
-  const load = useCallback(async () => {
+  const loadQueue = useCallback(async () => {
     setLoading(true);
     try {
-      const [pageData, pending, readyToPublish, kpiSnap] = await Promise.all([
-        listDqQueue({
-          status: statusFilter === 'ALL' ? undefined : statusFilter,
-          duplicatesOnly,
-          severity: severityFilter || undefined,
-          domain: domainFilter || undefined,
-          limit: pageSize,
-          offset: page * pageSize,
-        }),
-        listPendingApprovals().catch(() => []),
-        listApprovedProposals().catch(() => []),
-        getLatestKpis().catch(() => null),
-      ]);
+      const pageData = await listDqQueue({
+        status: statusFilter === 'ALL' ? undefined : statusFilter,
+        duplicatesOnly,
+        severity: severityFilter || undefined,
+        domain: domainFilter || undefined,
+        limit: pageSize,
+        offset: page * pageSize,
+      });
       setQueueItems(Array.isArray(pageData.items) ? pageData.items : []);
       setTotalQueueItems(pageData.total ?? 0);
-      setApprovals(pending);
-      setApprovedProposals(readyToPublish);
-      setKpis(kpiSnap);
     } catch (err) {
       setStatus(err instanceof Error ? err.message : 'Failed to load staging queue');
       setQueueItems([]);
@@ -233,6 +233,25 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
       setLoading(false);
     }
   }, [statusFilter, duplicatesOnly, severityFilter, domainFilter, page, pageSize]);
+
+  const loadExtras = useCallback(async () => {
+    try {
+      const [pending, readyToPublish, kpiSnap] = await Promise.all([
+        listPendingApprovals().catch(() => []),
+        listApprovedProposals().catch(() => []),
+        getLatestKpis().catch(() => null),
+      ]);
+      setApprovals(pending);
+      setApprovedProposals(readyToPublish);
+      setKpis(kpiSnap);
+    } catch {
+      /* sidebar extras are non-blocking */
+    }
+  }, []);
+
+  const load = useCallback(async () => {
+    await Promise.all([loadQueue(), loadExtras()]);
+  }, [loadQueue, loadExtras]);
 
   useEffect(() => {
     setPage(0);
@@ -320,9 +339,82 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
     }
   }, []);
 
+  const handleScanComplete = useCallback(
+    async (progress: GiopTopologyScanProgress) => {
+      if (scanTerminalHandledRef.current === progress.run_id) return;
+      scanTerminalHandledRef.current = progress.run_id;
+      if (progress.status === 'completed') {
+        setStatus(
+          `Scan complete: ${(progress.orphans_found ?? 0).toLocaleString()} orphans, ` +
+            `${(progress.dangling_found ?? 0).toLocaleString()} dangling, ` +
+            `${(progress.auto_cleared ?? 0).toLocaleString()} auto-cleared`,
+        );
+        clearSwCache(topoSummaryCacheKey('master', 'snapshot'));
+        await Promise.all([load(), loadTopo('master'), loadSummaryForTier('master')]);
+      } else if (progress.status === 'failed') {
+        setStatus(progress.error_message ?? 'Topology scan failed');
+      }
+      setScanBusy(false);
+    },
+    [load, loadTopo, loadSummaryForTier],
+  );
+
+  const {
+    progress: scanProgress,
+    pollError: scanPollError,
+    reset: resetScanProgress,
+  } = useTopologyScanProgress(scanRunId, Boolean(scanRunId), (p) => {
+    void handleScanComplete(p);
+  });
+
+  const beginTopologyScan = useCallback(async () => {
+    if (scanBusy && scanRunId) {
+      setScanModalOpen(true);
+      return;
+    }
+    setScanBusy(true);
+    scanTerminalHandledRef.current = null;
+    resetScanProgress();
+    try {
+      const queued = await runTopologyDqScan();
+      setScanRunId(queued.run_id);
+      setScanStartedMs(Date.now());
+      setScanModalOpen(true);
+      const estMin = Math.max(1, Math.ceil((queued.estimate_seconds ?? 420) / 60));
+      setStatus(
+        queued.message ??
+          `Scan ${queued.run_id.slice(0, 8)}… running (~${estMin} min estimated)`,
+      );
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : 'Topology scan failed');
+      setScanBusy(false);
+    }
+  }, [scanBusy, scanRunId, resetScanProgress]);
+
   useEffect(() => {
-    void load();
-  }, [load]);
+    void (async () => {
+      try {
+        const { active } = await getActiveTopologyScan();
+        if (active?.run_id && active.status === 'running') {
+          setScanRunId(active.run_id);
+          setScanStartedMs(
+            active.started_at ? new Date(active.started_at).getTime() : Date.now(),
+          );
+          setScanBusy(true);
+        }
+      } catch {
+        /* non-blocking */
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    void loadQueue();
+  }, [loadQueue]);
+
+  useEffect(() => {
+    void loadExtras();
+  }, [loadExtras]);
 
   useEffect(() => {
     void loadTopo(dqTier);
@@ -578,35 +670,16 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
     return null;
   };
 
-  const handleTopologyScan = async () => {
-    setScanBusy(true);
-    setStatus('Queuing master topology scan (Ghana bbox)…');
-    try {
-      const queued = await runTopologyDqScan();
-      setStatus(`Scan ${queued.run_id.slice(0, 8)}… running (may take several minutes)`);
-      for (let i = 0; i < 120; i += 1) {
-        await new Promise((r) => window.setTimeout(r, 5000));
-        const runs = await listTopologyDqRuns(5);
-        const run = runs.find((r) => r.id === queued.run_id);
-        if (!run || run.status === 'running') continue;
-        if (run.status === 'failed') {
-          setStatus(run.error_message ?? 'Topology scan failed');
-          break;
-        }
-        setStatus(
-          `Scan complete: ${run.orphans_found.toLocaleString()} orphans, ` +
-            `${run.dangling_found.toLocaleString()} dangling, ` +
-            `${run.auto_cleared.toLocaleString()} auto-cleared`,
-        );
-        clearSwCache(topoSummaryCacheKey('master', 'snapshot'));
-        await Promise.all([load(), loadTopo('master'), loadSummaryForTier('master')]);
-        break;
-      }
-    } catch (err) {
-      setStatus(err instanceof Error ? err.message : 'Topology scan failed');
-    } finally {
-      setScanBusy(false);
+  const handleTopologyScan = () => {
+    void beginTopologyScan();
+  };
+
+  const handleRefreshLive = () => {
+    if (dqTier === 'master') {
+      void beginTopologyScan();
+      return;
     }
+    void loadTopo(dqTier, 'live');
   };
 
   const validationBadgeClass = (validation?: string): string => {
@@ -1044,7 +1117,20 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
         onRunInBackground={handleValidationRunInBackground}
       />
 
-      <div className="shrink-0 px-3 pt-3 pb-2 space-y-2 border-b border-slate-200/70 dark:border-premium-border/45">
+      {scanRunId && (
+        <TopologyScanModal
+          open={scanModalOpen}
+          runId={scanRunId}
+          isLightMode={isLightMode}
+          localStartedMs={scanStartedMs}
+          progress={scanProgress}
+          pollError={scanPollError}
+          onClose={() => setScanModalOpen(false)}
+          onRunInBackground={() => setScanModalOpen(false)}
+        />
+      )}
+
+      <div className="shrink-0 px-3 pt-3 pb-2 border-b border-slate-200/70 dark:border-premium-border/45">
       <DqTierMetricsPanel
         tier={dqTier}
         onTierChange={setDqTier}
@@ -1055,9 +1141,16 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
         topoRevalidating={topoRevalidating}
         topoLiveBusy={topoLiveBusy}
         scanBusy={scanBusy}
-        onRefreshLive={() => void loadTopo(dqTier, 'live')}
-        onRunTopologyScan={() => void handleTopologyScan()}
+        scanProgress={scanProgress}
+        scanPollError={scanPollError}
+        scanStartedMs={scanStartedMs}
+        onRefreshLive={handleRefreshLive}
+        onRunTopologyScan={handleTopologyScan}
       />
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-3 pb-4 pt-2 space-y-2">
+      <GiopImportQueuePanel isLightMode={isLightMode} enabled={dqTier === 'master'} />
 
       {(kpis || approvals.length > 0 || approvedProposals.length > 0 || validationBusy) && (
         <details
@@ -1259,6 +1352,13 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
         </details>
       )}
 
+      <div
+        className={`sticky top-0 z-10 -mx-3 px-3 py-2 border-b backdrop-blur-sm ${
+          isLightMode
+            ? 'bg-white/95 border-slate-200/80'
+            : 'bg-premium-bg/95 border-premium-border/45'
+        }`}
+      >
       <DqQueueToolbar
         isLightMode={isLightMode}
         statusFilter={statusFilter}
@@ -1269,7 +1369,7 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
         onDuplicatesOnlyChange={setDuplicatesOnly}
         onSeverityFilterChange={setSeverityFilter}
         onDomainFilterChange={setDomainFilter}
-        onRefresh={() => void load()}
+        onRefresh={() => void loadQueue()}
         loading={loading}
         statusMessage={status || undefined}
         page={page}
@@ -1280,13 +1380,16 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
       />
       </div>
 
-      <div className="flex-1 min-h-0 overflow-y-auto px-3 pb-3 pt-2 space-y-2">
       {loading && (
-        <p className="text-sm text-slate-500 py-2">Loading staging queue…</p>
+        <p className="text-sm text-slate-500 py-2">
+          {dqTier === 'master' ? 'Loading exception queue…' : 'Loading staging queue…'}
+        </p>
       )}
       {!loading && queueItems.length === 0 && (
         <p className="text-sm text-slate-500">
-          No staging captures in the DQ queue. Field submissions appear here as PENDING_FIELD.
+          {dqTier === 'master'
+            ? 'No open topology exceptions in the master queue.'
+            : 'No staging captures in the DQ queue. Field submissions appear here as PENDING_FIELD.'}
         </p>
       )}
 

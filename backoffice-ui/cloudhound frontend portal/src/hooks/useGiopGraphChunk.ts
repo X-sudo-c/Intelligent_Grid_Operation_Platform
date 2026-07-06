@@ -8,10 +8,25 @@ export interface MapBbox {
   north: number;
 }
 
-function bboxKey(bbox: MapBbox, zoom: number): string {
+export interface UseGiopGraphChunkOptions {
+  /** Warm four adjacent viewport caches after each fetch (off by default — heavy on DB). */
+  prefetchNeighbors?: boolean;
+  /** Debounce rapid map pans before hitting /graph/chunk (ms). */
+  debounceMs?: number;
+}
+
+function bboxKey(bbox: MapBbox, zoom: number, traceStartMrid?: string): string {
   const precision = zoom >= 14 ? 4 : zoom >= 12 ? 3 : 2;
   const round = (n: number) => n.toFixed(precision);
-  return `${round(bbox.west)}:${round(bbox.south)}:${round(bbox.east)}:${round(bbox.north)}:${zoom}`;
+  const traceKey = traceStartMrid ? `:t:${traceStartMrid}` : '';
+  return `${round(bbox.west)}:${round(bbox.south)}:${round(bbox.east)}:${round(bbox.north)}:${zoom}${traceKey}`;
+}
+
+/** Mid-zoom overlay only (Martin detail covers z14+); keep payloads small. */
+function edgeLimitForZoom(zoom: number): number {
+  if (zoom >= 13.5) return 4000;
+  if (zoom >= 12) return 3000;
+  return 2000;
 }
 
 function neighborBboxes(bbox: MapBbox): MapBbox[] {
@@ -31,31 +46,58 @@ function neighborBboxes(bbox: MapBbox): MapBbox[] {
   }));
 }
 
-async function fetchChunk(bbox: MapBbox, startMrid?: string): Promise<GiopGraphChunkResponse> {
+async function fetchChunk(
+  bbox: MapBbox,
+  zoom: number,
+  traceStartMrid?: string,
+): Promise<GiopGraphChunkResponse> {
   return getGraphChunk({
     west: bbox.west,
     south: bbox.south,
     east: bbox.east,
     north: bbox.north,
-    startMrid,
+    edgeLimit: edgeLimitForZoom(zoom),
+    startMrid: traceStartMrid,
   });
 }
 
-export function useGiopGraphChunk(startMrid?: string) {
+export function useGiopGraphChunk(
+  traceStartMrid?: string,
+  cacheEpoch = 0,
+  options: UseGiopGraphChunkOptions = {},
+) {
+  const prefetchEnabled = options.prefetchNeighbors === true;
+  const debounceMs = options.debounceMs ?? 400;
   const [chunk, setChunk] = useState<GiopGraphChunkResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const cacheRef = useRef<Map<string, GiopGraphChunkResponse>>(new Map());
   const requestIdRef = useRef(0);
-  const startMridRef = useRef(startMrid);
-  startMridRef.current = startMrid;
+  const inFlightRef = useRef(0);
+  const debounceTimerRef = useRef<number | undefined>(undefined);
+  const traceStartMridRef = useRef(traceStartMrid);
+  traceStartMridRef.current = traceStartMrid;
+
+  useEffect(() => {
+    cacheRef.current.clear();
+    setChunk(null);
+  }, [traceStartMrid, cacheEpoch]);
+
+  useEffect(() => {
+    return () => {
+      if (debounceTimerRef.current !== undefined) {
+        window.clearTimeout(debounceTimerRef.current);
+      }
+    };
+  }, []);
 
   const prefetchNeighbors = useCallback((bbox: MapBbox, zoom: number) => {
+    if (!prefetchEnabled) return;
     const run = () => {
       for (const neighbor of neighborBboxes(bbox)) {
-        const key = bboxKey(neighbor, zoom);
+        const key = bboxKey(neighbor, zoom, traceStartMridRef.current);
         if (cacheRef.current.has(key)) continue;
-        void fetchChunk(neighbor, startMridRef.current)
+        void fetchChunk(neighbor, zoom, traceStartMridRef.current)
           .then((data) => {
             cacheRef.current.set(key, data);
             if (cacheRef.current.size > 32) {
@@ -71,24 +113,26 @@ export function useGiopGraphChunk(startMrid?: string) {
     } else {
       setTimeout(run, 100);
     }
-  }, []);
+  }, [prefetchEnabled]);
 
-  const loadBbox = useCallback(
+  const loadBboxImmediate = useCallback(
     async (bbox: MapBbox, zoom: number) => {
-      const key = bboxKey(bbox, zoom);
+      const key = bboxKey(bbox, zoom, traceStartMridRef.current);
       const cached = cacheRef.current.get(key);
       if (cached) {
         setChunk(cached);
         setError(null);
+        setLoading(false);
         prefetchNeighbors(bbox, zoom);
         return;
       }
 
       const requestId = ++requestIdRef.current;
+      inFlightRef.current += 1;
       setLoading(true);
       setError(null);
       try {
-        const data = await fetchChunk(bbox, startMridRef.current);
+        const data = await fetchChunk(bbox, zoom, traceStartMridRef.current);
         if (requestId !== requestIdRef.current) return;
 
         cacheRef.current.set(key, data);
@@ -103,7 +147,8 @@ export function useGiopGraphChunk(startMrid?: string) {
         setError(err instanceof Error ? err.message : 'Failed to load map chunk');
         setChunk(null);
       } finally {
-        if (requestId === requestIdRef.current) {
+        inFlightRef.current = Math.max(0, inFlightRef.current - 1);
+        if (requestId === requestIdRef.current && inFlightRef.current === 0) {
           setLoading(false);
         }
       }
@@ -111,10 +156,23 @@ export function useGiopGraphChunk(startMrid?: string) {
     [prefetchNeighbors],
   );
 
-  useEffect(() => {
-    cacheRef.current.clear();
-    setChunk(null);
-  }, [startMrid]);
+  const loadBbox = useCallback(
+    (bbox: MapBbox, zoom: number) => {
+      if (debounceMs <= 0) {
+        void loadBboxImmediate(bbox, zoom);
+        return;
+      }
+      if (debounceTimerRef.current !== undefined) {
+        window.clearTimeout(debounceTimerRef.current);
+      }
+      setLoading(true);
+      debounceTimerRef.current = window.setTimeout(() => {
+        debounceTimerRef.current = undefined;
+        void loadBboxImmediate(bbox, zoom);
+      }, debounceMs);
+    },
+    [debounceMs, loadBboxImmediate],
+  );
 
   return { chunk, loading, error, loadBbox };
 }

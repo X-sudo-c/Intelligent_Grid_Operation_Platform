@@ -8,6 +8,8 @@ import {
   isGiopLegendGroupVisible,
   type GiopLegendGroup,
   type GiopLegendVisibilityState,
+  NETWORK_GEOMETRY_MODE_META,
+  type NetworkGeometryMode,
 } from '../lib/giopMapLayers';
 
 interface GiopMapLegendProps {
@@ -16,6 +18,7 @@ interface GiopMapLegendProps {
   mapZoom: number;
   mapReady?: boolean;
   includeGisOverview?: boolean;
+  geometryMode?: NetworkGeometryMode;
 }
 
 function LegendSwatch({ entry }: { entry: GiopLegendGroup }) {
@@ -76,6 +79,7 @@ export function GiopMapLegend({
   mapZoom,
   mapReady = true,
   includeGisOverview = false,
+  geometryMode = 'both',
 }: GiopMapLegendProps) {
   const groups = useMemo(
     () => buildGiopLegendGroups(isLightMode, { includeGisOverview }),
@@ -96,8 +100,11 @@ export function GiopMapLegend({
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
-    applyGiopLegendVisibility(map, visibility);
-  }, [mapRef, mapReady, visibility]);
+    applyGiopLegendVisibility(map, visibility, {
+      geometryMode,
+      gisOverviewAvailable: includeGisOverview,
+    });
+  }, [mapRef, mapReady, visibility, geometryMode, includeGisOverview]);
 
   const handleRowDoubleClick = useCallback(
     (group: GiopLegendGroup) => {
@@ -125,6 +132,16 @@ export function GiopMapLegend({
       </div>
       <p className="mb-2 text-[10px] opacity-50 leading-snug">
         Double-click a layer to show or hide at this zoom.
+        {(geometryMode === 'both' || geometryMode === 'gis') && (
+          <>
+            {' '}
+            <span className={geometryMode === 'both' ? 'text-fuchsia-600 dark:text-fuchsia-400' : ''}>
+              {geometryMode === 'both'
+                ? 'Compare: magenta = GIS import · SLD colors = master.'
+                : 'GIS import geometry (magenta) shown through street zoom.'}
+            </span>
+          </>
+        )}
       </p>
       <ul className="space-y-1">
         {groups.map((group) => {

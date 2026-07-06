@@ -38,7 +38,10 @@ export function useGiopFieldTechnicians({
       return;
     }
     inFlightRef.current = true;
-    setLoading(true);
+    const isInitialLoad = lastPayloadRef.current === null;
+    if (isInitialLoad) {
+      setLoading(true);
+    }
     setError(null);
     try {
       do {
@@ -56,7 +59,9 @@ export function useGiopFieldTechnicians({
       } while (rerunQueuedRef.current);
     } finally {
       inFlightRef.current = false;
-      setLoading(false);
+      if (isInitialLoad) {
+        setLoading(false);
+      }
     }
   }, [enabled, staleMinutes]);
 

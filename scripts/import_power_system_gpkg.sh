@@ -113,6 +113,12 @@ psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -q -c \
   "GRANT SELECT ON ALL TABLES IN SCHEMA gis TO anon, authenticated, service_role;"
 
 echo
+echo "==> Clearing map/graph Redis cache"
+curl -sf -X POST "http://127.0.0.1:${SYNC_PORT:-5000}/api/v1/map/invalidate-cache" >/dev/null \
+  && echo "    cache cleared" \
+  || echo "    WARN: sync-service cache clear failed (is it running on :5000?)"
+
+echo
 echo "Done. Summary:"
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -c \
   "SELECT target_table, feature_count, duration_ms, imported_at

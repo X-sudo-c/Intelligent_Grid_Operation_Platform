@@ -2,6 +2,7 @@ import type { GiopTopologyPayload } from '../api/giop-api';
 
 function edgeLineCoordinates(
   edge: GiopTopologyPayload['edges'][number],
+  coordByMrid?: Map<string, [number, number]>,
 ): [number, number][] | null {
   if (edge.coordinates && edge.coordinates.length >= 2) {
     return edge.coordinates;
@@ -9,11 +10,11 @@ function edgeLineCoordinates(
   const source =
     edge.source_lon != null && edge.source_lat != null
       ? ([edge.source_lon, edge.source_lat] as [number, number])
-      : undefined;
+      : coordByMrid?.get(edge.source ?? '');
   const target =
     edge.target_lon != null && edge.target_lat != null
       ? ([edge.target_lon, edge.target_lat] as [number, number])
-      : undefined;
+      : coordByMrid?.get(edge.target ?? '');
   if (!source || !target) return null;
   return [source, target];
 }
@@ -28,6 +29,19 @@ export function topologyImpactToGeoJson(payload: GiopTopologyPayload | null) {
 
   const nodeList = Array.isArray(payload.nodes) ? payload.nodes : [];
   const edgeList = Array.isArray(payload.edges) ? payload.edges : [];
+
+  const coordByMrid = new Map<string, [number, number]>();
+  for (const node of nodeList) {
+    const lon =
+      (node as { longitude?: number }).longitude ??
+      (node as { lon?: number }).lon;
+    const lat =
+      (node as { latitude?: number }).latitude ??
+      (node as { lat?: number }).lat;
+    if (lon != null && lat != null && node.mrid) {
+      coordByMrid.set(node.mrid, [lon, lat]);
+    }
+  }
 
   const nodes = {
     type: 'FeatureCollection' as const,
@@ -60,7 +74,7 @@ export function topologyImpactToGeoJson(payload: GiopTopologyPayload | null) {
     type: 'FeatureCollection' as const,
     features: edgeList
       .map((edge) => {
-        const coordinates = edgeLineCoordinates(edge);
+        const coordinates = edgeLineCoordinates(edge, coordByMrid);
         if (!coordinates) return null;
         return {
           type: 'Feature' as const,

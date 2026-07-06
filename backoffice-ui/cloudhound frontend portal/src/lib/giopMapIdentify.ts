@@ -49,8 +49,9 @@ export const GIOP_IDENTIFY_LAYERS = [
   'nodes',
   'nodes-transformers-dt',
   'nodes-transformers-pt',
+  'master-transformers-dt',
+  'master-transformers-pt',
   'staging-points',
-  'graph-chunk-nodes-layer',
   'field-technician-points',
   'work-order-pins',
 ] as const;

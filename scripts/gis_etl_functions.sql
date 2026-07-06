@@ -79,79 +79,27 @@ BEGIN
   GET DIAGNOSTICS v_count = ROW_COUNT;
   v_total := v_total + v_count;
 
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = 'gis' AND table_name = 'customer_meter_lvle'
+  ) THEN
+    INSERT INTO gis.asset_id_map (source_layer, source_fid, source_unique_id, mrid, geom)
+    SELECT
+      'customer_meter_lvle',
+      fid,
+      NULLIF(btrim(unique_id), ''),
+      gis.mrid_from_source(gis.source_asset_key('customer_meter_lvle', fid)),
+      gis.as_point(geom)
+    FROM gis.customer_meter_lvle
+    WHERE geom IS NOT NULL
+    ON CONFLICT DO NOTHING;
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    v_total := v_total + v_count;
+  END IF;
+
   RETURN jsonb_build_object('asset_id_map_rows', v_total);
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION gis.promote_transformers_to_cim()
-RETURNS JSONB AS $$
-DECLARE
-  v_dist BIGINT;
-  v_pwr BIGINT;
-BEGIN
-  INSERT INTO public.identified_objects (mrid, name, lifecycle_state, validation)
-  SELECT
-    gis.mrid_from_source(gis.source_asset_key('distribution_transformer', dt.fid)),
-    COALESCE(NULLIF(btrim(dt.asset_name), ''), 'DT ' || COALESCE(NULLIF(btrim(dt.unique_id), ''), dt.fid::text)),
-    'IN_SERVICE',
-    'APPROVED'
-  FROM gis.distribution_transformer dt
-  WHERE dt.geom IS NOT NULL
-  ON CONFLICT (mrid) DO NOTHING;
-
-  INSERT INTO public.connectivity_nodes (mrid, boundary_feeder_id, geom)
-  SELECT
-    gis.mrid_from_source(gis.source_asset_key('distribution_transformer', dt.fid)),
-    NULLIF(btrim(dt.circuit_id), ''),
-    gis.as_point(dt.geom)
-  FROM gis.distribution_transformer dt
-  WHERE dt.geom IS NOT NULL
-  ON CONFLICT (mrid) DO NOTHING;
-
-  GET DIAGNOSTICS v_dist = ROW_COUNT;
-
-  INSERT INTO public.ghana_grid_assets (mrid, operating_utility, substation_name)
-  SELECT
-    gis.mrid_from_source(gis.source_asset_key('distribution_transformer', dt.fid)),
-    'ECG_SOUTHERN',
-    NULLIF(btrim(dt.district), '')
-  FROM gis.distribution_transformer dt
-  WHERE dt.geom IS NOT NULL
-  ON CONFLICT (mrid) DO NOTHING;
-
-  INSERT INTO public.identified_objects (mrid, name, lifecycle_state, validation)
-  SELECT
-    gis.mrid_from_source(gis.source_asset_key('power_transformer', pt.fid)),
-    COALESCE(NULLIF(btrim(pt.asset_name), ''), 'PT ' || COALESCE(NULLIF(btrim(pt.unique_id), ''), pt.fid::text)),
-    'IN_SERVICE',
-    'APPROVED'
-  FROM gis.power_transformer pt
-  WHERE pt.geom IS NOT NULL
-  ON CONFLICT (mrid) DO NOTHING;
-
-  INSERT INTO public.connectivity_nodes (mrid, boundary_feeder_id, geom)
-  SELECT
-    gis.mrid_from_source(gis.source_asset_key('power_transformer', pt.fid)),
-    NULLIF(btrim(pt.circuit_id), ''),
-    gis.as_point(pt.geom)
-  FROM gis.power_transformer pt
-  WHERE pt.geom IS NOT NULL
-  ON CONFLICT (mrid) DO NOTHING;
-
-  GET DIAGNOSTICS v_pwr = ROW_COUNT;
-
-  INSERT INTO public.ghana_grid_assets (mrid, operating_utility, substation_name)
-  SELECT
-    gis.mrid_from_source(gis.source_asset_key('power_transformer', pt.fid)),
-    'ECG_SOUTHERN',
-    NULLIF(btrim(pt.district), '')
-  FROM gis.power_transformer pt
-  WHERE pt.geom IS NOT NULL
-  ON CONFLICT (mrid) DO NOTHING;
-
-  RETURN jsonb_build_object(
-    'distribution_transformers', v_dist,
-    'power_transformers', v_pwr
-  );
-END;
-$$ LANGUAGE plpgsql;
+-- gis.promote_transformers_to_cim() is defined in migration 00082_cim_asset_power_transformer.sql

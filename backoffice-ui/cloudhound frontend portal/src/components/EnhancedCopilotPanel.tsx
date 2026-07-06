@@ -6,6 +6,7 @@ import { useGiopVoiceMode } from '../context/GiopVoiceModeContext';
 import { useGiopMapOverlay } from '../context/GiopMapOverlayContext';
 import { playCopilotSpeech, stopCopilotSpeech } from '../lib/giopVoicePlayback';
 import { buildCopilotContext } from '../lib/giopMapViewport';
+import { tryInstantRelativeZoom } from '../lib/giopRelativeZoom';
 import {
   COPILOT_SUGGESTIONS,
   describeCopilotUiAction,
@@ -180,6 +181,25 @@ export function EnhancedCopilotPanel({
         },
       ]);
       try {
+        const instant = tryInstantRelativeZoom(trimmed, copilotContextForVoice().viewport);
+        if (instant) {
+          onUiAction(instant.action);
+          setMessages((prev) =>
+            prev
+              .filter((m) => m.id !== pendingId)
+              .concat({
+                id: newId(),
+                role: 'assistant',
+                content: instant.speak,
+                actions: ['Map zoom updated'],
+              }),
+          );
+          if (opts?.voice) {
+            await playCopilotSpeech(instant.speak);
+          }
+          return;
+        }
+
         // All turns use voice-turn: transcript normalization, fast-path map
         // commands (highlight/pan/count), then steward chat fallback — no LLM
         // required for simple commands even when typed.
@@ -209,7 +229,7 @@ export function EnhancedCopilotPanel({
         setBusy(false);
       }
     },
-    [busy, portalContext, applyResponse, copilotContextForVoice],
+    [busy, portalContext, applyResponse, copilotContextForVoice, onUiAction],
   );
 
   const voiceMode = useGiopVoiceMode();

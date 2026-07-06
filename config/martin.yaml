@@ -7,6 +7,7 @@ postgres:
   auto_bounds: skip
   pool_size: 10
   auto_publish: false
+  # Clip/simplify geometries per tile — lighter country/mid-zoom Martin payloads.
   tables:
     map_connectivity_nodes:
       schema: public
@@ -20,6 +21,23 @@ postgres:
         boundary_feeder_id: text
         name: text
         validation: text
+    map_power_transformers:
+      schema: public
+      table: map_power_transformers
+      srid: 4326
+      geometry_column: geom
+      geometry_type: POINT
+      bounds: [-3.5, 4.5, 1.5, 8.5]
+      minzoom: 12
+      maxzoom: 16
+      properties:
+        mrid: text
+        connectivity_node_mrid: text
+        transformer_kind: text
+        rated_power_kva: float4
+        boundary_feeder_id: text
+        name: text
+        validation: text
     map_ac_line_segments:
       schema: public
       table: map_ac_line_segments
@@ -27,6 +45,8 @@ postgres:
       geometry_column: geom
       geometry_type: LINESTRING
       bounds: [-3.5, 4.5, 1.5, 8.5]
+      minzoom: 11
+      maxzoom: 16
       properties:
         mrid: text
         nominal_voltage: text
@@ -34,6 +54,7 @@ postgres:
         name: text
         validation: text
         installation_type: text
+        length_m: float4
     ug_cable_33kv:
       schema: gis
       table: ug_cable_33kv
@@ -85,3 +106,18 @@ postgres:
       properties:
         fid: int4
         region: text
+    h3_rebuild_coverage:
+      schema: public
+      table: h3_rebuild_coverage
+      srid: 4326
+      geometry_column: geom
+      geometry_type: POLYGON
+      bounds: [-3.5, 4.5, 1.5, 8.5]
+      minzoom: 0
+      maxzoom: 16
+      properties:
+        h3_index: text
+        resolution: int2
+        verified_count: int4
+        staged_count: int4
+        reference_count: int4

@@ -22,6 +22,17 @@ def _qgis_steps_for_orphan(name: str | None, mrid: str) -> str:
     )
 
 
+def _qgis_steps_for_geom_endpoint(name: str | None, mrid: str) -> str:
+    label = name or mrid
+    return (
+        f"1. Open QGIS and load connectivity nodes + ac_line_segments.\n"
+        f"2. Locate line '{label}' (MRID {mrid}).\n"
+        f"3. Enable snapping to connectivity nodes (≤1 m tolerance).\n"
+        f"4. Move line start/end vertices onto the assigned source/target nodes.\n"
+        f"5. Save and re-run topology validation in the portal."
+    )
+
+
 def generate_cleanup_plan(conn, exception_id: str) -> CleanupPlan:
     exc = tools.tool_get_exception(conn, exception_id)
     if not exc:
@@ -43,6 +54,20 @@ def generate_cleanup_plan(conn, exception_id: str) -> CleanupPlan:
             rollback_sql=(
                 "-- Rollback: restore line endpoints from audit snapshot before repair execution"
             ),
+        )
+    if rule in ("TOPO_LINE_ENDPOINT_GEOM_MISMATCH", "TOPO_GEOM_DANGLING_ENDPOINT"):
+        return CleanupPlan(
+            mode=CleanupMode.ASSISTED,
+            target_mrid=mrid,
+            exception_id=exception_id,
+            steps=[
+                "Run repair_asset_topology_and_attributes dry-run (snaps geom to nodes)",
+                "Review endpoint distance in exception details",
+                "Execute repair after steward approval",
+            ],
+            risk="medium",
+            qgis_steps=_qgis_steps_for_geom_endpoint(exc.get("asset_name"), mrid),
+            rollback_sql="-- Rollback: restore line geometry from audit snapshot",
         )
     return CleanupPlan(
         mode=CleanupMode.MANUAL,

@@ -56,7 +56,7 @@ _ASSET_ALIASES: dict[str, str] = {
 
 @dataclass
 class VoiceIntent:
-    kind: str  # count | highlight | pan | zoom_map | trace_feeder | trace_connection_path | work_orders_in_view | inspect_node | pan_work_order
+    kind: str  # count | highlight | pan | zoom_map | trace_feeder | trace_connection_path | trace_downstream_path | work_orders_in_view | inspect_node | pan_work_order
     asset_kind: str | None = None
     tier: str = "master"
     district: str | None = None
@@ -160,6 +160,10 @@ def _parse_zoom_relative_intent(lower: str) -> VoiceIntent | None:
     """Relative zoom on the current viewport (zoom in/out), not zoom-to-place."""
     text = _normalize_zoom_command_text(lower)
 
+    # "zoom in to Tema" / "zoom out to Accra" — navigate to a place, not relative zoom.
+    if re.search(r"\bzoom\s+(?:in|out)\s+to\s+\S", text, flags=re.I):
+        return None
+
     zoom_relative = re.fullmatch(
         r"zoom\s+"
         r"(?:(?:the|this)\s+map\s+)?"
@@ -260,7 +264,34 @@ def _clean_feeder_query(raw: str | None) -> str | None:
     return q or None
 
 
+def _parse_trace_downstream_path_intent(lower: str) -> VoiceIntent | None:
+    if re.search(r"\b(?:connection|connections|link)\b", lower) and not re.search(
+        r"\b(?:downstream|impact|affected)\b",
+        lower,
+    ):
+        return None
+    if re.search(
+        r"\b(?:downstream|down stream|affected area|impact zone|"
+        r"what(?:'?s| is)\s+(?:downstream|below|after)|below\s+this)\b",
+        lower,
+    ):
+        return VoiceIntent(kind="trace_downstream_path")
+    if re.search(
+        r"\b(?:show|trace|highlight|display|map|estimate)\b.*\b(?:downstream|impact|affected)\b",
+        lower,
+    ):
+        return VoiceIntent(kind="trace_downstream_path")
+    if re.search(
+        r"\b(?:downstream|impact)\b.*\b(?:show|trace|highlight|display|map|path)\b",
+        lower,
+    ):
+        return VoiceIntent(kind="trace_downstream_path")
+    return None
+
+
 def _parse_trace_connection_path_intent(lower: str) -> VoiceIntent | None:
+    if re.search(r"\b(?:downstream|impact|affected)\b", lower):
+        return None
     if not re.search(r"\b(?:trace|show|highlight|display|draw)\b", lower):
         return None
     if re.search(r"\bfeeder\b", lower):
@@ -501,17 +532,27 @@ def parse_intent(
     if pan_work_order_intent:
         return pan_work_order_intent
 
-    inspect_node_intent = _parse_inspect_node_intent(lower)
-    if inspect_node_intent:
-        return inspect_node_intent
+    trace_downstream_intent = _parse_trace_downstream_path_intent(lower)
+    if trace_downstream_intent:
+        return trace_downstream_intent
 
     trace_connection_intent = _parse_trace_connection_path_intent(lower)
     if trace_connection_intent:
         return trace_connection_intent
 
+    inspect_node_intent = _parse_inspect_node_intent(lower)
+    if inspect_node_intent:
+        return inspect_node_intent
+
     trace_feeder_intent = _parse_trace_feeder_intent(raw, lower)
     if trace_feeder_intent:
         return trace_feeder_intent
+
+    zoom_in_to = re.search(r"zoom\s+in\s+to\s+(?P<place>.+?)[\?.!]*$", lower, flags=re.I)
+    if zoom_in_to:
+        place = _clean_place(zoom_in_to.group("place"))
+        district, region = _place_slots(place)
+        return VoiceIntent(kind="pan", district=district, region=region, zoom_close=True)
 
     zoom_relative_intent = _parse_zoom_relative_intent(lower)
     if zoom_relative_intent:
@@ -1005,6 +1046,53 @@ def execute_fast_path(
         ui = result.get("ui_action")
         if ui:
             ui_actions.append(ui)
+        return {
+            "content": speak,
+            "speak": speak,
+            "ui_actions": ui_actions,
+            "session_patch": {
+                **session_patch,
+                "last_kind": intent.kind,
+                "last_mrid": result.get("mrid"),
+            },
+            "fast_path": True,
+            "data": result,
+        }
+
+    if intent.kind == "trace_downstream_path":
+        from agents import graph_tools
+
+        exec_ctx = dict(context)
+
+        result = graph_tools.trace_downstream_path(
+            conn,
+            context=exec_ctx,
+            show_on_map=True,
+        )
+        if result.get("error") and not result.get("ui_action"):
+            speak = str(result["error"])
+            return {
+                "content": speak,
+                "speak": speak,
+                "ui_actions": [],
+                "session_patch": session_patch,
+                "fast_path": True,
+                "data": result,
+            }
+
+        ui = result.get("ui_action")
+        if ui:
+            ui_actions.append(ui)
+        name = result.get("name") or "this node"
+        downstream = int(result.get("downstream_nodes") or 0)
+        edge_count = int(result.get("edge_count") or 0)
+        truncated = bool((result.get("metrics") or {}).get("truncated"))
+        suffix = " (truncated at limit)" if truncated else ""
+        speak = (
+            f"Showing {downstream} downstream node{'s' if downstream != 1 else ''} "
+            f"and {edge_count} line{'s' if edge_count != 1 else ''} "
+            f"from {name} on the map{suffix}."
+        )
         return {
             "content": speak,
             "speak": speak,

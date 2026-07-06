@@ -84,7 +84,6 @@ export function GiopSideMapPanel({
           showSearchBar={false}
           stagingAssets={stagingAssets}
           refreshToken={mapRefreshToken}
-          startMrid={startMrid}
           onNodeClick={onNodeClick}
           impactOverlay={impactOverlay}
           flyRequest={flyRequest}

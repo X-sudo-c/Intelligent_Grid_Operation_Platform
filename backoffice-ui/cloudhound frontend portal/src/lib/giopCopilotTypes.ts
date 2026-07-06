@@ -1,3 +1,4 @@
+import type { GiopTopologyPayload } from '../api/giop-api';
 import type { GiopPortalTab } from '../lib/giopPortalRouting';
 import type { FeederHighlightGeoJson } from '../lib/giopFeederHighlight';
 import type { TerritoryGeoJson } from '../lib/giopTerritoryHighlight';
@@ -36,6 +37,8 @@ export type GiopCopilotUiAction =
       tab?: GiopPortalTab | string;
       center: { lon: number; lat: number };
       zoom?: number;
+      /** MapLibre fly duration ms — use shorter values for snappy relative zoom. */
+      duration?: number;
     }
   | {
       type: 'highlight_territory';
@@ -63,6 +66,14 @@ export type GiopCopilotUiAction =
       zoom?: number;
       /** Amber pulse — AI is guessing which node the user means. */
       tentative?: boolean;
+    }
+  | {
+      type: 'show_downstream_impact';
+      tab?: GiopPortalTab | string;
+      start_mrid: string;
+      label?: string;
+      impact: GiopTopologyPayload;
+      bbox?: MapBboxContext;
     };
 
 /** Human-readable "here's what I did" line for a UI action the copilot ran. */
@@ -86,6 +97,8 @@ export function describeCopilotUiAction(action: GiopCopilotUiAction): string {
       return action.tentative
         ? `Highlighted ${action.label ?? 'a node'} on the map for confirmation`
         : `Highlighted ${action.label ?? 'the node'} on the map`;
+    case 'show_downstream_impact':
+      return `Showed downstream impact from ${action.label ?? 'the selected node'} on the map`;
     default:
       return 'Updated the map';
   }
@@ -120,4 +133,5 @@ export const COPILOT_SUGGESTIONS = [
   'How many staging captures in this district?',
   'Highlight Accra on the map',
   'Show nodes on this feeder',
+  "What's downstream from this node?",
 ] as const;

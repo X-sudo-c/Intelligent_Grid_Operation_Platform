@@ -12,7 +12,12 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { OpenAIRealtimeWebRTC, RealtimeAgent, RealtimeSession, tool } from '@openai/agents/realtime';
 import type { RealtimeItem } from '@openai/agents/realtime';
 import { z } from 'zod';
-import { createRealtimeSession, portalAiVoiceTurn } from '../api/giop-api';
+import { portalAiVoiceTurn } from '../api/giop-api';
+import {
+  prefetchRealtimeSessionToken,
+  resolveRealtimeSessionToken,
+} from '../lib/giopRealtimeTokenCache';
+import { tryInstantRelativeZoom } from '../lib/giopRelativeZoom';
 import type { GiopCopilotPortalContext, GiopCopilotUiAction } from '../lib/giopCopilotTypes';
 import { giopLog } from '../lib/giopDebugLog';
 
@@ -133,12 +138,15 @@ Keep replies short and conversational — this is a live voice call.
 You control a map and grid database ONLY through the run_giop_command tool.
 Whenever the user asks to see, zoom, pan, highlight, or count anything on the
 map or in the data (districts, regions, towns, poles, transformers, staging
-captures, feeders, work orders in view), call run_giop_command with their request phrased plainly,
+captures, feeders, work orders in view), call run_giop_command immediately with
+their request phrased plainly — do not ask clarifying questions first for obvious
+map commands,
 e.g. "zoom into Dome", "highlight Accra", "how many poles in Kumasi",
 "what work orders are in view".
 For relative zoom on the current map view (not a named place), pass the command
 verbatim: "zoom in", "zoom out", "zoom in a bit", "zoom out more" — do not add
-place names or rephrase as "zoom to …".
+place names or rephrase as "zoom to …". Relative zoom is applied instantly on the
+client; still call run_giop_command with the same phrase so you can confirm briefly.
 For "take me to" or "go to" a named place, pass it plainly, e.g. "take me to Roman Ridge".
 For work orders in a named area, pass the place explicitly, e.g. "work orders in Accra".
 To pan to a work order pin on the map, say "pan to the work order node".
@@ -210,11 +218,34 @@ function restorableHistory(items: RealtimeItem[]): RealtimeItem[] {
   return restored;
 }
 
+function latestUserTranscript(items: RealtimeItem[]): string | null {
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const item = items[i];
+    if (item.type !== 'message' || item.role !== 'user') continue;
+    const text = (item.content ?? [])
+      .map((part) => {
+        if (part.type === 'input_text' || part.type === 'output_text') {
+          return part.text ?? '';
+        }
+        if (part.type === 'input_audio' || part.type === 'output_audio') {
+          return part.transcript ?? '';
+        }
+        return '';
+      })
+      .join(' ')
+      .trim();
+    if (text) return text;
+  }
+  return null;
+}
+
 interface UseGiopRealtimeSessionOptions {
   getPortalContext: () => GiopCopilotPortalContext;
   onUiAction: (action: GiopCopilotUiAction) => void;
   onTranscript?: (role: 'user' | 'assistant', text: string) => void;
 }
+
+export { prefetchRealtimeSessionToken } from '../lib/giopRealtimeTokenCache';
 
 export function useGiopRealtimeSession({
   getPortalContext,
@@ -253,6 +284,7 @@ export function useGiopRealtimeSession({
   const conversationMemoryRef = useRef<string>('');
   const lastReconnectReasonRef = useRef<string | null>(null);
   const lastSessionErrorRef = useRef<{ key: string; at: number } | null>(null);
+  const lastInstantZoomKeyRef = useRef<string | null>(null);
   const openSessionRef = useRef<() => Promise<void>>(async () => undefined);
   const scheduleRecoveryRef = useRef<(reason?: string) => void>(() => undefined);
   const performReconnectRef = useRef<(reason?: string) => void>(() => undefined);
@@ -326,32 +358,53 @@ export function useGiopRealtimeSession({
         pushDebugEvent('info', 'tool_command_started', { command });
         try {
           const ctx = ctxRef.current();
-          let resp: Awaited<ReturnType<typeof portalAiVoiceTurn>> | null = null;
-          let lastErr: unknown = null;
-          for (let attempt = 1; attempt <= VOICE_TURN_MAX_ATTEMPTS; attempt += 1) {
-            try {
-              resp = await portalAiVoiceTurn({
-                text: command,
-                sessionId: sessionIdRef.current,
-                mrid: ctx.focus_mrid ?? undefined,
-                context: { ...ctx } as Record<string, unknown>,
-              });
-              pushDebugEvent('info', 'tool_command_succeeded', { attempt });
-              break;
-            } catch (err) {
-              lastErr = err;
-              pushDebugEvent(
-                'warn',
-                'tool_command_attempt_failed',
-                err instanceof Error ? { attempt, error: err.message } : { attempt, error: String(err) },
-              );
-              if (attempt < VOICE_TURN_MAX_ATTEMPTS) {
-                await wait(VOICE_TURN_RETRY_MS);
-                continue;
+          const instant = tryInstantRelativeZoom(command, ctx.viewport);
+          if (instant) {
+            const zoomKey = `${instant.action.type}:${instant.action.zoom}`;
+            if (lastInstantZoomKeyRef.current !== zoomKey) {
+              uiActionRef.current(instant.action);
+              lastInstantZoomKeyRef.current = zoomKey;
+            }
+            pushDebugEvent('info', 'tool_command_instant_zoom', { command });
+            transcriptRef.current?.('assistant', instant.speak);
+            return instant.speak;
+          }
+
+          const baseReq = {
+            text: command,
+            sessionId: sessionIdRef.current,
+            mrid: ctx.focus_mrid ?? undefined,
+            context: { ...ctx } as Record<string, unknown>,
+          };
+
+          const runTurn = async (fastOnly: boolean) => {
+            let lastErr: unknown = null;
+            for (let attempt = 1; attempt <= VOICE_TURN_MAX_ATTEMPTS; attempt += 1) {
+              try {
+                const resp = await portalAiVoiceTurn({ ...baseReq, fastOnly });
+                pushDebugEvent('info', 'tool_command_succeeded', { attempt, fastOnly });
+                return resp;
+              } catch (err) {
+                lastErr = err;
+                pushDebugEvent(
+                  'warn',
+                  'tool_command_attempt_failed',
+                  err instanceof Error ? { attempt, fastOnly, error: err.message } : { attempt, fastOnly, error: String(err) },
+                );
+                if (attempt < VOICE_TURN_MAX_ATTEMPTS) {
+                  await wait(VOICE_TURN_RETRY_MS);
+                }
               }
             }
+            throw lastErr instanceof Error ? lastErr : new Error('Voice command failed');
+          };
+
+          // Phase 2: try deterministic fast path first (no LLM) — typical map commands.
+          let resp = await runTurn(true);
+          if (resp.agent?.fast_only_miss && !resp.agent?.fast_path) {
+            pushDebugEvent('info', 'tool_command_slow_path_fallback');
+            resp = await runTurn(false);
           }
-          if (!resp) throw lastErr instanceof Error ? lastErr : new Error('Voice command failed');
 
           if (resp.agent?.session_id) {
             sessionIdRef.current = String(resp.agent.session_id);
@@ -421,10 +474,11 @@ export function useGiopRealtimeSession({
 
   const openSession = useCallback(async () => {
     pushDebugEvent('info', 'session_open_started');
-    const token = await createRealtimeSession();
+    const token = await resolveRealtimeSessionToken();
     pushDebugEvent('info', 'session_token_minted', {
       model: token.model,
       expiresAt: token.expires_at ?? null,
+      prefetched: true,
     });
     const expiresAtMs = (token.expires_at ?? 0) * 1000;
     if (expiresAtMs > 0) {
@@ -495,8 +549,17 @@ export function useGiopRealtimeSession({
     sessionRef.current = session;
 
     try {
-      session.on('history_updated', () => {
+      session.on('history_updated', (items: RealtimeItem[]) => {
         snapshotHistory();
+        const userText = latestUserTranscript(items);
+        if (!userText) return;
+        const instant = tryInstantRelativeZoom(userText, ctxRef.current().viewport);
+        if (!instant) return;
+        const zoomKey = `${instant.action.type}:${instant.action.zoom}`;
+        if (lastInstantZoomKeyRef.current === zoomKey) return;
+        lastInstantZoomKeyRef.current = zoomKey;
+        uiActionRef.current(instant.action);
+        pushDebugEvent('info', 'instant_relative_zoom', { userText, zoom: instant.action.zoom });
       });
     } catch {
       /* optional */

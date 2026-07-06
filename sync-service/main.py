@@ -56,7 +56,10 @@ from integrations.sap.sync_customers import (
 )
 from graph_sync import apply_webhook_event, graph_parity_report, reconcile_memgraph
 from redis_cache import (
+    GRAPH_CHUNK_CACHE_TTL_SEC,
     OPS_CACHE_TTL_SEC,
+    TOPOLOGY_SNAPSHOT_CACHE_TTL_SEC,
+    REFERENCE_LAYERS_CACHE_TTL_SEC,
     RULES_CACHE_TTL_SEC,
     SCHEMATIC_CACHE_TTL_SEC,
     CIM_PREVIEW_TTL_SEC,
@@ -68,6 +71,7 @@ from redis_cache import (
     cim_preview_key,
     claim_idempotency,
     conflicts_key,
+    delete_pattern,
     dq_exceptions_key,
     dq_queue_key,
     dq_rules_key,
@@ -75,8 +79,10 @@ from redis_cache import (
     exports_list_key,
     get_idempotent_response,
     get_json,
+    gis_import_summary_key,
     graph_chunk_key,
     graph_parity_key,
+    reference_layers_key,
     h3_assignments_geojson_key,
     h3_cells_key,
     h3_coverage_key,
@@ -133,12 +139,26 @@ from data_quality import (
     summary as dq_summary,
 )
 from topology_dq import (
+    TopologyScanInProgressError,
     create_topology_batch_run,
+    estimate_topology_scan_seconds,
     execute_topology_batch_scan,
+    find_active_topology_batch_run,
+    get_topology_batch_progress,
     latest_staging_topology_live,
     latest_topology_snapshot,
     list_batch_runs as topology_dq_list_runs,
     topology_dq_summary,
+    topology_snapshot_pending,
+)
+from gis_import import (
+    GIS_IMPORT_SUMMARY_CACHE_TTL_SEC,
+    UNPROMOTED_REASONS,
+    endpoint_diagnostics_summary,
+    list_unpromoted_segments,
+    snap_conductor_endpoints,
+    unpromoted_segment_geojson,
+    unpromoted_segments_summary,
 )
 from map_nodes import fetch_nodes_near_location
 import h3_index as h3x
@@ -151,6 +171,7 @@ from h3_service import (
     fetch_coverage,
     fetch_nodes_in_cells,
     list_assignments,
+    refresh_h3_rebuild_coverage_table,
     upsert_assignment,
 )
 from node_connections import fetch_bulk_node_connections, fetch_node_connections
@@ -634,17 +655,38 @@ def _trace_payload_blocking(
     max_hops: int | None = None,
     max_nodes: int | None = None,
 ) -> dict[str, Any]:
+    from memgraph_topology import build_trace_payload_memgraph, memgraph_trace_ready
+
     conn = _pg_connect()
     if not conn:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     try:
-        return _build_trace_payload_postgres(
+        total_nodes, total_edges = _pg_graph_totals(conn)
+        graph_totals = {"nodes": total_nodes, "edges": total_edges}
+        if memgraph_trace_ready(graph_driver):
+            try:
+                return build_trace_payload_memgraph(
+                    graph_driver,
+                    conn,
+                    start_mrid,
+                    scope,
+                    graph_totals=graph_totals,
+                    max_hops=max_hops,
+                    max_nodes=max_nodes,
+                )
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Memgraph trace failed, falling back to Postgres: %s", exc
+                )
+        payload = _build_trace_payload_postgres(
             conn,
             start_mrid,
             scope,
             max_hops=max_hops,
             max_nodes=max_nodes,
         )
+        payload["backend"] = "postgres"
+        return payload
     finally:
         conn.close()
 
@@ -655,18 +697,56 @@ def _graph_chunk_traced_mrids_blocking(
     max_hops: int | None = None,
     max_nodes: int | None = None,
 ) -> set[str]:
+    from memgraph_topology import collect_downstream_mrids, memgraph_trace_ready
+
+    hop_cap = max(1, min(max_hops or TRACE_MAX_HOPS, 20))
+    node_cap = max(100, min(max_nodes or TRACE_MAX_NODES, 20000))
+    if memgraph_trace_ready(graph_driver):
+        try:
+            traced, _ = collect_downstream_mrids(
+                graph_driver,
+                start_mrid,
+                max_hops=hop_cap,
+                max_nodes=node_cap,
+            )
+            return traced
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Memgraph traced_mrids failed, falling back to Postgres: %s", exc
+            )
+
     conn = _pg_connect()
     if not conn:
         return {start_mrid}
     try:
-        hop_cap = max(1, min(max_hops or TRACE_MAX_HOPS, 20))
-        node_cap = max(100, min(max_nodes or TRACE_MAX_NODES, 20000))
         traced, _ = _collect_traced_mrids_pg(
             conn, start_mrid, max_hops=hop_cap, max_nodes=node_cap
         )
         return traced
     finally:
         conn.close()
+
+
+def _fetch_graph_chunk_blocking(
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+    limit: int,
+    traced_mrids: set[str] | None = None,
+    edge_limit: int = 5000,
+) -> dict[str, Any]:
+    """Viewport chunks are served straight from PostGIS (GIST bbox scans).
+
+    The former Memgraph path ran `WHERE a.mrid IN [...thousands of ids...]`
+    membership scans per request, which dominated viewport latency in dense
+    areas. PostGIS answers the same question with two indexed bbox scans.
+    """
+    payload = _fetch_graph_chunk_from_postgres(
+        west, south, east, north, limit, traced_mrids or set(), edge_limit
+    )
+    payload["backend"] = "postgres"
+    return payload
 
 
 def _fetch_graph_chunk_from_postgres(
@@ -686,6 +766,45 @@ def _fetch_graph_chunk_from_postgres(
     envelope = (west, south, east, north)
     try:
         with conn.cursor() as cur:
+            # Edge-first: lines in the bbox define the visible topology.
+            edge_rows: list[Any] = []
+            edges_truncated = False
+            connected_mrids: set[str] = set()
+            if edge_limit > 0:
+                span = max(east - west, north - south)
+                simplify_tol = max(0.00003, span / 600.0)
+
+                cur.execute(
+                    """
+                    SELECT
+                      als.mrid::text,
+                      als.source_node_id::text,
+                      als.target_node_id::text,
+                      coalesce(ce.phases, 'ABC'),
+                      coalesce(ce.nominal_voltage::text, 'MV_11KV'),
+                      ST_X(src.geom) AS src_lon,
+                      ST_Y(src.geom) AS src_lat,
+                      ST_X(tgt.geom) AS tgt_lon,
+                      ST_Y(tgt.geom) AS tgt_lat,
+                      ST_AsGeoJSON(ST_SimplifyPreserveTopology(als.geom, %s))::json AS geom_json
+                    FROM ac_line_segments als
+                    JOIN conducting_equipment ce ON als.mrid = ce.mrid
+                    JOIN connectivity_nodes src ON src.mrid = als.source_node_id
+                    JOIN connectivity_nodes tgt ON tgt.mrid = als.target_node_id
+                    WHERE als.geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
+                    ORDER BY als.mrid
+                    LIMIT %s
+                    """,
+                    (simplify_tol, *envelope, edge_limit + 1),
+                )
+                edge_rows = cur.fetchall()
+                edges_truncated = len(edge_rows) > edge_limit
+                if edges_truncated:
+                    edge_rows = edge_rows[:edge_limit]
+                for row in edge_rows:
+                    connected_mrids.add(row[1])
+                    connected_mrids.add(row[2])
+
             cur.execute(
                 """
                 SELECT
@@ -703,37 +822,29 @@ def _fetch_graph_chunk_from_postgres(
                 (*envelope, limit),
             )
             node_rows = cur.fetchall()
+            truncated = len(node_rows) >= limit
 
-            span = max(east - west, north - south)
-            simplify_tol = max(0.00003, span / 600.0)
-
-            cur.execute(
-                """
-                SELECT
-                  als.mrid::text,
-                  als.source_node_id::text,
-                  als.target_node_id::text,
-                  coalesce(ce.phases, 'ABC'),
-                  coalesce(ce.nominal_voltage::text, 'MV_11KV'),
-                  ST_X(src.geom) AS src_lon,
-                  ST_Y(src.geom) AS src_lat,
-                  ST_X(tgt.geom) AS tgt_lon,
-                  ST_Y(tgt.geom) AS tgt_lat,
-                  ST_AsGeoJSON(ST_SimplifyPreserveTopology(als.geom, %s))::json AS geom_json
-                FROM ac_line_segments als
-                JOIN conducting_equipment ce ON als.mrid = ce.mrid
-                JOIN connectivity_nodes src ON src.mrid = als.source_node_id
-                JOIN connectivity_nodes tgt ON tgt.mrid = als.target_node_id
-                WHERE als.geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
-                ORDER BY als.mrid
-                LIMIT %s
-                """,
-                (simplify_tol, *envelope, edge_limit + 1),
-            )
-            edge_rows = cur.fetchall()
-            edges_truncated = len(edge_rows) > edge_limit
-            if edges_truncated:
-                edge_rows = edge_rows[:edge_limit]
+            # Back-fill edge endpoints missing from the bbox node set (line
+            # crosses the viewport border or the node cap truncated them);
+            # the graph canvas drops edges whose endpoints are absent.
+            missing_endpoints = connected_mrids - {row[0] for row in node_rows}
+            if missing_endpoints:
+                cur.execute(
+                    """
+                    SELECT
+                      cn.mrid::text,
+                      io.name,
+                      ST_X(cn.geom) AS lon,
+                      ST_Y(cn.geom) AS lat,
+                      io.validation
+                    FROM connectivity_nodes cn
+                    JOIN identified_objects io ON io.mrid = cn.mrid
+                    WHERE cn.mrid = ANY(%s::uuid[])
+                      AND cn.geom IS NOT NULL
+                    """,
+                    (list(missing_endpoints),),
+                )
+                node_rows = list(node_rows) + cur.fetchall()
 
             if not node_rows and not edge_rows:
                 return {
@@ -745,11 +856,6 @@ def _fetch_graph_chunk_from_postgres(
                     "limit": limit,
                     "edge_limit": edge_limit,
                 }
-
-            connected_mrids: set[str] = set()
-            for row in edge_rows:
-                connected_mrids.add(row[1])
-                connected_mrids.add(row[2])
 
             def _edge_coordinates(geom_json: Any) -> list[list[float]] | None:
                 if not geom_json:
@@ -805,7 +911,6 @@ def _fetch_graph_chunk_from_postgres(
                     edge["coordinates"] = coords
                 edges.append(edge)
 
-            truncated = len(node_rows) >= limit
             return {
                 "nodes": nodes,
                 "edges": edges,
@@ -2068,6 +2173,35 @@ async def get_h3_coverage(
     return await asyncio.to_thread(lambda: cached_json(cache_key, _fetch))
 
 
+@app.post("/api/v1/h3/coverage/refresh")
+async def refresh_h3_coverage_martin(
+    background_tasks: BackgroundTasks,
+    sync: bool = Query(default=False, description="Block until national refresh completes"),
+):
+    """Rebuild h3_rebuild_coverage table for Martin tiles (run after promote)."""
+    _require_h3()
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+
+    def _run_refresh() -> dict[str, Any]:
+        conn = pooled_connect(SUPABASE_DB_URI)
+        try:
+            result = refresh_h3_rebuild_coverage_table(conn)
+            invalidate_h3_cache()
+            return result
+        finally:
+            conn.close()
+
+    if sync:
+        try:
+            return await asyncio.to_thread(_run_refresh)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    background_tasks.add_task(_run_refresh)
+    return {"status": "accepted", "message": "H3 rebuild coverage refresh started"}
+
+
 @app.get("/api/v1/h3/assignments")
 async def get_h3_assignments(
     assigned_to: str | None = Query(default=None),
@@ -2434,6 +2568,7 @@ async def topology_impact(
             downstream_impact_payload,
             start_mrid,
             max_nodes=max_nodes,
+            graph_driver=graph_driver,
         )
         if not payload["nodes"]:
             raise HTTPException(status_code=404, detail=f"No nodes found for mrid {start_mrid}")
@@ -3150,6 +3285,30 @@ async def execute_trace(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.post("/api/v1/map/invalidate-cache")
+async def invalidate_map_cache(
+    background_tasks: BackgroundTasks,
+    refresh_h3: bool = Query(default=False, description="Rebuild H3 Martin coverage table"),
+):
+    """Clear Redis map/graph tile caches after import or promote."""
+    cleared = invalidate_topology_cache()
+    if refresh_h3:
+        _require_h3()
+
+        def _run_h3() -> None:
+            if not SUPABASE_DB_URI:
+                return
+            conn = pooled_connect(SUPABASE_DB_URI)
+            try:
+                refresh_h3_rebuild_coverage_table(conn)
+                invalidate_h3_cache()
+            finally:
+                conn.close()
+
+        background_tasks.add_task(_run_h3)
+    return {"status": "ok", "keys_cleared": cleared, "h3_refresh": refresh_h3}
+
+
 @app.get("/api/v1/graph/chunk")
 async def graph_chunk(
     west: float = Query(..., ge=-180, le=180),
@@ -3157,7 +3316,7 @@ async def graph_chunk(
     east: float = Query(..., ge=-180, le=180),
     north: float = Query(..., ge=-90, le=90),
     limit: int = Query(default=2000, ge=1, le=5000),
-    edge_limit: int = Query(default=5000, ge=1, le=10000),
+    edge_limit: int = Query(default=8000, ge=1, le=15000),
     start_mrid: str | None = Query(default=None),
 ):
     if west >= east or south >= north:
@@ -3177,7 +3336,7 @@ async def graph_chunk(
 
     try:
         payload = await asyncio.to_thread(
-            _fetch_graph_chunk_from_postgres,
+            _fetch_graph_chunk_blocking,
             west,
             south,
             east,
@@ -3186,12 +3345,51 @@ async def graph_chunk(
             traced_mrids,
             edge_limit,
         )
-        set_json(cache_key, payload)
+        set_json(cache_key, payload, GRAPH_CHUNK_CACHE_TTL_SEC)
         return payload
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/graph/sample-connected-node")
+async def graph_sample_connected_node(
+    west: float | None = Query(default=None, ge=-180, le=180),
+    south: float | None = Query(default=None, ge=-90, le=90),
+    east: float | None = Query(default=None, ge=-180, le=180),
+    north: float | None = Query(default=None, ge=-90, le=90),
+):
+    """Return one node on at least one line (optional bbox filter) for trace smoke tests."""
+    if any(v is not None for v in (west, south, east, north)) and any(
+        v is None for v in (west, south, east, north)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide all of west, south, east, north or omit all for national sample",
+        )
+    if None not in (west, south, east, north) and (west >= east or south >= north):
+        raise HTTPException(status_code=400, detail="Invalid bbox")
+
+    from memgraph_topology import sample_connected_node_pg
+
+    conn = _pg_connect()
+    if not conn:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    try:
+        sample = await asyncio.to_thread(
+            sample_connected_node_pg,
+            conn,
+            west=west,
+            south=south,
+            east=east,
+            north=north,
+        )
+    finally:
+        conn.close()
+    if not sample:
+        raise HTTPException(status_code=404, detail="No connected node found in scope")
+    return sample
 
 
 @app.get("/api/v1/lineage")
@@ -3442,18 +3640,46 @@ async def get_topology_dq_summary(
             snap = latest_topology_snapshot(conn)
             if snap is not None:
                 return snap
-            return topology_dq_summary(conn, clip=clip, tier="master")
+            return topology_snapshot_pending(tier="master")
         finally:
             conn.close()
 
     try:
         if mode == "live":
+            if tier == "master":
+                conn_check = pooled_connect(SUPABASE_DB_URI)
+                try:
+                    active = find_active_topology_batch_run(conn_check)
+                    if active is not None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "error": "topology_scan_in_progress",
+                                "message": "A master topology scan is already running.",
+                                "active_run_id": active["run_id"],
+                            },
+                        )
+                finally:
+                    conn_check.close()
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "live_master_disabled",
+                        "message": (
+                            "Live master topology counts are disabled at national scale. "
+                            "Use Scan → queue to refresh metrics in the background."
+                        ),
+                    },
+                )
             return await asyncio.to_thread(_live)
+        snapshot_ttl = (
+            TOPOLOGY_SNAPSHOT_CACHE_TTL_SEC if mode == "snapshot" else OPS_CACHE_TTL_SEC
+        )
         return await asyncio.to_thread(
             lambda: cached_json(
                 topology_dq_summary_key(tier, mode),
                 _snapshot_or_live,
-                OPS_CACHE_TTL_SEC,
+                snapshot_ttl,
             )
         )
     except Exception as exc:
@@ -3485,43 +3711,109 @@ async def get_nav_badges():
 async def run_topology_dq_scan(payload: TopologyDqScanPayload, background_tasks: BackgroundTasks):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    from pgmq_worker import PGMQ_CONSUMER_ENABLED, enqueue_topology_dq_job
+
     clip = payload.clip.model_dump() if payload.clip else None
     conn = pooled_connect(SUPABASE_DB_URI)
+    pgmq_msg_id: int | None = None
+    run_id: str | None = None
     try:
         run_id = create_topology_batch_run(
             conn,
             clip=clip,
             requested_by=payload.operator_id,
         )
+        if PGMQ_CONSUMER_ENABLED:
+            try:
+                pgmq_msg_id = enqueue_topology_dq_job(conn, run_id)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "pgmq enqueue failed for topology scan — falling back to in-process worker",
+                    exc_info=True,
+                )
+                pgmq_msg_id = None
         conn.commit()
+    except TopologyScanInProgressError as exc:
+        conn.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "topology_scan_in_progress",
+                "message": "A master topology scan is already running.",
+                "active_run_id": exc.run_id,
+            },
+        ) from exc
     except Exception as exc:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         conn.close()
 
-    def _execute() -> None:
-        if not SUPABASE_DB_URI:
-            return
-        bg = pooled_connect(SUPABASE_DB_URI)
-        try:
-            execute_topology_batch_scan(
-                bg,
-                run_id,
-                clip=clip,
-                requested_by=payload.operator_id,
-            )
-            bg.commit()
-            invalidate_ops_cache()
-            invalidate_topology_cache()
-        except Exception:
-            # Scan already marked the run failed and committed; log for ops.
-            logging.getLogger(__name__).exception("Topology DQ scan %s failed", run_id)
-        finally:
-            bg.close()
+    est_conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        estimate_seconds = estimate_topology_scan_seconds(est_conn)
+    finally:
+        est_conn.close()
 
-    background_tasks.add_task(_execute)
-    return {"run_id": run_id, "status": "running", "message": "Topology scan queued"}
+    if not (PGMQ_CONSUMER_ENABLED and pgmq_msg_id is not None):
+
+        def _execute() -> None:
+            if not SUPABASE_DB_URI or not run_id:
+                return
+            bg = pooled_connect(SUPABASE_DB_URI)
+            try:
+                execute_topology_batch_scan(
+                    bg,
+                    run_id,
+                    clip=clip,
+                    requested_by=payload.operator_id,
+                )
+                bg.commit()
+                invalidate_ops_cache()
+                invalidate_topology_cache()
+            except Exception:
+                logging.getLogger(__name__).exception("Topology DQ scan %s failed", run_id)
+            finally:
+                bg.close()
+
+        background_tasks.add_task(_execute)
+
+    return {
+        "run_id": run_id,
+        "status": "running",
+        "message": "Topology scan queued",
+        "estimate_seconds": estimate_seconds,
+        "delivery": "pgmq" if pgmq_msg_id is not None else "background",
+    }
+
+
+@app.get("/api/v1/dq/topology/runs/active")
+async def get_active_topology_dq_run():
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        active = find_active_topology_batch_run(conn)
+        estimate_seconds = estimate_topology_scan_seconds(conn)
+        return {"active": active, "estimate_seconds": estimate_seconds}
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/dq/topology/runs/{run_id}/progress")
+async def get_topology_dq_run_progress(run_id: str):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        progress = get_topology_batch_progress(conn, run_id)
+        if progress is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if progress.get("estimate_seconds") is None:
+            progress["estimate_seconds"] = estimate_topology_scan_seconds(conn)
+        return progress
+    finally:
+        conn.close()
 
 
 @app.get("/api/v1/dq/topology/runs")
@@ -3531,6 +3823,155 @@ async def list_topology_dq_runs(limit: int = Query(default=20, ge=1, le=100)):
     conn = pooled_connect(SUPABASE_DB_URI)
     try:
         return {"runs": topology_dq_list_runs(conn, limit=limit)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/gis/unpromoted-segments/summary")
+async def get_gis_unpromoted_segments_summary(
+    district: str | None = Query(default=None),
+    west: float | None = Query(default=None),
+    south: float | None = Query(default=None),
+    east: float | None = Query(default=None),
+    north: float | None = Query(default=None),
+):
+    """Counts of gis.conductor_segments not yet promoted to ac_line_segments."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    clip = None
+    if None not in (west, south, east, north):
+        if west >= east or south >= north:
+            raise HTTPException(status_code=400, detail="Invalid bbox")
+        clip = {"west": west, "south": south, "east": east, "north": north}
+
+    cache_key = gis_import_summary_key(district if clip is None else f"{district}:{west}:{south}:{east}:{north}")
+
+    def _fetch():
+        conn = pooled_connect(SUPABASE_DB_URI)
+        try:
+            return unpromoted_segments_summary(conn, district=district, clip=clip)
+        finally:
+            conn.close()
+
+    try:
+        if clip is None:
+            return await asyncio.to_thread(
+                lambda: cached_json(
+                    cache_key,
+                    _fetch,
+                    GIS_IMPORT_SUMMARY_CACHE_TTL_SEC,
+                )
+            )
+        return await asyncio.to_thread(_fetch)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/gis/endpoint-diagnostics")
+async def get_gis_endpoint_diagnostics(
+    district: str | None = Query(default=None),
+):
+    """Endpoint ID class breakdown for unpromoted GIS conductor segments."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+
+    def _fetch():
+        conn = pooled_connect(SUPABASE_DB_URI)
+        try:
+            return endpoint_diagnostics_summary(conn, district=district)
+        finally:
+            conn.close()
+
+    cache_key = gis_import_summary_key(f"endpoint-diagnostics:{district or 'all'}")
+    try:
+        return await asyncio.to_thread(
+            lambda: cached_json(
+                cache_key,
+                _fetch,
+                GIS_IMPORT_SUMMARY_CACHE_TTL_SEC,
+            )
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/gis/unpromoted-segments")
+async def get_gis_unpromoted_segments(
+    district: str | None = Query(default=None),
+    reason: str | None = Query(default=None),
+    west: float | None = Query(default=None),
+    south: float | None = Query(default=None),
+    east: float | None = Query(default=None),
+    north: float | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    """Paginated steward queue for unpromoted GIS conductor segments."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    if reason is not None and reason not in UNPROMOTED_REASONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"reason must be one of: {', '.join(UNPROMOTED_REASONS)}",
+        )
+    clip = None
+    if None not in (west, south, east, north):
+        if west >= east or south >= north:
+            raise HTTPException(status_code=400, detail="Invalid bbox")
+        clip = {"west": west, "south": south, "east": east, "north": north}
+
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return list_unpromoted_segments(
+            conn,
+            district=district,
+            reason=reason,
+            clip=clip,
+            limit=limit,
+            offset=offset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/gis/unpromoted-segments/{segment_id}/geojson")
+async def get_gis_unpromoted_segment_geojson(segment_id: int):
+    """Line + endpoint geometry for GIS import queue map highlight."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return unpromoted_segment_geojson(conn, segment_id)
+    except ValueError as exc:
+        if str(exc) == "segment_not_found":
+            raise HTTPException(status_code=404, detail="Segment not found or already promoted") from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+class GisSnapConductorsPayload(BaseModel):
+    tolerance_m: float | None = Field(default=None, ge=0.01, le=50.0)
+
+
+@app.post("/api/v1/gis/snap-conductors")
+async def post_gis_snap_conductors(payload: GisSnapConductorsPayload | None = None):
+    """Rebuild conductor geometry from resolved endpoint nodes (conservative snap)."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    body = payload or GisSnapConductorsPayload()
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return snap_conductor_endpoints(conn, tolerance_m=body.tolerance_m)
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         conn.close()
 
@@ -3740,8 +4181,13 @@ async def get_kpis_latest():
         snap = repository.latest_kpi_snapshot(conn)
         if snap:
             return snap
-        metrics = kpi.compute_kpis(conn)
-        return metrics
+        return kpi.compute_kpis(conn)
+    except psycopg2.Error as exc:
+        logging.exception("kpis/latest database error")
+        raise HTTPException(status_code=503, detail="KPI data temporarily unavailable") from exc
+    except Exception as exc:
+        logging.exception("kpis/latest failed")
+        raise HTTPException(status_code=500, detail="Failed to compute KPIs") from exc
     finally:
         conn.close()
 
@@ -3816,6 +4262,7 @@ class PortalVoiceTurnPayload(BaseModel):
     mrid: str | None = None
     operator_id: str | None = Field(default=None, max_length=100)
     context: dict[str, Any] = Field(default_factory=dict)
+    fast_only: bool = False
 
 
 class PortalSpeakPayload(BaseModel):
@@ -4016,6 +4463,7 @@ async def portal_voice_turn(payload: PortalVoiceTurnPayload):
             mrid=payload.mrid,
             operator_id=payload.operator_id,
             context=payload.context,
+            fast_only=payload.fast_only,
         )
         conn.commit()
         return result.model_dump()
@@ -4674,23 +5122,30 @@ def _run_boundary_import_job(job_id: str) -> None:
 
 
 @app.get("/api/v1/reference-layers")
-async def api_list_reference_layers():
+async def api_list_reference_layers(refresh: bool = Query(default=False)):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
-    conn = pooled_connect(SUPABASE_DB_URI)
-    try:
+
+    def _fetch() -> dict[str, Any]:
+        conn = pooled_connect(SUPABASE_DB_URI)
         try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT gis.refresh_reference_layer_counts()")
-            conn.commit()
-        except Exception:
-            conn.rollback()
-        refresh_all_render_policies(conn)
-        conn.commit()
-        layers = list_reference_layers(conn)
-    finally:
-        conn.close()
-    return {"layers": layers}
+            if refresh:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT gis.sync_network_reference_catalog()")
+                conn.commit()
+                refresh_all_render_policies(conn)
+                conn.commit()
+            return {"layers": list_reference_layers(conn)}
+        finally:
+            conn.close()
+
+    try:
+        if refresh:
+            delete_pattern(reference_layers_key())
+            return _fetch()
+        return cached_json(reference_layers_key(), _fetch, REFERENCE_LAYERS_CACHE_TTL_SEC)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/reference-layers/map-config")
@@ -4700,11 +5155,6 @@ async def api_reference_map_config():
     martin_url = os.getenv("MARTIN_URL", "http://127.0.0.1:3001")
     conn = pooled_connect(SUPABASE_DB_URI)
     try:
-        try:
-            refresh_all_render_policies(conn)
-            conn.commit()
-        except Exception:
-            conn.rollback()
         config = build_map_config(conn, martin_url=martin_url)
     finally:
         conn.close()
@@ -5827,9 +6277,24 @@ def warm_voice_pipeline() -> None:
 
     threading.Thread(target=_warm, name="voice-warmup", daemon=True).start()
 
+    if SUPABASE_DB_URI:
+        try:
+            from pgmq_worker import bootstrap_handlers, start_pgmq_worker
+
+            bootstrap_handlers()
+            start_pgmq_worker(lambda: pooled_connect(SUPABASE_DB_URI))
+        except Exception:
+            logging.getLogger(__name__).warning("pgmq worker failed to start", exc_info=True)
+
 
 @app.on_event("shutdown")
 def shutdown():
+    try:
+        from pgmq_worker import stop_pgmq_worker
+
+        stop_pgmq_worker()
+    except Exception:
+        pass
     graph_driver.close()
     close_all_pools()
 

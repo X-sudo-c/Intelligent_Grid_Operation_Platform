@@ -21,6 +21,8 @@ interface GiopMapControlPanelProps {
   groups: GiopMapLayerGroup[];
   /** Optional special control (e.g. territory mode) rendered in the footer. */
   footerSlot?: ReactNode;
+  /** Tailwind position classes for the floating panel anchor. */
+  positionClass?: string;
 }
 
 const PANEL_STATE_KEY = 'giop.map.overlays.expanded.v1';
@@ -88,6 +90,7 @@ export function GiopMapControlPanel({
   isLightMode,
   groups,
   footerSlot,
+  positionClass = 'left-3 top-3',
 }: GiopMapControlPanelProps) {
   const t = giopThemeTokens(isLightMode);
   const [expanded, setExpanded] = useState<boolean>(readExpanded);
@@ -115,7 +118,7 @@ export function GiopMapControlPanel({
 
   return (
     <div
-      className={`giop-map-control pointer-events-auto absolute left-3 top-3 z-10 w-52 overflow-hidden rounded-xl border ${shell}`}
+      className={`giop-map-control pointer-events-auto absolute ${positionClass} z-20 w-52 overflow-hidden rounded-xl border ${shell}`}
     >
       <button
         type="button"

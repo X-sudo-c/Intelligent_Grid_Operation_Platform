@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DEFAULT_START_MRID, getStagingAssets, getTopologyGaps, getTrace } from '../api/giop-api';
 import type { GiopStagingAsset, GiopTraceResponse } from '../api/giop-api';
-import { topologyPayloadToPortalGraph, traceToPortalGraph } from '../lib/giopGraphAdapter';
+import { chunkToPortalGraph, topologyPayloadToPortalGraph, traceToPortalGraph } from '../lib/giopGraphAdapter';
 import type { GiopGraphQueryKey } from '../lib/giopGraphTypes';
 import type { PortalGraphResponse } from '../lib/giopGraphTypes';
 import { readSwCache, writeSwCache } from '../lib/giopSwCache';
+import { useGiopGraphChunk, type MapBbox } from './useGiopGraphChunk';
 
 function traceCacheKey(startMrid: string, scope: 'traced' | 'full'): string {
   return `trace:${scope}:${startMrid}`;
@@ -27,6 +28,13 @@ function needsTraceFetch(queryKey: GiopGraphQueryKey): boolean {
   return queryKey === 'traced_subgraph' || queryKey === 'network_topology';
 }
 
+function viewportCacheKey(mapViewport: { bbox: MapBbox; zoom: number } | null): string | null {
+  if (!mapViewport) return null;
+  const { bbox, zoom } = mapViewport;
+  const round = (n: number) => n.toFixed(4);
+  return `${round(bbox.west)}:${round(bbox.south)}:${round(bbox.east)}:${round(bbox.north)}:${zoom}`;
+}
+
 interface UseGiopTopologyOptions {
   /**
    * When false, the expensive Memgraph trace is NOT fetched on mount. Only the
@@ -37,6 +45,8 @@ interface UseGiopTopologyOptions {
   traceActive?: boolean;
   /** Initial graph query key (e.g. viewport for split view). */
   initialGraphQuery?: GiopGraphQueryKey;
+  /** Last map viewport — used when graphQuery is viewport_subgraph on Topology tab. */
+  mapViewport?: { bbox: MapBbox; zoom: number } | null;
 }
 
 export function useGiopTopology(
@@ -45,6 +55,10 @@ export function useGiopTopology(
 ) {
   const traceActive = options?.traceActive ?? true;
   const initialGraphQuery = options?.initialGraphQuery ?? 'traced_subgraph';
+  const mapViewport = options?.mapViewport ?? null;
+  const viewportKey = useMemo(() => viewportCacheKey(mapViewport), [mapViewport]);
+  const mapViewportRef = useRef(mapViewport);
+  mapViewportRef.current = mapViewport;
   const [trace, setTrace] = useState<GiopTraceResponse | null>(null);
   const [staging, setStaging] = useState<GiopStagingAsset[]>([]);
   const [graphQuery, setGraphQuery] = useState<GiopGraphQueryKey>(initialGraphQuery);
@@ -62,6 +76,41 @@ export function useGiopTopology(
   const refreshSeqRef = useRef(0);
   const stagingInFlightRef = useRef(false);
   const lastStagingPayloadRef = useRef<string | null>(null);
+
+  const { chunk, loading: chunkLoading, error: chunkError, loadBbox } = useGiopGraphChunk(
+    traceActive && graphQuery !== 'viewport_subgraph' ? startMrid : undefined,
+    0,
+    { debounceMs: 450 },
+  );
+
+  const viewportGraph = useMemo(
+    () => (chunk ? chunkToPortalGraph(chunk, staging) : null),
+    [chunk, staging],
+  );
+
+  useEffect(() => {
+    if (graphQuery !== 'viewport_subgraph' || !viewportKey) return;
+    const vp = mapViewportRef.current;
+    if (!vp) return;
+    loadBbox(vp.bbox, vp.zoom);
+  }, [graphQuery, viewportKey, loadBbox]);
+
+  useEffect(() => {
+    if (graphQuery !== 'viewport_subgraph') return;
+
+    if (chunkLoading) {
+      setLoading(true);
+      return;
+    }
+
+    if (viewportGraph) {
+      setGraph(viewportGraph);
+      setError(chunkError ?? null);
+    } else if (chunkError) {
+      setError(chunkError);
+    }
+    setLoading(false);
+  }, [graphQuery, viewportGraph, chunkError, chunkLoading]);
 
   useEffect(() => {
     loadedTraceKeyRef.current = null;
@@ -234,9 +283,20 @@ export function useGiopTopology(
         void refresh(queryKey);
         return;
       }
-      // Viewport mode is served by map chunks in split view — never pull full trace.
+      // Viewport mode loads map-bbox chunks (nodes + edges in bounds).
       if (queryKey === 'viewport_subgraph') {
-        if (trace) rebuildGraph(trace, staging, queryKey);
+        if (mapViewport) {
+          setLoading(true);
+          setError(null);
+          void loadBbox(mapViewport.bbox, mapViewport.zoom);
+          return;
+        }
+        if (trace) {
+          rebuildGraph(trace, staging, queryKey);
+          return;
+        }
+        setLoading(false);
+        setError('Open the Map tab and pan to an area, then switch to Viewport.');
         return;
       }
       if (!needsTraceFetch(queryKey)) {
@@ -254,7 +314,7 @@ export function useGiopTopology(
       }
       void refresh(queryKey);
     },
-    [trace, traceScope, staging, rebuildGraph, refresh, traceActive],
+    [trace, traceScope, staging, rebuildGraph, refresh, traceActive, mapViewport, loadBbox],
   );
 
   return {

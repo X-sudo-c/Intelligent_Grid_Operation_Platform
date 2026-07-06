@@ -54,6 +54,12 @@ When the user asks to trace/show/highlight the connection path, line, or link fr
 (use trace_connection_path with show_on_map=true). Use the selected focus_mrid or the node
 they just inspected. Do NOT use trace_feeder for that — trace_feeder is for an entire feeder.
 
+When the user asks what's downstream, what would be affected by an outage at a node, or to
+show/highlight the downstream network path, call trace_downstream_path with show_on_map=true.
+Use focus_mrid from portal context or the node they just inspected. This is a directed walk
+(same as the Outages tab impact estimate) — NOT trace_connection_path (1-hop) or trace_feeder
+(whole feeder BFS).
+
 When the user asks to show, highlight, or trace feeder nodes on the map, call trace_feeder with
 show_on_map=true. Use focus_mrid from portal context when they say "this feeder" and boundary_feeder_id
 is not explicit. Use feeder_id when they name a feeder code or locality (e.g. Mallam feeder → Mallam).

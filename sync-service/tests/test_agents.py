@@ -68,10 +68,10 @@ class KpiTests(unittest.TestCase):
 
         conn = MagicMock()
         with patch("agents.kpi.summary") as mock_summary, patch(
-            "agents.kpi.topology_dq_summary"
-        ) as mock_topo, patch("agents.kpi.export_topology_blocked") as mock_gate, patch(
-            "agents.kpi.count_pending_approvals", return_value=0
-        ):
+            "agents.kpi._resolve_topology_summary"
+        ) as mock_topo, patch(
+            "agents.kpi._auto_fix_success_rate", return_value=None
+        ), patch("agents.kpi.count_pending_approvals", return_value=0):
             mock_summary.return_value = {
                 "open_total": 5,
                 "open_by_severity": {"critical": 1},
@@ -79,9 +79,8 @@ class KpiTests(unittest.TestCase):
             }
             mock_topo.return_value = {
                 "live": {"approved_nodes": 100, "orphan_nodes": 5},
+                "export_blocked": {"blocked": False},
             }
-            mock_gate.return_value = {"blocked": False}
-            conn.cursor.return_value.__enter__.return_value.fetchone.return_value = (0, 0)
             metrics = kpi.compute_kpis(conn)
         self.assertEqual(metrics["topology_validity_pct"], 95.0)
         self.assertTrue(any(e["code"] == "TOPOLOGY_BELOW_THRESHOLD" for e in metrics["escalation"]))
@@ -615,6 +614,104 @@ class VoiceRouterTests(unittest.TestCase):
         self.assertAlmostEqual(float(ui["center"]["lon"]), -0.185)
         self.assertAlmostEqual(float(ui["center"]["lat"]), 5.612)
 
+    def test_tema_osm_zoom_uses_fly_to_not_region_fit_bounds(self):
+        from agents.place_resolve import place_viewport_ui_action
+
+        resolved = {
+            "source": "osm",
+            "matched_as": "Tema",
+            "center": {"lon": -0.017573, "lat": 5.666951},
+            "bbox": {"west": -0.5, "south": 5.3, "east": 0.4, "north": 6.0},
+        }
+        ui = place_viewport_ui_action(resolved, mode="zoom", tab="map")
+        self.assertIsNotNone(ui)
+        assert ui is not None
+        self.assertEqual(ui["type"], "fly_to")
+        self.assertAlmostEqual(float(ui["center"]["lat"]), 5.666951, places=3)
+
+    def test_parse_zoom_in_to_tema_is_pan_not_relative_zoom(self):
+        from agents.voice_router import parse_intent, _parse_zoom_relative_intent
+
+        self.assertIsNone(_parse_zoom_relative_intent("zoom in to tema"))
+        intent = parse_intent("zoom in to tema", session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "pan")
+        self.assertTrue(intent.zoom_close)
+        self.assertEqual(intent.district, "tema")
+
+    def test_parse_zoom_to_tema(self):
+        from agents.voice_router import parse_intent
+
+        intent = parse_intent("zoom to tema", session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "pan")
+        self.assertTrue(intent.zoom_close)
+        self.assertEqual(intent.district, "tema")
+
+    def test_tema_city_geocoded_before_region_polygon(self):
+        from unittest.mock import MagicMock, patch
+
+        from agents.place_resolve import resolve_place
+
+        osm_hit = {
+            "query": "Tema",
+            "matched_as": "Tema",
+            "confidence": 0.8,
+            "source": "osm",
+            "district": "Tema South",
+            "region": "Tema",
+            "center": {"lon": -0.017573, "lat": 5.666951},
+            "bbox": {"west": -0.05, "south": 5.64, "east": 0.02, "north": 5.69},
+            "candidates": [],
+        }
+        conn = MagicMock()
+        with patch("redis_cache.get_json", return_value=None):
+            with patch("redis_cache.set_json"):
+                with patch("agents.place_resolve._lookup_alias_exact", return_value=None):
+                    with patch("agents.place_resolve._resolve_osm", return_value=osm_hit) as mock_osm:
+                        with patch("agents.place_resolve._resolve_metro_region", return_value=None):
+                            result = resolve_place(conn, "Tema")
+        mock_osm.assert_called_once()
+        self.assertEqual(result["source"], "osm")
+        self.assertAlmostEqual(float(result["center"]["lat"]), 5.666951, places=3)
+
+    def test_voice_turn_fast_only_skips_llm(self):
+        from unittest.mock import MagicMock, patch
+
+        from agents.voice import run_voice_turn
+
+        conn = MagicMock()
+        with patch("agents.voice.try_copilot_fast_path", return_value=(None, None)):
+            with patch("agents.voice.run_steward_chat") as slow:
+                result = run_voice_turn(
+                    conn,
+                    text="explain the whole grid topology in detail",
+                    fast_only=True,
+                )
+        slow.assert_not_called()
+        self.assertTrue(result.agent.get("fast_only_miss"))
+
+    def test_resolve_place_uses_cache(self):
+        from unittest.mock import MagicMock, patch
+
+        from agents.place_resolve import resolve_place
+
+        cached = {
+            "query": "Tema",
+            "matched_as": "Tema",
+            "source": "osm",
+            "center": {"lon": -0.02, "lat": 5.67},
+            "confidence": 0.8,
+        }
+        conn = MagicMock()
+        with patch("redis_cache.get_json", return_value=cached):
+            with patch("agents.place_resolve._resolve_place_uncached") as uncached:
+                result = resolve_place(conn, "Tema")
+        uncached.assert_not_called()
+        self.assertTrue(result.get("cached"))
+
     def test_parse_take_me_to_locality(self):
         from agents.voice_router import parse_intent
 
@@ -735,6 +832,104 @@ class VoiceRouterTests(unittest.TestCase):
         self.assertIsNotNone(intent)
         assert intent is not None
         self.assertEqual(intent.kind, "trace_connection_path")
+
+    def test_parse_trace_downstream_path(self):
+        from agents.voice_router import parse_intent
+
+        for text in (
+            "what's downstream from this node",
+            "show downstream impact on the map",
+            "what would be affected downstream",
+            "trace the downstream path",
+        ):
+            with self.subTest(text=text):
+                intent = parse_intent(text, session={}, context={})
+                self.assertIsNotNone(intent, msg=text)
+                assert intent is not None
+                self.assertEqual(intent.kind, "trace_downstream_path", msg=text)
+
+    def test_parse_trace_connection_not_downstream(self):
+        from agents.voice_router import parse_intent
+
+        intent = parse_intent("trace the connection path from this node", session={}, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "trace_connection_path")
+
+    def test_impact_payload_to_geojson(self):
+        from agents.graph_tools import _impact_payload_to_geojson
+
+        nodes_fc, edges_fc, bbox = _impact_payload_to_geojson(
+            {
+                "start_mrid": "seed-1",
+                "nodes": [
+                    {
+                        "mrid": "seed-1",
+                        "name": "Breaker A",
+                        "latitude": 5.6,
+                        "longitude": -0.2,
+                    },
+                    {
+                        "mrid": "n-2",
+                        "name": "Pole B",
+                        "latitude": 5.601,
+                        "longitude": -0.201,
+                        "traced": True,
+                    },
+                ],
+                "edges": [
+                    {"mrid": "e-1", "source": "seed-1", "target": "n-2", "voltage": "MV_11KV"},
+                ],
+            }
+        )
+        self.assertEqual(len(nodes_fc["features"]), 2)
+        self.assertEqual(len(edges_fc["features"]), 1)
+        self.assertIsNotNone(bbox)
+
+    def test_trace_downstream_path_ui_action(self):
+        from agents import graph_tools
+
+        conn = MagicMock()
+        with patch("agents.portal_context.resolve_node_mrid") as resolve_mock, patch(
+            "topology_analysis.downstream_impact_payload"
+        ) as impact_mock:
+            resolve_mock.return_value = {"mrid": "seed-1", "name": "Breaker A"}
+            impact_mock.return_value = {
+                "start_mrid": "seed-1",
+                "nodes": [
+                    {
+                        "mrid": "seed-1",
+                        "name": "Breaker A",
+                        "latitude": 5.6,
+                        "longitude": -0.2,
+                    },
+                    {
+                        "mrid": "n-2",
+                        "name": "Pole B",
+                        "latitude": 5.601,
+                        "longitude": -0.201,
+                        "traced": True,
+                    },
+                ],
+                "edges": [
+                    {"mrid": "e-1", "source": "seed-1", "target": "n-2", "voltage": "MV_11KV"},
+                ],
+                "metrics": {"downstream_nodes": 1, "edge_count": 1, "truncated": False},
+            }
+
+            result = graph_tools.trace_downstream_path(
+                conn,
+                context={"focus_mrid": "seed-1"},
+                show_on_map=True,
+            )
+
+        self.assertEqual(result["downstream_nodes"], 1)
+        ui = result.get("ui_action")
+        self.assertIsNotNone(ui)
+        assert ui is not None
+        self.assertEqual(ui["type"], "show_downstream_impact")
+        self.assertEqual(ui["start_mrid"], "seed-1")
+        self.assertIn("impact", ui)
 
     def test_parse_trace_feeder_explicit(self):
         from agents.voice_router import parse_intent

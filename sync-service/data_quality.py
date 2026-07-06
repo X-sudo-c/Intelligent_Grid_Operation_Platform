@@ -229,6 +229,9 @@ RULES: dict[str, Callable[[dict[str, Any]], RuleResult]] = {
     "FEEDER_TRACE_COMPLETE": _r_network_only,
     "TOPO_DANGLING_LINE_ENDPOINT": _r_batch_only,
     "TOPO_LINE_ENDPOINT_NOT_APPROVED": _r_batch_only,
+    "TOPO_LINE_ENDPOINT_GEOM_MISMATCH": _r_batch_only,
+    "TOPO_GEOM_DANGLING_ENDPOINT": _r_batch_only,
+    "TOPO_LINE_CROSSING_WITHOUT_NODE": _r_batch_only,
 }
 
 
@@ -765,6 +768,10 @@ def run_referential_batch_checks(conn) -> dict[str, Any]:
             """
         )
         results["unapproved_endpoints"] = cur.rowcount
+
+    from geometric_topology import bulk_upsert_geometric_topology
+
+    results["geometric_topology"] = bulk_upsert_geometric_topology(conn, clip=None, tier="master")
     return results
 
 
@@ -1330,115 +1337,123 @@ def list_dq_queue(
         duplicates_only=duplicates_only,
     )
     where = f"WHERE {' AND '.join(filters)}"
-    query_params = [*params, *nested_params, limit, offset]
+    query_params = [*params, limit, offset, *nested_params]
     with conn.cursor() as cur:
         cur.execute(
             f"""
+            WITH page AS (
+              SELECT
+                cn.mrid,
+                io.name,
+                io.validation,
+                io.submitted_by,
+                io.work_order_id,
+                io.photo_url,
+                io.updated_at,
+                io.lifecycle_state,
+                cn.geom,
+                cn.boundary_feeder_id,
+                COALESCE(ga.asset_kind, 'connectivity_node') AS asset_kind,
+                ga.operating_utility,
+                ga.substation_name
+              FROM staging.connectivity_nodes cn
+              JOIN staging.identified_objects io ON io.mrid = cn.mrid
+              LEFT JOIN staging.ghana_grid_assets ga ON ga.mrid = cn.mrid
+              {where}
+              ORDER BY io.updated_at DESC
+              LIMIT %s OFFSET %s
+            ),
+            colocated AS (
+              SELECT
+                cn.geom,
+                COUNT(*)::int AS colocated_staging_count,
+                COALESCE(
+                  json_agg(
+                    json_build_object(
+                      'mrid', io.mrid::text,
+                      'name', io.name,
+                      'validation', io.validation::text
+                    )
+                    ORDER BY io.name, io.mrid
+                  ),
+                  '[]'::json
+                ) AS colocated_staging_peers
+              FROM staging.connectivity_nodes cn
+              JOIN staging.identified_objects io ON io.mrid = cn.mrid
+              WHERE cn.geom IS NOT NULL
+                AND io.validation <> 'REJECTED'
+                AND cn.geom IN (SELECT geom FROM page WHERE geom IS NOT NULL)
+              GROUP BY cn.geom
+            ),
+            exc_open AS (
+              SELECT
+                e.record_mrid,
+                COUNT(*)::int AS open_exception_count,
+                COUNT(*) FILTER (WHERE r.blocks_promotion)::int AS blocking_open_count
+              FROM staging.data_quality_exceptions e
+              JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
+              WHERE e.status = 'OPEN'
+                AND e.record_mrid IN (SELECT mrid FROM page)
+              GROUP BY e.record_mrid
+            ),
+            exc_detail AS (
+              SELECT
+                e.record_mrid,
+                COALESCE(
+                  json_agg(
+                    json_build_object(
+                      'id', e.id::text,
+                      'record_type', e.record_type,
+                      'record_mrid', e.record_mrid::text,
+                      'rule_code', e.rule_code,
+                      'domain', r.domain,
+                      'severity', e.severity::text,
+                      'status', e.status::text,
+                      'error_message', e.error_message,
+                      'details', e.details,
+                      'created_at', e.created_at,
+                      'rule_description', r.description,
+                      'blocks_promotion', r.blocks_promotion
+                    )
+                    ORDER BY e.created_at DESC
+                  ),
+                  '[]'::json
+                ) AS exceptions
+              FROM staging.data_quality_exceptions e
+              JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
+              WHERE e.record_mrid IN (SELECT mrid FROM page)
+                {nested_where}
+              GROUP BY e.record_mrid
+            )
             SELECT
-              cn.mrid::text,
-              io.name,
-              io.validation::text,
-              io.submitted_by,
-              io.work_order_id,
-              io.photo_url,
-              io.updated_at,
-              io.lifecycle_state::text,
-              ST_X(cn.geom) AS longitude,
-              ST_Y(cn.geom) AS latitude,
-              cn.boundary_feeder_id,
-              COALESCE(ga.asset_kind, 'connectivity_node') AS asset_kind,
-              ga.operating_utility::text,
-              ga.substation_name,
+              p.mrid::text,
+              p.name,
+              p.validation::text,
+              p.submitted_by,
+              p.work_order_id,
+              p.photo_url,
+              p.updated_at,
+              p.lifecycle_state::text,
+              ST_X(p.geom) AS longitude,
+              ST_Y(p.geom) AS latitude,
+              p.boundary_feeder_id,
+              p.asset_kind,
+              p.operating_utility::text,
+              p.substation_name,
               CASE
-                WHEN cn.geom IS NOT NULL THEN ST_AsText(cn.geom)
+                WHEN p.geom IS NOT NULL THEN ST_AsText(p.geom)
                 ELSE NULL
               END AS location_key,
-              (
-                SELECT COUNT(*)::int
-                FROM staging.connectivity_nodes cn2
-                JOIN staging.identified_objects io2 ON io2.mrid = cn2.mrid
-                WHERE cn.geom IS NOT NULL
-                  AND cn2.geom = cn.geom
-                  AND io2.validation <> 'REJECTED'
-              ) AS colocated_staging_count,
-              (
-                SELECT COALESCE(
-                  json_agg(
-                    json_build_object(
-                      'mrid', io2.mrid::text,
-                      'name', io2.name,
-                      'validation', io2.validation::text
-                    )
-                    ORDER BY io2.name, io2.mrid
-                  ),
-                  '[]'::json
-                )
-                FROM staging.connectivity_nodes cn2
-                JOIN staging.identified_objects io2 ON io2.mrid = cn2.mrid
-                WHERE cn.geom IS NOT NULL
-                  AND cn2.geom = cn.geom
-                  AND io2.validation <> 'REJECTED'
-              ) AS colocated_staging_peers,
-              (
-                SELECT COUNT(*)::int
-                FROM staging.data_quality_exceptions e
-                WHERE e.record_mrid = cn.mrid AND e.status = 'OPEN'
-              ) AS open_exception_count,
-              (
-                SELECT COUNT(*)::int
-                FROM staging.data_quality_exceptions e
-                JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
-                WHERE e.record_mrid = cn.mrid
-                  AND e.status = 'OPEN'
-                  AND r.blocks_promotion = TRUE
-              ) AS blocking_open_count,
-              (
-                SELECT COALESCE(
-                  json_agg(
-                    json_build_object(
-                      'id', ex.id,
-                      'record_type', ex.record_type,
-                      'record_mrid', ex.record_mrid,
-                      'rule_code', ex.rule_code,
-                      'domain', ex.domain,
-                      'severity', ex.severity,
-                      'status', ex.status,
-                      'error_message', ex.error_message,
-                      'details', ex.details,
-                      'created_at', ex.created_at,
-                      'rule_description', ex.rule_description,
-                      'blocks_promotion', ex.blocks_promotion
-                    )
-                    ORDER BY ex.created_at DESC
-                  ),
-                  '[]'::json
-                )
-                FROM (
-                  SELECT
-                    e.id::text,
-                    e.record_type,
-                    e.record_mrid::text,
-                    e.rule_code,
-                    r.domain,
-                    e.severity::text AS severity,
-                    e.status::text AS status,
-                    e.error_message,
-                    e.details,
-                    e.created_at,
-                    r.description AS rule_description,
-                    r.blocks_promotion
-                  FROM staging.data_quality_exceptions e
-                  JOIN public.data_quality_rules r ON r.rule_code = e.rule_code
-                  WHERE e.record_mrid = cn.mrid
-                    {nested_where}
-                ) ex
-              ) AS exceptions
-            FROM staging.connectivity_nodes cn
-            JOIN staging.identified_objects io ON io.mrid = cn.mrid
-            LEFT JOIN staging.ghana_grid_assets ga ON ga.mrid = cn.mrid
-            {where}
-            ORDER BY io.updated_at DESC
-            LIMIT %s OFFSET %s
+              COALESCE(c.colocated_staging_count, 1)::int AS colocated_staging_count,
+              COALESCE(c.colocated_staging_peers, '[]'::json) AS colocated_staging_peers,
+              COALESCE(eo.open_exception_count, 0)::int AS open_exception_count,
+              COALESCE(eo.blocking_open_count, 0)::int AS blocking_open_count,
+              COALESCE(ed.exceptions, '[]'::json) AS exceptions
+            FROM page p
+            LEFT JOIN colocated c ON p.geom IS NOT NULL AND c.geom = p.geom
+            LEFT JOIN exc_open eo ON eo.record_mrid = p.mrid
+            LEFT JOIN exc_detail ed ON ed.record_mrid = p.mrid
+            ORDER BY p.updated_at DESC
             """,
             query_params,
         )

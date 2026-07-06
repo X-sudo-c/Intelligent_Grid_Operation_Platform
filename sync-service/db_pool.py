@@ -99,6 +99,12 @@ def _checkout(pool: _pgpool.ThreadedConnectionPool):
         return pool.getconn()
 
 
+def set_local_statement_timeout(conn, ms: int) -> None:
+    """Cap query runtime for the current transaction (milliseconds)."""
+    with conn.cursor() as cur:
+        cur.execute("SET LOCAL statement_timeout = %s", (str(ms),))
+
+
 def pooled_connect(dsn: str):
     """Drop-in replacement for psycopg2.connect(dsn) backed by a shared pool."""
     try:

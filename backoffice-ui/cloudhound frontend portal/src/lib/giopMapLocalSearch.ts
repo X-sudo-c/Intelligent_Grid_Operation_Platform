@@ -10,12 +10,78 @@ import type { Map as MaplibreMap } from 'maplibre-gl';
 
 export type GiopMapSearchFilter = 'all' | GiopMapSearchKind;
 
+function normalizeSearchText(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const row = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    let prev = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? row[j - 1] : Math.min(row[j - 1], row[j], prev) + 1;
+      row[j - 1] = prev;
+      prev = cost;
+    }
+    row[b.length] = prev;
+  }
+  return row[b.length];
+}
+
+/** Substring, token-prefix, or small edit-distance match for map spotlight. */
+export function fuzzyMatchesMapQuery(haystack: string, query: string): boolean {
+  const q = normalizeSearchText(query);
+  if (!q) return false;
+
+  const h = normalizeSearchText(haystack);
+  if (!h) return false;
+  if (h.includes(q)) return true;
+
+  const qTokens = q.split(/\s+/).filter(Boolean);
+  const hTokens = h.split(/\s+/).filter(Boolean);
+
+  for (const token of hTokens) {
+    if (token.startsWith(q)) return true;
+    if (q.length >= 3 && token.length >= 3) {
+      const maxDist = q.length <= 4 ? 1 : q.length <= 6 ? 2 : 3;
+      const window = token.slice(0, Math.max(token.length, q.length + 1));
+      if (levenshtein(q, window) <= maxDist) return true;
+    }
+  }
+
+  if (qTokens.length > 1) {
+    return qTokens.every(
+      (qt) => hTokens.some((ht) => ht.includes(qt) || ht.startsWith(qt) || levenshtein(qt, ht) <= 1),
+    );
+  }
+
+  return false;
+}
+
+function dedupeSearchResults(items: GiopMapSearchResult[]): GiopMapSearchResult[] {
+  const seen = new Set<string>();
+  const out: GiopMapSearchResult[] = [];
+  for (const item of items) {
+    const key = `${item.kind}:${item.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
 function rankMatch(title: string, query: string): number {
   const t = title.toLowerCase();
   const q = query.toLowerCase();
   if (t === q) return 0;
   if (t.startsWith(q)) return 1;
   if (t.includes(q)) return 2;
+  const tokens = t.split(/[\s,/\-–—]+/);
+  if (tokens.some((token) => token.startsWith(q))) return 3;
+  if (fuzzyMatchesMapQuery(title, query)) return 4;
   return 99;
 }
 
@@ -58,8 +124,8 @@ export function searchLocalMapCatalog(
 
   const hits = catalog.filter((item) => {
     if (kinds && !kinds.has(item.kind)) return false;
-    const hay = `${item.title} ${item.subtitle ?? ''} ${item.id}`.toLowerCase();
-    return hay.includes(q.toLowerCase());
+    const hay = `${item.title} ${item.subtitle ?? ''} ${item.id}`;
+    return fuzzyMatchesMapQuery(hay, q);
   });
 
   hits.sort((a, b) => compareSearchHits(a, b, q));
@@ -74,24 +140,39 @@ export function searchMapCatalog(options: {
   opsCatalog: GiopMapSearchResult[];
   query: string;
   limit?: number;
+  /** OSM / server geocode hits — always shown (already matched upstream). */
+  geocodeHits?: GiopMapSearchResult[];
+  /** Server-side DB search fallback hits. */
+  remoteHits?: GiopMapSearchResult[];
 }): GiopMapSearchResult[] {
-  const { filter, placeCatalog, opsCatalog, query, limit = 12 } = options;
+  const { filter, placeCatalog, opsCatalog, query, limit = 12, geocodeHits = [], remoteHits = [] } = options;
   const q = query.trim();
   if (q.length < 1) return [];
 
+  const passthrough = dedupeSearchResults([...geocodeHits, ...remoteHits]);
+
   if (filter === 'place') {
-    return searchLocalMapCatalog(placeCatalog, q, 'place', limit);
+    const local = searchLocalMapCatalog(placeCatalog, q, 'place', limit);
+    const merged = dedupeSearchResults([...passthrough.filter((item) => item.kind === 'place'), ...local]);
+    merged.sort((a, b) => compareSearchHits(a, b, q));
+    return merged.slice(0, limit);
   }
 
   if (filter !== 'all') {
-    return searchLocalMapCatalog(opsCatalog, q, filter, limit);
+    const local = searchLocalMapCatalog(opsCatalog, q, filter, limit);
+    const merged = dedupeSearchResults([
+      ...passthrough.filter((item) => item.kind === filter),
+      ...local,
+    ]);
+    merged.sort((a, b) => compareSearchHits(a, b, q));
+    return merged.slice(0, limit);
   }
 
   const placeLimit = Math.max(4, Math.ceil(limit / 2));
   const placeHits = searchLocalMapCatalog(placeCatalog, q, 'place', placeLimit);
   const opsLimit = Math.max(limit - placeHits.length, 4);
   const opsHits = searchLocalMapCatalog(opsCatalog, q, 'all', opsLimit);
-  const merged = [...placeHits, ...opsHits];
+  const merged = dedupeSearchResults([...passthrough, ...placeHits, ...opsHits]);
   merged.sort((a, b) => compareSearchHits(a, b, q));
   return merged.slice(0, limit);
 }
@@ -154,6 +235,36 @@ export function buildOpsSearchCatalog(options: {
   }
 
   return out;
+}
+
+export function buildGraphNodeSearchCatalog(
+  graph: { nodes: Array<{ id: string; label?: string; name?: string }> } | null,
+): GiopMapSearchResult[] {
+  if (!graph?.nodes.length) return [];
+  return graph.nodes.map((node) => ({
+    kind: 'asset' as const,
+    id: node.id,
+    title: node.label || node.name || node.id,
+    subtitle: 'Network node',
+    longitude: null,
+    latitude: null,
+  }));
+}
+
+export function mergeSearchCatalogs(
+  primary: GiopMapSearchResult[],
+  extra: GiopMapSearchResult[],
+): GiopMapSearchResult[] {
+  if (!extra.length) return primary;
+  const seen = new Set(primary.map((item) => `${item.kind}:${item.id}`));
+  const merged = [...primary];
+  for (const item of extra) {
+    const key = `${item.kind}:${item.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(item);
+  }
+  return merged;
 }
 
 /** @deprecated Prefer separate place + ops catalogs for search performance. */

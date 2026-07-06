@@ -3,7 +3,8 @@ import { ChevronDown, Database, Layers } from 'lucide-react';
 import { useState } from 'react';
 import { PremiumMetricCard } from './PremiumCard';
 import { ease, fadeUpItem, staggerContainer } from '../lib/motion';
-import type { GiopDqSummary, GiopTopologyDqSummary } from '../api/giop-api';
+import type { GiopDqSummary, GiopTopologyDqSummary, GiopTopologyScanProgress } from '../api/giop-api';
+import { TopologyScanProgressContent } from './TopologyScanProgressContent';
 
 export type DqDataTier = 'master' | 'staging';
 
@@ -177,6 +178,9 @@ interface DqTierMetricsPanelProps {
   topoRevalidating: boolean;
   topoLiveBusy: boolean;
   scanBusy: boolean;
+  scanProgress?: GiopTopologyScanProgress | null;
+  scanPollError?: string | null;
+  scanStartedMs?: number;
   onRefreshLive: () => void;
   onRunTopologyScan: () => void;
 }
@@ -191,6 +195,9 @@ export function DqTierMetricsPanel({
   topoRevalidating,
   topoLiveBusy,
   scanBusy,
+  scanProgress,
+  scanPollError,
+  scanStartedMs = 0,
   onRefreshLive,
   onRunTopologyScan,
 }: DqTierMetricsPanelProps) {
@@ -201,11 +208,13 @@ export function DqTierMetricsPanel({
 
   const statusLine = topoRevalidating
     ? 'Updating…'
-    : topoSummary?.source === 'live'
-      ? 'Live · just computed'
-      : tier === 'staging'
-        ? 'Live from staging tables'
-        : `As of last scan · ${formatAgo(topoSummary?.scanned_at)}`;
+    : topoSummary?.source === 'pending'
+      ? 'No scan yet — run Scan → queue'
+      : topoSummary?.source === 'live'
+        ? 'Live · just computed'
+        : tier === 'staging'
+          ? 'Live from staging tables'
+          : `As of last scan · ${formatAgo(topoSummary?.scanned_at)}`;
 
   return (
     <motion.div
@@ -251,7 +260,7 @@ export function DqTierMetricsPanel({
           <div className="flex items-center gap-1.5 shrink-0">
             <button
               type="button"
-              disabled={topoLiveBusy || scanBusy}
+              disabled={(topoLiveBusy && tier !== 'master') || scanBusy}
               onClick={onRefreshLive}
               className={`rounded-lg border text-xs py-1 px-2 disabled:opacity-50 transition-colors ${
                 isLightMode
@@ -259,7 +268,13 @@ export function DqTierMetricsPanel({
                   : 'border-premium-border/50 text-premium-text-secondary hover:bg-premium-hover'
               }`}
             >
-              {topoLiveBusy ? '…' : 'Refresh live'}
+              {scanBusy && tier === 'master'
+                ? 'Scanning…'
+                : topoLiveBusy
+                  ? '…'
+                  : tier === 'master'
+                    ? 'Run scan'
+                    : 'Refresh live'}
             </button>
             <AnimatePresence mode="wait">
               {tier === 'master' && (
@@ -275,14 +290,25 @@ export function DqTierMetricsPanel({
                     isLightMode ? 'giop-btn-primary--light' : 'giop-btn-primary--dark'
                   }`}
                 >
-                  {scanBusy ? '…' : 'Scan → queue'}
+                  {scanBusy ? 'Scanning…' : 'Scan → queue'}
                 </motion.button>
               )}
             </AnimatePresence>
           </div>
         </div>
 
-        {!metricsExpanded && topoSummary && (
+        {scanBusy && scanProgress && tier === 'master' && (
+          <TopologyScanProgressContent
+            runId={scanProgress.run_id}
+            progress={scanProgress}
+            pollError={scanPollError ?? null}
+            isLightMode={isLightMode}
+            localStartedMs={scanStartedMs}
+            compact
+          />
+        )}
+
+        {!metricsExpanded && topoSummary && topoSummary.source !== 'pending' && (
           <div className="flex flex-wrap gap-1.5">
             <CompactStat
               isLightMode={isLightMode}
@@ -338,6 +364,11 @@ export function DqTierMetricsPanel({
               />
             ))}
           </div>
+        ) : topoSummary?.source === 'pending' ? (
+          <p className={`text-xs py-2 ${muted}`}>
+            Master topology metrics need a completed scan. Use <strong>Scan → queue</strong> (may take
+            several minutes), or <strong>Refresh live</strong> for an on-demand count.
+          </p>
         ) : topoSummary ? (
           <AnimatePresence mode="wait">
             <motion.div

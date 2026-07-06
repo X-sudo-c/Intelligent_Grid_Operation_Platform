@@ -12,13 +12,20 @@ from typing import Any, Callable, Iterator, TypeVar
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 CACHE_TTL_SEC = int(os.getenv("REDIS_CACHE_TTL_SEC", "600"))
+GRAPH_CHUNK_CACHE_TTL_SEC = int(os.getenv("REDIS_GRAPH_CHUNK_CACHE_TTL_SEC", "1800"))
+REFERENCE_LAYERS_CACHE_TTL_SEC = int(os.getenv("REDIS_REFERENCE_LAYERS_CACHE_TTL_SEC", "900"))
 OPS_CACHE_TTL_SEC = int(os.getenv("REDIS_OPS_CACHE_TTL_SEC", "60"))
+TOPOLOGY_SNAPSHOT_CACHE_TTL_SEC = int(
+    os.getenv("REDIS_TOPOLOGY_SNAPSHOT_CACHE_TTL_SEC", "600")
+)
 SCHEMATIC_CACHE_TTL_SEC = int(os.getenv("REDIS_SCHEMATIC_CACHE_TTL_SEC", "900"))
 CIM_PREVIEW_TTL_SEC = int(os.getenv("REDIS_CIM_PREVIEW_TTL_SEC", "300"))
 RULES_CACHE_TTL_SEC = int(os.getenv("REDIS_RULES_CACHE_TTL_SEC", "3600"))
 LOCK_TTL_SEC = int(os.getenv("REDIS_LOCK_TTL_SEC", "600"))
 WEBHOOK_DEDUP_TTL_SEC = int(os.getenv("REDIS_WEBHOOK_DEDUP_TTL_SEC", "86400"))
 IDEMPOTENCY_TTL_SEC = int(os.getenv("REDIS_IDEMPOTENCY_TTL_SEC", "86400"))
+PLACE_GEOCODE_CACHE_TTL_SEC = int(os.getenv("PLACE_GEOCODE_CACHE_TTL_SEC", "86400"))
+PLACE_RESOLVE_CACHE_TTL_SEC = int(os.getenv("PLACE_RESOLVE_CACHE_TTL_SEC", "3600"))
 
 _KEY_PREFIX = "giop:"
 _client: Any = None
@@ -130,6 +137,19 @@ def cached_json(key: str, builder: Callable[[], T], ttl_sec: int | None = None) 
     return result
 
 
+def delete_key(key: str) -> bool:
+    client = _connect()
+    if client is None:
+        return False
+    try:
+        return bool(client.delete(key))
+    except Exception as exc:
+        global _last_error
+        _last_error = str(exc)
+        _reset_client()
+        return False
+
+
 def delete_pattern(pattern: str) -> int:
     client = _connect()
     if client is None:
@@ -161,7 +181,8 @@ def invalidate_topology_cache() -> int:
         f"{_KEY_PREFIX}assets:detail:*",
         f"{_KEY_PREFIX}schematic:*",
         f"{_KEY_PREFIX}graph:parity",
-        f"{_KEY_PREFIX}cim:preview:*",
+        f"{_KEY_PREFIX}gis:import:*",
+        f"{_KEY_PREFIX}reference:layers",
     ):
         total += delete_pattern(pattern)
     return total
@@ -254,6 +275,10 @@ def topology_gaps_key(
         f"{_KEY_PREFIX}topology:gaps:{limit}:"
         f"{round(west, 4)}:{round(south, 4)}:{round(east, 4)}:{round(north, 4)}"
     )
+
+
+def reference_layers_key() -> str:
+    return f"{_KEY_PREFIX}reference:layers"
 
 
 def topology_impact_key(start_mrid: str, max_nodes: int) -> str:
@@ -364,6 +389,18 @@ def h3_assignments_geojson_key(assigned_to: str | None, status: str | None) -> s
     return f"{_KEY_PREFIX}h3:assignments:{assigned_to or '*'}:{status or '*'}"
 
 
+def geocode_places_key(query: str, limit: int) -> str:
+    normalized = " ".join((query or "").strip().lower().split())
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return f"{_KEY_PREFIX}geocode:{limit}:{digest}"
+
+
+def place_resolve_key(query: str, *, geocode_enabled: bool) -> str:
+    normalized = " ".join((query or "").strip().lower().split())
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return f"{_KEY_PREFIX}place:resolve:{int(geocode_enabled)}:{digest}"
+
+
 def graph_parity_key() -> str:
     return f"{_KEY_PREFIX}graph:parity"
 
@@ -379,6 +416,22 @@ def nav_badges_key() -> str:
 def topology_dq_summary_key(tier: str = "master", mode: str = "snapshot") -> str:
     """Under the topology: namespace so topology invalidation clears it."""
     return f"{_KEY_PREFIX}topology:dq:summary:{tier}:{mode}"
+
+
+def topology_scan_progress_key(run_id: str) -> str:
+    return f"{_KEY_PREFIX}topology:scan:progress:{run_id}"
+
+
+def topology_scan_active_key() -> str:
+    return f"{_KEY_PREFIX}topology:scan:active"
+
+
+TOPOLOGY_SCAN_LOCK_NAME = "topology_master_scan"
+TOPOLOGY_SCAN_LOCK_TTL_SEC = int(os.getenv("TOPOLOGY_SCAN_LOCK_TTL_SEC", "7200"))
+
+
+def gis_import_summary_key(district: str | None = None) -> str:
+    return f"{_KEY_PREFIX}gis:import:summary:{district or 'all'}"
 
 
 def dq_rules_key() -> str:
@@ -494,6 +547,33 @@ def release_lock(name: str, token: str | None) -> None:
     """
     try:
         client.eval(release_script, 1, key, token)
+    except Exception as exc:
+        global _last_error
+        _last_error = str(exc)
+        _reset_client()
+
+
+def lock_held(name: str) -> bool:
+    client = _connect()
+    if client is None:
+        return False
+    key = f"{_KEY_PREFIX}lock:{name}"
+    try:
+        return bool(client.exists(key))
+    except Exception as exc:
+        global _last_error
+        _last_error = str(exc)
+        _reset_client()
+        return False
+
+
+def force_release_lock(name: str) -> None:
+    client = _connect()
+    if client is None:
+        return
+    key = f"{_KEY_PREFIX}lock:{name}"
+    try:
+        client.delete(key)
     except Exception as exc:
         global _last_error
         _last_error = str(exc)

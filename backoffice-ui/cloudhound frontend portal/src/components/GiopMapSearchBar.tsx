@@ -7,10 +7,12 @@ import {
   useState,
   type KeyboardEvent,
 } from 'react';
-import { Layers, Search, UserRound, Wrench } from 'lucide-react';
+import { Box, Search, UserRound, Wrench } from 'lucide-react';
 import { useGiopVoiceMode } from '../context/GiopVoiceModeContext';
+import { useGiopMapOverlay } from '../context/GiopMapOverlayContext';
 import { GiopTwistWaveCanvas } from './GiopTwistWaveCanvas';
-import { getMapGeocode, type GiopMapSearchKind, type GiopMapSearchResult } from '../api/giop-api';
+import { GiopNetworkGeometryToggle } from './GiopNetworkGeometryToggle';
+import { getMapGeocode, searchMap, type GiopMapSearchKind, type GiopMapSearchResult } from '../api/giop-api';
 import {
   mergeGeocodePlaces,
   searchMapCatalog,
@@ -27,6 +29,14 @@ interface GiopMapSearchBarProps {
   onSelect: (result: GiopMapSearchResult) => void;
   /** Live camera preview while typing (best match). */
   onPreview: (result: GiopMapSearchResult | null) => void;
+  /** Overlay = map top-center; inline = toolbar row; split = centered over Map + Topology. */
+  variant?: 'overlay' | 'inline' | 'split';
+  placeholder?: string;
+  /** Map + Topology: hide field crew filter and crew results. */
+  hideCrewFilter?: boolean;
+  /** Side map / split toolbar: omit line-geometry layers control (shown elsewhere). */
+  hideGeometryToggle?: boolean;
+  gisOverviewAvailable?: boolean;
 }
 
 const FILTER_OPTIONS: {
@@ -36,12 +46,15 @@ const FILTER_OPTIONS: {
   icon: typeof Search;
 }[] = [
   { id: 'all', label: 'All', title: 'Search everything', icon: Search },
-  { id: 'asset', label: 'Assets', title: 'Staging assets on map', icon: Layers },
+  { id: 'asset', label: 'Assets', title: 'Staging assets on map', icon: Box },
   { id: 'work_order', label: 'Orders', title: 'Work orders', icon: Wrench },
   { id: 'crew', label: 'Crews', title: 'Field technicians', icon: UserRound },
 ];
 
 function kindLabel(result: GiopMapSearchResult): string {
+  if (result.subtitle === 'Network node') {
+    return 'Node';
+  }
   if (result.kind === 'place' && result.id.startsWith('osm:')) {
     return 'Town';
   }
@@ -70,6 +83,11 @@ export function GiopMapSearchBar({
   placesReady = true,
   onSelect,
   onPreview,
+  variant = 'overlay',
+  placeholder = 'Search map',
+  hideCrewFilter = false,
+  hideGeometryToggle = false,
+  gisOverviewAvailable = true,
 }: GiopMapSearchBarProps) {
   const listboxId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -80,13 +98,16 @@ export function GiopMapSearchBar({
     null,
   );
   const geocodeSeqRef = useRef(0);
+  const remoteSeqRef = useRef(0);
 
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<GiopMapSearchFilter>('all');
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
   const [geocodeHits, setGeocodeHits] = useState<GiopMapSearchResult[]>([]);
+  const [remoteHits, setRemoteHits] = useState<GiopMapSearchResult[]>([]);
   const [geocoding, setGeocoding] = useState(false);
+  const [remoteLoading, setRemoteLoading] = useState(false);
 
   const wantsGeocode = filter === 'all';
 
@@ -119,9 +140,53 @@ export function GiopMapSearchBar({
     return () => window.clearTimeout(timer);
   }, [query, wantsGeocode]);
 
+  useEffect(() => {
+    const q = query.trim();
+    if (q.length < 2) {
+      remoteSeqRef.current += 1;
+      setRemoteHits([]);
+      setRemoteLoading(false);
+      return;
+    }
+
+    setRemoteLoading(true);
+    const seq = ++remoteSeqRef.current;
+    const timer = window.setTimeout(() => {
+      void searchMap({ q, limit: 12 })
+        .then((hits) => {
+          if (seq !== remoteSeqRef.current) return;
+          setRemoteHits(hits);
+        })
+        .catch(() => {
+          if (seq !== remoteSeqRef.current) return;
+          setRemoteHits([]);
+        })
+        .finally(() => {
+          if (seq === remoteSeqRef.current) setRemoteLoading(false);
+        });
+    }, 420);
+
+    return () => window.clearTimeout(timer);
+  }, [query]);
+
   const placePool = useMemo(
     () => mergeGeocodePlaces(placeCatalog, geocodeHits),
     [placeCatalog, geocodeHits],
+  );
+
+  const filterOptions = useMemo(
+    () => (hideCrewFilter ? FILTER_OPTIONS.filter((opt) => opt.id !== 'crew') : FILTER_OPTIONS),
+    [hideCrewFilter],
+  );
+
+  const toolbarFilterOptions = useMemo(
+    () => filterOptions.filter((opt) => opt.id !== 'asset'),
+    [filterOptions],
+  );
+
+  const filteredOpsCatalog = useMemo(
+    () => (hideCrewFilter ? opsCatalog.filter((item) => item.kind !== 'crew') : opsCatalog),
+    [hideCrewFilter, opsCatalog],
   );
 
   const results = useMemo(
@@ -129,11 +194,13 @@ export function GiopMapSearchBar({
       searchMapCatalog({
         filter,
         placeCatalog: placePool,
-        opsCatalog,
+        opsCatalog: filteredOpsCatalog,
         query,
         limit: 12,
+        geocodeHits: wantsGeocode ? geocodeHits : [],
+        remoteHits,
       }),
-    [filter, placePool, opsCatalog, query],
+    [filter, placePool, filteredOpsCatalog, query, wantsGeocode, geocodeHits, remoteHits],
   );
 
   useEffect(() => {
@@ -156,9 +223,11 @@ export function GiopMapSearchBar({
     const best = searchMapCatalog({
       filter,
       placeCatalog: placePool,
-      opsCatalog,
+      opsCatalog: filteredOpsCatalog,
       query,
       limit: 1,
+      geocodeHits: wantsGeocode ? geocodeHits : [],
+      remoteHits,
     })[0];
 
     if (!best) {
@@ -170,7 +239,7 @@ export function GiopMapSearchBar({
     if (key === lastPreviewKeyRef.current) return;
     lastPreviewKeyRef.current = key;
     onPreview(best);
-  }, [query, filter, placePool, opsCatalog, onPreview]);
+  }, [query, filter, placePool, filteredOpsCatalog, onPreview, wantsGeocode, geocodeHits, remoteHits]);
 
   const setSearchFilter = useCallback((next: GiopMapSearchFilter) => {
     if (next === filter) return;
@@ -196,15 +265,16 @@ export function GiopMapSearchBar({
 
   const pickResult = useCallback(
     (result: GiopMapSearchResult) => {
-      const trimmed = query.trim();
+      const displayQuery = result.title.trim();
       const key = resultKey(result);
-      confirmedRef.current = { query: trimmed, filter, key };
+      confirmedRef.current = { query: displayQuery, filter, key };
       lastPreviewKeyRef.current = key;
+      setQuery(displayQuery);
       onSelect(result);
       setOpen(false);
       inputRef.current?.blur();
     },
-    [filter, onSelect, query],
+    [filter, onSelect],
   );
 
   const onKeyDown = useCallback(
@@ -245,14 +315,15 @@ export function GiopMapSearchBar({
 
   const showPanel = open && query.trim().length >= 1;
   const indexing = !placesReady && wantsGeocode;
-  const busy = indexing || geocoding;
+  const busy = indexing || geocoding || remoteLoading;
   const voice = useGiopVoiceMode();
   const voiceActive = voice.mapVoiceActive || voice.recording;
+  const { networkGeometryMode, setNetworkGeometryMode } = useGiopMapOverlay();
 
   return (
     <div
       ref={rootRef}
-      className={`giop-map-spotlight ${isLightMode ? 'giop-map-spotlight--light' : 'giop-map-spotlight--dark'}`}
+      className={`giop-map-spotlight ${variant === 'inline' ? 'giop-map-spotlight--inline' : ''} ${variant === 'split' ? 'giop-map-spotlight--split' : ''} ${isLightMode ? 'giop-map-spotlight--light' : 'giop-map-spotlight--dark'}`}
       role="search"
     >
       <div className="giop-map-spotlight__bar">
@@ -274,7 +345,7 @@ export function GiopMapSearchBar({
             inputRef.current?.select();
           }}
           onKeyDown={onKeyDown}
-          placeholder="Search map"
+          placeholder={placeholder}
           className="giop-map-spotlight__input"
           aria-label="Search map"
           aria-expanded={showPanel}
@@ -287,7 +358,7 @@ export function GiopMapSearchBar({
       </div>
 
       <div className="giop-map-spotlight__filters" role="group" aria-label="Search filters">
-        {FILTER_OPTIONS.slice(0, 1).map(({ id, title, icon: Icon }) => {
+        {toolbarFilterOptions.slice(0, 1).map(({ id, title, icon: Icon }) => {
           const active = filter === id;
           return (
             <button
@@ -319,7 +390,16 @@ export function GiopMapSearchBar({
             active={voiceActive}
           />
         </button>
-        {FILTER_OPTIONS.slice(1).map(({ id, title, icon: Icon }) => {
+        {!hideGeometryToggle && (
+          <GiopNetworkGeometryToggle
+            variant="inline"
+            isLightMode={isLightMode}
+            gisOverviewAvailable={gisOverviewAvailable}
+            mode={networkGeometryMode}
+            onModeChange={setNetworkGeometryMode}
+          />
+        )}
+        {toolbarFilterOptions.slice(1).map(({ id, title, icon: Icon }) => {
           const active = filter === id;
           return (
             <button
@@ -340,7 +420,7 @@ export function GiopMapSearchBar({
       {showPanel && (
         <div className="giop-map-spotlight__panel" id={listboxId} role="listbox">
           {busy && results.length === 0 && (
-            <p className="giop-map-spotlight__empty">Looking up places…</p>
+            <p className="giop-map-spotlight__empty">Looking up matches…</p>
           )}
           {!busy && results.length === 0 && (
             <p className="giop-map-spotlight__empty">No results for &ldquo;{query.trim()}&rdquo;</p>

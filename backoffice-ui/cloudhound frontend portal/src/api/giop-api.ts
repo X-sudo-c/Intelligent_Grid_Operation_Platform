@@ -35,13 +35,19 @@ export interface GiopTraceResponse {
   edges: GiopTraceEdge[];
   start_mrid: string;
   scope?: 'traced' | 'full';
+  backend?: 'memgraph' | 'postgres' | string;
   graph_totals?: { nodes: number; edges: number };
   bounds?: {
     max_hops: number;
     max_nodes: number;
     max_edges: number;
     truncated: boolean;
-    mode: 'traced' | 'full_bounded' | 'viewport_fallback';
+    mode:
+      | 'traced'
+      | 'full_bounded'
+      | 'viewport_fallback'
+      | 'memgraph_traced'
+      | 'memgraph_full';
     edges_truncated?: boolean;
   };
   bbox?: { west: number; south: number; east: number; north: number };
@@ -65,6 +71,7 @@ export interface GiopGraphChunkResponse {
   edges_truncated?: boolean;
   limit: number;
   edge_limit?: number;
+  backend?: 'memgraph' | 'postgres';
 }
 
 export interface GiopStagingAsset {
@@ -118,8 +125,20 @@ async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(url, options);
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    const detail = (err as { detail?: string }).detail || res.statusText;
-    throw new Error(detail || `HTTP ${res.status}`);
+    const detail = (err as { detail?: unknown }).detail ?? res.statusText;
+    const message =
+      typeof detail === 'string'
+        ? detail
+        : typeof detail === 'object' && detail && 'message' in detail
+          ? String((detail as { message?: string }).message)
+          : `HTTP ${res.status}`;
+    const error = new Error(message || `HTTP ${res.status}`) as Error & {
+      status?: number;
+      detail?: unknown;
+    };
+    error.status = res.status;
+    error.detail = detail;
+    throw error;
   }
   return res.json() as Promise<T>;
 }
@@ -193,7 +212,10 @@ export async function getGraphChunk(params: {
   east: number;
   north: number;
   limit?: number;
+  edgeLimit?: number;
   startMrid?: string;
+  /** Abort slow bbox queries (ms). Default 90s. */
+  timeoutMs?: number;
 }): Promise<GiopGraphChunkResponse> {
   const query = new URLSearchParams({
     west: String(params.west),
@@ -201,9 +223,48 @@ export async function getGraphChunk(params: {
     east: String(params.east),
     north: String(params.north),
     limit: String(params.limit ?? 2000),
+    edge_limit: String(params.edgeLimit ?? 8000),
   });
   if (params.startMrid) query.set('start_mrid', params.startMrid);
-  return fetchJson<GiopGraphChunkResponse>(`${SYNC_BASE}/graph/chunk?${query}`);
+
+  const timeoutMs = params.timeoutMs ?? 90_000;
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetchJson<GiopGraphChunkResponse>(`${SYNC_BASE}/graph/chunk?${query}`, {
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error(`Map chunk timed out after ${Math.round(timeoutMs / 1000)}s — zoom out or retry`);
+    }
+    throw err;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+export interface GiopSampleConnectedNode {
+  mrid: string;
+  name: string;
+  lon?: number | null;
+  lat?: number | null;
+}
+
+/** One connectivity node on at least one line — used when the demo seed island is active. */
+export async function getSampleConnectedNode(params?: {
+  west?: number;
+  south?: number;
+  east?: number;
+  north?: number;
+}): Promise<GiopSampleConnectedNode> {
+  const query = new URLSearchParams();
+  if (params?.west != null) query.set('west', String(params.west));
+  if (params?.south != null) query.set('south', String(params.south));
+  if (params?.east != null) query.set('east', String(params.east));
+  if (params?.north != null) query.set('north', String(params.north));
+  const suffix = query.toString() ? `?${query}` : '';
+  return fetchJson<GiopSampleConnectedNode>(`${SYNC_BASE}/graph/sample-connected-node${suffix}`);
 }
 
 export async function getH3Coverage(params: {
@@ -799,8 +860,8 @@ export interface GiopTopologyDqSummary {
     reasons: string[];
     caps: { open_topology_exceptions: number; orphan_ratio: number };
   };
-  /** 'snapshot' = served from the last scan (fast); 'live' = freshly computed. */
-  source?: 'snapshot' | 'live';
+  /** 'snapshot' = served from the last scan (fast); 'live' = freshly computed; 'pending' = no scan yet. */
+  source?: 'snapshot' | 'live' | 'pending';
   /** ISO timestamp of the scan the snapshot came from (snapshot mode only). */
   scanned_at?: string | null;
   run_id?: string;
@@ -843,15 +904,58 @@ export async function getTopologyDqSummary(options?: {
 export async function runTopologyDqScan(options?: {
   clip?: { west: number; south: number; east: number; north: number };
   operatorId?: string;
-}): Promise<{ run_id: string; status: string; message?: string }> {
-  return fetchJson(`${SYNC_BASE}/dq/topology/scan`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      clip: options?.clip ?? GHANA_EXPORT_CLIP,
-      operator_id: options?.operatorId,
-    }),
-  });
+}): Promise<{ run_id: string; status: string; message?: string; estimate_seconds?: number }> {
+  try {
+    return await fetchJson(`${SYNC_BASE}/dq/topology/scan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        clip: options?.clip ?? GHANA_EXPORT_CLIP,
+        operator_id: options?.operatorId,
+      }),
+    });
+  } catch (err) {
+    const e = err as Error & { status?: number; detail?: unknown };
+    if (e.status === 409 && e.detail && typeof e.detail === 'object') {
+      const d = e.detail as { active_run_id?: string; message?: string };
+      if (d.active_run_id) {
+        return {
+          run_id: d.active_run_id,
+          status: 'running',
+          message: d.message ?? 'Topology scan already running',
+        };
+      }
+    }
+    throw err;
+  }
+}
+
+export interface GiopTopologyScanProgress {
+  run_id: string;
+  status: 'running' | 'completed' | 'failed';
+  current_phase: string;
+  completed_phases: string[];
+  phases: Array<{ id: string; label: string }>;
+  started_at?: string | null;
+  completed_at?: string | null;
+  error_message?: string | null;
+  estimate_seconds?: number;
+  eta_seconds?: number;
+  progress_pct?: number;
+  orphans_found?: number;
+  dangling_found?: number;
+  auto_cleared?: number;
+}
+
+export async function getActiveTopologyScan(): Promise<{
+  active: GiopTopologyScanProgress | null;
+  estimate_seconds: number;
+}> {
+  return fetchJson(`${SYNC_BASE}/dq/topology/runs/active`);
+}
+
+export async function getTopologyDqRunProgress(runId: string): Promise<GiopTopologyScanProgress> {
+  return fetchJson(`${SYNC_BASE}/dq/topology/runs/${encodeURIComponent(runId)}/progress`);
 }
 
 export interface GiopTopologyDqRun {
@@ -873,6 +977,152 @@ export async function listTopologyDqRuns(limit = 10): Promise<GiopTopologyDqRun[
     `${SYNC_BASE}/dq/topology/runs?limit=${limit}`,
   );
   return data.runs ?? [];
+}
+
+export type GiopUnpromotedSegmentReason =
+  | 'missing_endpoints'
+  | 'customer_equipment_originating'
+  | 'customer_equipment_end'
+  | 'unresolved_originating'
+  | 'unresolved_end'
+  | 'same_endpoint'
+  | 'invalid_geom'
+  | 'eligible_unpromoted';
+
+export interface GiopUnpromotedSegmentSummary {
+  total_unpromoted: number;
+  actionable_unpromoted?: number;
+  customer_equipment_unpromoted?: number;
+  by_reason: Partial<Record<GiopUnpromotedSegmentReason, number>>;
+  district?: string | null;
+  conductor_segments?: number;
+  master_lines?: number;
+  pct_promoted?: number;
+  refreshed_at?: string | null;
+  source?: 'cached' | 'live' | string;
+}
+
+export interface GiopImportStatusRefresh {
+  refreshed_at?: string;
+  duration_ms?: number;
+  conductor_segments?: number;
+  master_lines?: number;
+  total_unpromoted?: number;
+  by_reason?: Partial<Record<GiopUnpromotedSegmentReason, number>>;
+}
+
+export interface GiopUnpromotedSegment {
+  id: number;
+  source_layer: string;
+  source_fid: number;
+  voltage_class?: string | null;
+  circuit_id?: string | null;
+  district?: string | null;
+  region?: string | null;
+  originating_node_id?: string | null;
+  end_node_id?: string | null;
+  length_m?: number | null;
+  longitude?: number | null;
+  latitude?: number | null;
+  line_mrid?: string | null;
+  reason: GiopUnpromotedSegmentReason;
+}
+
+export interface GiopUnpromotedSegmentPage {
+  segments: GiopUnpromotedSegment[];
+  count: number;
+  total: number;
+  offset: number;
+  limit: number;
+  district?: string | null;
+  reason?: GiopUnpromotedSegmentReason | null;
+}
+
+export interface GiopConductorSnapResult {
+  segments_snapped: number;
+  segments_already_aligned: number;
+  segments_no_geom?: number;
+  segments_unresolved: number;
+  segments_span_rejected?: number;
+  segments_move_rejected?: number;
+  tolerance_m: number;
+  max_move_m?: number;
+  import_status?: GiopImportStatusRefresh;
+}
+
+export type GiopEndpointIdClass =
+  | 'missing'
+  | 'pole_resolved'
+  | 'pole_alias_pending'
+  | 'customer_equipment'
+  | 'generic_short_id'
+  | 'pole_id_unmatched'
+  | 'other_unmatched';
+
+export interface GiopEndpointDiagnostics {
+  unpromoted_segments: number;
+  district?: string | null;
+  originating: Partial<Record<GiopEndpointIdClass, number>>;
+  end: Partial<Record<GiopEndpointIdClass, number>>;
+  endpoint_alias_rows?: number;
+  lookup_rows?: number;
+  refreshed_at?: string;
+}
+
+export async function getGisEndpointDiagnostics(options?: {
+  district?: string;
+}): Promise<GiopEndpointDiagnostics> {
+  const q = new URLSearchParams();
+  if (options?.district) q.set('district', options.district);
+  const suffix = q.toString() ? `?${q}` : '';
+  return fetchJson(`${SYNC_BASE}/gis/endpoint-diagnostics${suffix}`);
+}
+
+export async function getGisUnpromotedSummary(options?: {
+  district?: string;
+}): Promise<GiopUnpromotedSegmentSummary> {
+  const q = new URLSearchParams();
+  if (options?.district) q.set('district', options.district);
+  const suffix = q.toString() ? `?${q}` : '';
+  return fetchJson(`${SYNC_BASE}/gis/unpromoted-segments/summary${suffix}`);
+}
+
+export async function listGisUnpromotedSegments(options?: {
+  district?: string;
+  reason?: GiopUnpromotedSegmentReason;
+  limit?: number;
+  offset?: number;
+}): Promise<GiopUnpromotedSegmentPage> {
+  const q = new URLSearchParams();
+  if (options?.district) q.set('district', options.district);
+  if (options?.reason) q.set('reason', options.reason);
+  q.set('limit', String(options?.limit ?? 25));
+  q.set('offset', String(options?.offset ?? 0));
+  return fetchJson(`${SYNC_BASE}/gis/unpromoted-segments?${q}`);
+}
+
+export interface GiopImportSegmentHighlight {
+  segment_id: number;
+  label: string;
+  geojson: {
+    line: GeoJSON.FeatureCollection;
+    endpoints: GeoJSON.FeatureCollection;
+  };
+  bbox?: { west: number; south: number; east: number; north: number } | null;
+}
+
+export async function getGisUnpromotedSegmentGeojson(segmentId: number): Promise<GiopImportSegmentHighlight> {
+  return fetchJson(`${SYNC_BASE}/gis/unpromoted-segments/${segmentId}/geojson`);
+}
+
+export async function snapGisConductors(options?: {
+  tolerance_m?: number;
+}): Promise<GiopConductorSnapResult> {
+  return fetchJson(`${SYNC_BASE}/gis/snap-conductors`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tolerance_m: options?.tolerance_m }),
+  });
 }
 
 export interface GiopDqExceptionPage {
@@ -1336,6 +1586,8 @@ export async function portalAiVoiceTurn(options: {
   exceptionId?: string;
   mrid?: string;
   context?: Record<string, unknown>;
+  /** When true, return immediately if no regex fast-path match (skip LLM). */
+  fastOnly?: boolean;
 }): Promise<{
   content: string;
   findings: string[];
@@ -1345,6 +1597,7 @@ export async function portalAiVoiceTurn(options: {
     speak?: string;
     session_id?: string;
     fast_path?: boolean;
+    fast_only_miss?: boolean;
     voice?: boolean;
     tts?: GiopVoiceStatus['tts'];
   };
@@ -1358,6 +1611,7 @@ export async function portalAiVoiceTurn(options: {
       exception_id: options.exceptionId,
       mrid: options.mrid,
       context: options.context,
+      fast_only: options.fastOnly === true,
     }),
   });
 }
@@ -1676,15 +1930,49 @@ export async function listReferenceLayers(): Promise<GiopReferenceLayer[]> {
   return data.layers ?? [];
 }
 
-/** True when an active catalog network layer has been imported and is renderable. */
+/** True when built-in GIS network overview tables are imported and renderable. */
 export function referenceNetworkReady(layers: GiopReferenceLayer[]): boolean {
   return layers.some(
     (layer) =>
       layer.kind === 'network' &&
-      layer.active &&
+      layer.built_in_map_style &&
       layer.render_mode !== 'none' &&
       (layer.feature_count ?? 0) > 0,
   );
+}
+
+async function probeMartinNetworkCatalog(
+  martinUrl: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${martinUrl}/catalog`, { signal });
+    if (!res.ok) return false;
+    const catalog = (await res.json()) as Array<{ id?: string }>;
+    return catalog.some(
+      (entry) => entry.id === 'oh_conductor_11kv' || entry.id === 'oh_conductor_33kv',
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Whether legacy GIS network overview layers (conductors, transformers) are loaded. */
+export async function probeGisOverviewAvailable(
+  martinUrl: string = MARTIN_URL,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${SYNC_BASE}/reference-layers`, { signal });
+    if (res.ok) {
+      const data = (await res.json()) as { layers?: GiopReferenceLayer[] };
+      if (referenceNetworkReady(data.layers ?? [])) return true;
+    }
+  } catch {
+    // sync-service may be slow — fall back to Martin catalog
+  }
+  // Use a fresh fetch for Martin: the sync probe may share an aborted signal.
+  return probeMartinNetworkCatalog(martinUrl);
 }
 
 export async function getReferenceMapConfig(): Promise<GiopReferenceMapLayerConfig[]> {
@@ -2212,21 +2500,6 @@ export const MARTIN_URL = resolvePublicBaseUrl(
   import.meta.env.VITE_MARTIN_URL,
   'http://127.0.0.1:3001',
 );
-
-/** Whether legacy GIS network overview layers (conductors, transformers) are loaded. */
-export async function probeGisOverviewAvailable(
-  _martinUrl: string = MARTIN_URL,
-  signal?: AbortSignal,
-): Promise<boolean> {
-  try {
-    const res = await fetch(`${SYNC_BASE}/reference-layers`, { signal });
-    if (!res.ok) return false;
-    const data = (await res.json()) as { layers?: GiopReferenceLayer[] };
-    return referenceNetworkReady(data.layers ?? []);
-  } catch {
-    return false;
-  }
-}
 
 export const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'http://127.0.0.1:54321';
 export const SUPABASE_ANON_KEY =

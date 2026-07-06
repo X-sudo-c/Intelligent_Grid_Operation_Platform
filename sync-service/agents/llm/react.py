@@ -225,6 +225,37 @@ def _tool_schemas() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "trace_downstream_path",
+                "description": (
+                    "Directed downstream network walk from a seed node — all nodes and lines "
+                    "reachable downstream on the feeder graph (same as outage impact estimate). "
+                    "Use when the user asks what's downstream, what would be affected, or to "
+                    "show/highlight/map the downstream path from the selected or named node. "
+                    "NOT for 1-hop neighbors (trace_connection_path) or whole-feeder BFS (trace_feeder)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mrid": {
+                            "type": "string",
+                            "description": "Optional seed node UUID. Omit to use selection or last inspected node.",
+                        },
+                        "show_on_map": {
+                            "type": "boolean",
+                            "default": True,
+                        },
+                        "max_nodes": {
+                            "type": "integer",
+                            "default": 5000,
+                            "description": "Cap on nodes returned (max 20000).",
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "trace_feeder",
                 "description": (
                     "Trace ALL reachable nodes on a boundary feeder (BFS). "
@@ -601,6 +632,19 @@ def _execute_tool(
             conn,
             mrid=arguments.get("mrid"),
             context=portal_ctx,
+            show_on_map=bool(arguments.get("show_on_map", True)),
+        )
+    if name == "trace_downstream_path":
+        portal_ctx = dict(portal_context or {})
+        if arguments.get("mrid"):
+            portal_ctx["focus_mrid"] = arguments["mrid"]
+        elif portal_ctx.get("last_mrid"):
+            portal_ctx.setdefault("focus_mrid", portal_ctx["last_mrid"])
+        return graph_tools.trace_downstream_path(
+            conn,
+            mrid=arguments.get("mrid"),
+            context=portal_ctx,
+            max_nodes=int(arguments.get("max_nodes") or 5000),
             show_on_map=bool(arguments.get("show_on_map", True)),
         )
     if name == "trace_feeder":

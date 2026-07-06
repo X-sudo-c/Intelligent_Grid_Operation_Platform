@@ -359,6 +359,38 @@ html.giop-theme-transition .giop-theme-toggle__knob {
   height: 100%;
 }
 
+/* Map + Topology: keep zoom clear of the centered search chrome */
+.giop-map-host--split .maplibregl-ctrl-top-right {
+  top: auto !important;
+  right: 12px !important;
+  bottom: 12px !important;
+  z-index: 70;
+}
+
+.giop-map-host--split .giop-map-control {
+  top: 12px;
+  left: 12px;
+  z-index: 70;
+  width: auto;
+  min-width: 8.5rem;
+}
+
+.giop-map-host--split .giop-map-control > button {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+}
+
+.giop-split-chrome .giop-map-spotlight {
+  align-items: center;
+}
+
+.giop-split-chrome .giop-map-spotlight__bar {
+  min-height: 38px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
 /* Ripple halos — sibling to the WebGL canvas inside MapLibre's container */
 .giop-map-pulse-canvas {
   position: absolute;
@@ -382,6 +414,216 @@ html.giop-theme-transition .giop-theme-toggle__knob {
   width: min(620px, calc(100% - 2rem));
   transform: translateX(-50%);
   pointer-events: none;
+}
+
+.giop-map-spotlight--inline {
+  position: relative;
+  top: auto;
+  left: auto;
+  transform: none;
+  width: 100%;
+  max-width: min(560px, 100%);
+  pointer-events: auto;
+}
+
+.giop-map-spotlight--split {
+  position: relative;
+  top: auto;
+  left: auto;
+  transform: none;
+  width: 100%;
+  pointer-events: auto;
+}
+
+.giop-split-view {
+  position: relative;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  --giop-chrome-top: 12px;
+}
+
+.giop-split-panes {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  min-height: 0;
+}
+
+.giop-split-pane {
+  min-height: 0;
+  height: 100%;
+}
+
+.giop-split-pane--map {
+  border-right: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.giop-split-view--light .giop-split-pane--map {
+  border-right-color: rgba(15, 23, 42, 0.08);
+}
+
+.giop-split-float {
+  position: absolute;
+  z-index: 45;
+  pointer-events: none;
+}
+
+.giop-split-float > * {
+  pointer-events: auto;
+}
+
+.giop-split-chrome {
+  position: absolute;
+  top: var(--giop-chrome-top);
+  left: 50%;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: min(760px, calc(100% - 1.5rem));
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.giop-split-chrome__modes {
+  pointer-events: auto;
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 4px;
+  height: 38px;
+  padding: 0 4px;
+  border-radius: 9999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(18, 18, 18, 0.78);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+}
+
+.giop-split-view--light .giop-split-chrome__modes {
+  border-color: rgba(15, 23, 42, 0.1);
+  background: rgba(255, 255, 255, 0.88);
+  box-shadow: 0 8px 28px rgba(15, 23, 42, 0.1);
+}
+
+.giop-split-chrome__search {
+  pointer-events: auto;
+  flex: 1;
+  min-width: 0;
+}
+
+.giop-split-chrome .giop-map-spotlight__panel {
+  z-index: 90;
+}
+
+.giop-split-float--search {
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(620px, calc(100% - 1.5rem));
+}
+
+.giop-split-float--modes {
+  top: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 9999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(18, 18, 18, 0.72);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+}
+
+.giop-split-float--modes.giop-split-float--modes-light {
+  border-color: rgba(15, 23, 42, 0.1);
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow: 0 8px 28px rgba(15, 23, 42, 0.1);
+}
+
+.giop-split-float--meta {
+  top: 56px;
+  right: 12px;
+  max-width: min(300px, 36vw);
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  background: rgba(69, 26, 3, 0.82);
+  color: #fde68a;
+  font-size: 11px;
+  line-height: 1.35;
+  backdrop-filter: blur(12px);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+}
+
+.giop-split-float--meta-light {
+  border-color: rgba(245, 158, 11, 0.45);
+  background: rgba(255, 251, 235, 0.92);
+  color: #92400e;
+}
+
+.giop-graph-float {
+  pointer-events: none;
+  z-index: 30;
+}
+
+.giop-graph-float__cluster {
+  pointer-events: auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  max-width: min(420px, calc(100vw - 2rem));
+  padding: 6px 8px;
+  border-radius: 9999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(18, 18, 18, 0.72);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+}
+
+.giop-graph-float__cluster--light {
+  border-color: rgba(15, 23, 42, 0.1);
+  background: rgba(255, 255, 255, 0.86);
+  box-shadow: 0 8px 28px rgba(15, 23, 42, 0.12);
+}
+
+.giop-graph-float__filters {
+  pointer-events: auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-width: min(480px, calc(100vw - 2rem));
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(18, 18, 18, 0.68);
+  backdrop-filter: blur(14px);
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.28);
+}
+
+.giop-graph-float__filters--light {
+  border-color: rgba(15, 23, 42, 0.1);
+  background: rgba(255, 255, 255, 0.84);
+}
+
+@media (max-width: 960px) {
+  .giop-split-chrome {
+    flex-direction: column;
+    align-items: stretch;
+    width: calc(100% - 1rem);
+  }
+
+  .giop-split-chrome__modes {
+    align-self: flex-start;
+  }
 }
 
 .giop-map-spotlight__bar {
@@ -760,6 +1002,33 @@ html.giop-theme-transition .giop-theme-toggle__knob {
 @media (prefers-reduced-motion: reduce) {
   .giop-map-zoom-hint {
     transition-duration: 0.01ms !important;
+  }
+}
+
+@keyframes giop-indeterminate-slide {
+  0% {
+    transform: translateX(-100%);
+    width: 40%;
+  }
+  50% {
+    transform: translateX(80%);
+    width: 55%;
+  }
+  100% {
+    transform: translateX(220%);
+    width: 40%;
+  }
+}
+
+.giop-indeterminate-bar {
+  width: 45% !important;
+  animation: giop-indeterminate-slide 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .giop-indeterminate-bar {
+    animation: none;
+    width: 66% !important;
   }
 }
 

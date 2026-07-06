@@ -143,3 +143,9 @@ start_web() {
     echo "$vite_pid" >"$PID_DIR/overseeyer-web.pid"
   fi
 }
+
+follow_stack_logs() {
+  # shellcheck disable=SC1091
+  source "$GIOP_ROOT/scripts/lib_giop_logs.sh"
+  giop_tail_stack_logs
+}

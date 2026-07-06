@@ -10,7 +10,7 @@ from typing import Any
 
 import requests
 
-CIM_PROFILE = "GIOP-Distribution-MVP-1.0"
+CIM_PROFILE = "GIOP-Distribution-MVP-1.1"
 # Ghana operating bbox — required for bulk export when node count exceeds cap.
 GHANA_BBOX = {"west": -3.5, "south": 4.5, "east": 1.5, "north": 8.5}
 FULL_EXPORT_NODE_CAP = 10_000
@@ -19,6 +19,9 @@ DEFAULT_LAYERS = [
     "connectivity_nodes",
     "conducting_equipment",
     "ac_line_segments",
+    "power_transformers",
+    "cim_assets",
+    "cim_asset_info",
     "usage_points",
     "meters",
     "ghana_grid_assets",
@@ -233,6 +236,160 @@ def build_cim_payload(
                 )
         payload["ACLineSegment"] = lines
         payload["counts"]["ACLineSegment"] = len(lines)
+
+    equipment_mrids: set[str] = set()
+    if "power_transformers" in selected:
+        pt_bbox, pt_params = _bbox_clause("cn", "geom", clip)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT pt.mrid::text,
+                       io.name,
+                       pt.connectivity_node_mrid::text,
+                       pt.transformer_kind,
+                       ce.nominal_voltage::text,
+                       ce.phases,
+                       pt.rated_power_kva,
+                       pt.vector_group,
+                       pt.substation_name,
+                       ST_AsGeoJSON(cn.geom)::json AS location
+                FROM public.power_transformers pt
+                JOIN public.conducting_equipment ce ON ce.mrid = pt.mrid
+                JOIN public.identified_objects io ON io.mrid = pt.mrid
+                JOIN public.connectivity_nodes cn ON cn.mrid = pt.connectivity_node_mrid
+                WHERE io.validation = 'APPROVED'
+                {pt_bbox}
+                ORDER BY io.name
+                """,
+                pt_params,
+            )
+            transformers = []
+            for row in cur.fetchall():
+                eq_mrid = row[0]
+                cn_mrid = row[2]
+                if eq_mrid in blocked or cn_mrid in blocked:
+                    continue
+                equipment_mrids.add(eq_mrid)
+                transformers.append(
+                    {
+                        "@type": "PowerTransformer",
+                        "mrid": eq_mrid,
+                        "name": row[1],
+                        "connectivity_node_mrid": cn_mrid,
+                        "transformer_kind": row[3],
+                        "nominal_voltage": row[4],
+                        "phases": row[5],
+                        "rated_power_kva": row[6],
+                        "vector_group": row[7],
+                        "substation_name": row[8],
+                        "location": row[9],
+                    }
+                )
+        payload["PowerTransformer"] = transformers
+        payload["counts"]["PowerTransformer"] = len(transformers)
+
+    if "cim_assets" in selected:
+        asset_filter = ""
+        asset_params: list[Any] = []
+        if equipment_mrids:
+            asset_filter = " AND ca.equipment_mrid = ANY(%s::uuid[])"
+            asset_params.append(list(equipment_mrids))
+        elif clip:
+            asset_filter = """
+              AND ca.equipment_mrid IN (
+                SELECT pt.mrid FROM public.power_transformers pt
+                JOIN public.connectivity_nodes cn ON cn.mrid = pt.connectivity_node_mrid
+                WHERE cn.geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
+              )
+            """
+            asset_params.extend([clip["west"], clip["south"], clip["east"], clip["north"]])
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT ca.mrid::text,
+                       io.name,
+                       ca.equipment_mrid::text,
+                       ca.asset_kind
+                FROM public.cim_assets ca
+                JOIN public.identified_objects io ON io.mrid = ca.mrid
+                WHERE io.validation = 'APPROVED'
+                {asset_filter}
+                ORDER BY io.name
+                """,
+                asset_params,
+            )
+            assets = [
+                {
+                    "@type": "Asset",
+                    "mrid": r[0],
+                    "name": r[1],
+                    "equipment_mrid": r[2],
+                    "asset_kind": r[3],
+                }
+                for r in cur.fetchall()
+                if r[0] not in blocked and r[2] not in blocked
+            ]
+        payload["Asset"] = assets
+        payload["counts"]["Asset"] = len(assets)
+
+    if "cim_asset_info" in selected:
+        info_filter = ""
+        info_params: list[Any] = []
+        if equipment_mrids:
+            info_filter = """
+              AND ai.asset_mrid IN (
+                SELECT ca.mrid FROM public.cim_assets ca
+                WHERE ca.equipment_mrid = ANY(%s::uuid[])
+              )
+            """
+            info_params.append(list(equipment_mrids))
+        elif clip:
+            info_filter = """
+              AND ai.asset_mrid IN (
+                SELECT ca.mrid FROM public.cim_assets ca
+                JOIN public.power_transformers pt ON pt.mrid = ca.equipment_mrid
+                JOIN public.connectivity_nodes cn ON cn.mrid = pt.connectivity_node_mrid
+                WHERE cn.geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
+              )
+            """
+            info_params.extend([clip["west"], clip["south"], clip["east"], clip["north"]])
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT ai.mrid::text,
+                       io.name,
+                       ai.asset_mrid::text,
+                       ai.info_kind,
+                       ai.manufacturer,
+                       ai.model_number,
+                       ai.serial_number,
+                       ai.rated_power_kva,
+                       ai.year_of_manufacture
+                FROM public.cim_asset_info ai
+                JOIN public.identified_objects io ON io.mrid = ai.mrid
+                WHERE io.validation = 'APPROVED'
+                {info_filter}
+                ORDER BY io.name
+                """,
+                info_params,
+            )
+            infos = [
+                {
+                    "@type": row[3],
+                    "mrid": row[0],
+                    "name": row[1],
+                    "asset_mrid": row[2],
+                    "manufacturer": row[4],
+                    "model_number": row[5],
+                    "serial_number": row[6],
+                    "rated_power_kva": row[7],
+                    "year_of_manufacture": row[8],
+                }
+                for row in cur.fetchall()
+                if row[0] not in blocked
+            ]
+        payload["AssetInfo"] = infos
+        payload["counts"]["AssetInfo"] = len(infos)
 
     if "usage_points" in selected:
         up_bbox, up_params = _bbox_clause("up", "geom", clip)

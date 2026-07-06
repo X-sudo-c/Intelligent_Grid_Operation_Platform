@@ -8,6 +8,11 @@ import {
 } from '../api/giop-api';
 import { buildOpsSearchCatalog } from '../lib/giopMapLocalSearch';
 
+/** Stable defaults — avoid `= []` in props/deps (new reference every render). */
+export const EMPTY_STAGING_ASSETS: GiopStagingAsset[] = [];
+export const EMPTY_WORK_ORDERS: GiopWorkOrder[] = [];
+export const EMPTY_FIELD_TECHNICIANS: GiopFieldTechnician[] = [];
+
 let cachedPlaces: GiopMapSearchResult[] | null = null;
 let placesPromise: Promise<GiopMapSearchResult[]> | null = null;
 
@@ -50,9 +55,9 @@ export function useGiopMapSearchCatalog(options: {
   const opsCatalog = useMemo(
     () =>
       buildOpsSearchCatalog({
-        workOrders: options.workOrders,
-        fieldTechnicians: options.fieldTechnicians,
-        stagingAssets: options.stagingAssets,
+        workOrders: options.workOrders ?? EMPTY_WORK_ORDERS,
+        fieldTechnicians: options.fieldTechnicians ?? EMPTY_FIELD_TECHNICIANS,
+        stagingAssets: options.stagingAssets ?? EMPTY_STAGING_ASSETS,
       }),
     [options.workOrders, options.fieldTechnicians, options.stagingAssets],
   );

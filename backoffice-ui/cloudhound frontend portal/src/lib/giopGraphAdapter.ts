@@ -90,8 +90,16 @@ export function traceToPortalGraph(
 
   const noteParts: string[] = [];
   if (trace.graph_totals && trace.graph_totals.nodes > nodes.length) {
+    const backend =
+      (trace as GiopTraceResponse & { backend?: string }).backend === 'memgraph'
+        ? 'Memgraph'
+        : 'network';
     noteParts.push(
-      `Loaded ${nodes.length.toLocaleString()} of ${trace.graph_totals.nodes.toLocaleString()} network nodes (${trace.scope ?? 'traced'} scope).`,
+      `Loaded ${nodes.length.toLocaleString()} nodes · ${edges.length.toLocaleString()} edges of ${trace.graph_totals.nodes.toLocaleString()} ${backend} nodes (${trace.scope ?? 'traced'} scope).`,
+    );
+  } else if (edges.length > 0) {
+    noteParts.push(
+      `${nodes.length.toLocaleString()} nodes · ${edges.length.toLocaleString()} edges (${trace.scope ?? 'traced'} scope).`,
     );
   }
   if (trace.bounds?.truncated) {
@@ -214,36 +222,61 @@ export function filterGraphByQuery(
 }
 
 function capGraphForCanvas(graph: PortalGraphResponse): PortalGraphResponse {
-  if (graph.nodes.length <= MAX_GRAPH_NODES) {
+  const maxNodes = MAX_GRAPH_NODES;
+  if (graph.nodes.length <= maxNodes && graph.edges.length <= maxNodes) {
     return graph;
   }
 
-  const priority = (node: PortalGraphResponse['nodes'][number]) => {
+  const nodePriority = (node: PortalGraphResponse['nodes'][number]) => {
     const props = (node.properties || {}) as Record<string, unknown>;
     if (props.traced === true) return 0;
     if (props.is_conflict === true) return 1;
-    if (props.disconnected === true || props.connected === false) return 2;
-    if (props.is_hvt === true) return 3;
+    if (props.is_hvt === true) return 2;
+    if (props.connected !== false && props.disconnected !== true) return 3;
+    if (props.disconnected === true || props.connected === false) return 5;
     return 4;
   };
 
-  const sorted = [...graph.nodes].sort((a, b) => priority(a) - priority(b));
-  const keptNodes = sorted.slice(0, MAX_GRAPH_NODES);
-  const keptIds = new Set(keptNodes.map((n) => n.id));
-  const keptEdges = graph.edges.filter((e) => keptIds.has(e.source) && keptIds.has(e.target));
+  // Keep wired structure first — avoids E=0 when the API returned edges.
+  const keptIds = new Set<string>();
+  const keptEdges: PortalGraphResponse['edges'] = [];
+  for (const edge of graph.edges) {
+    if (keptEdges.length >= maxNodes) break;
+    keptIds.add(edge.source);
+    keptIds.add(edge.target);
+    keptEdges.push(edge);
+  }
+
+  const sortedNodes = [...graph.nodes].sort((a, b) => nodePriority(a) - nodePriority(b));
+  for (const node of sortedNodes) {
+    if (keptIds.size >= maxNodes) break;
+    keptIds.add(node.id);
+  }
+
+  const keptNodes = graph.nodes.filter((n) => keptIds.has(n.id));
+  const finalEdges = keptEdges.filter(
+    (e) => keptIds.has(e.source) && keptIds.has(e.target),
+  );
 
   const omitted = graph.nodes.length - keptNodes.length;
   return {
     ...graph,
     nodes: keptNodes,
-    edges: keptEdges,
+    edges: finalEdges,
     metrics: {
       ...graph.metrics,
       total_nodes: keptNodes.length,
-      total_edges: keptEdges.length,
-      note: `Showing ${keptNodes.length.toLocaleString()} of ${graph.nodes.length.toLocaleString()} nodes. Use Map view or narrow the filter to explore the full network.`,
+      total_edges: finalEdges.length,
+      note:
+        omitted > 0
+          ? `Showing ${keptNodes.length.toLocaleString()} nodes · ${finalEdges.length.toLocaleString()} edges (${omitted.toLocaleString()} nodes omitted). Pan the map or use Traced for a feeder walk.`
+          : `Showing ${keptNodes.length.toLocaleString()} nodes · ${finalEdges.length.toLocaleString()} edges.`,
     },
-    detail: graph.detail ?? `Graph capped: ${omitted.toLocaleString()} nodes omitted for performance.`,
+    detail:
+      graph.detail ??
+      (omitted > 0
+        ? `Graph capped: ${omitted.toLocaleString()} nodes omitted for performance.`
+        : undefined),
   };
 }
 
@@ -266,14 +299,16 @@ export function chunkToPortalGraph(
   };
 
   const graph = traceToPortalGraph(pseudoTrace, stagingAssets, 'viewport_subgraph');
+  const backendLabel =
+    chunk.backend === 'memgraph' ? ' · Memgraph' : chunk.backend === 'postgres' ? ' · Postgres' : '';
   return {
     ...graph,
     metrics: {
       ...graph.metrics,
       query_title: 'Map viewport',
       note: chunk.truncated
-        ? `Viewport: ${chunk.nodes.length} nodes (cap ${chunk.limit}), ${chunk.edges.length} lines in bounds.`
-        : `Viewport: ${chunk.nodes.length} nodes, ${chunk.edges.length} lines in map bounds.`,
+        ? `Viewport: ${chunk.nodes.length} nodes (cap ${chunk.limit}), ${chunk.edges.length} lines in bounds${backendLabel}.`
+        : `Viewport: ${chunk.nodes.length} nodes, ${chunk.edges.length} lines in map bounds${backendLabel}.`,
     },
   };
 }

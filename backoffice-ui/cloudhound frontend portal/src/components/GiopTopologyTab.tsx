@@ -25,6 +25,8 @@ interface GiopTopologyTabProps {
   onFocusHandled?: () => void;
   onNodeSelect?: (mrid: string, label?: string) => void;
   compact?: boolean;
+  /** Combined Map + Topology: chrome lives in the split toolbar. */
+  layoutMode?: 'default' | 'split';
   graphQueryOptions?: typeof GIOP_GRAPH_QUERY_OPTIONS;
   graphChrome?: 'full' | 'operations';
 }
@@ -41,9 +43,11 @@ export function GiopTopologyTab({
   onFocusHandled,
   onNodeSelect,
   compact = false,
+  layoutMode = 'default',
   graphQueryOptions = GIOP_GRAPH_QUERY_OPTIONS,
   graphChrome = 'full',
 }: GiopTopologyTabProps) {
+  const isSplitLayout = layoutMode === 'split';
   const isOpsChrome = graphChrome === 'operations';
   const [graphAiOpen, setGraphAiOpen] = useState(false);
   const [graphAiNodeId, setGraphAiNodeId] = useState<string | null>(null);
@@ -116,8 +120,8 @@ export function GiopTopologyTab({
   }, [graphAiOpen]);
 
   return (
-    <div className={`flex flex-col h-full min-h-0 ${compact && !isOpsChrome ? '' : compact ? '' : 'p-4'}`}>
-      {!isOpsChrome && (
+    <div className={`flex flex-col h-full min-h-0 ${compact && !isOpsChrome && !isSplitLayout ? '' : compact ? '' : 'p-4'}`}>
+      {!isOpsChrome && !isSplitLayout && (
         <div className={`shrink-0 mb-3 flex flex-wrap items-center justify-center gap-2 ${compact ? 'px-2 pt-2' : ''}`}>
           {graphQueryOptions.map((option) => (
             <button
@@ -138,13 +142,13 @@ export function GiopTopologyTab({
         </div>
       )}
 
-      {!isOpsChrome && error && (
+      {!isOpsChrome && !isSplitLayout && error && (
         <div className="mb-4 mx-4 rounded-lg border border-red-500/40 bg-red-950/40 px-4 py-3 text-sm text-red-200">
           {error}
         </div>
       )}
 
-      {!isOpsChrome && graph?.metrics?.note && !loading && (
+      {!isOpsChrome && !isSplitLayout && graph?.metrics?.note && !loading && (
         <div
           className={`mb-3 mx-4 rounded-lg border px-4 py-2 text-xs ${
             isLightMode
@@ -156,7 +160,7 @@ export function GiopTopologyTab({
         </div>
       )}
 
-      {!isOpsChrome && revalidating && graph && !loading && (
+      {!isOpsChrome && !isSplitLayout && revalidating && graph && !loading && (
         <p className={`mb-2 mx-4 text-center text-[10px] ${isLightMode ? 'text-slate-400' : 'text-premium-muted-dim'}`}>
           Updating topology…
         </p>
@@ -212,6 +216,7 @@ export function GiopTopologyTab({
             isAdmin={!isOpsChrome}
             isLightMode={isLightMode}
             graphChrome={graphChrome}
+            layoutMode={isSplitLayout ? 'split' : 'default'}
             focusNodeArn={focusMrid || undefined}
             onFocusNodeHandled={onFocusHandled}
             onNodeSelect={onNodeSelect}

@@ -5,6 +5,8 @@
 #   ./overseeyer/scripts/start.sh
 #   ./overseeyer/scripts/start.sh --api-only
 #   ./overseeyer/scripts/start.sh --web-only
+#   ./overseeyer/scripts/start.sh --detach   # start and exit (no log tail)
+#   ./overseeyer/scripts/start.sh --follow-logs   # default: tail stack logs in this terminal
 
 set -euo pipefail
 
@@ -15,13 +17,16 @@ _overseeyer_init
 
 API_ONLY=0
 WEB_ONLY=0
+FOLLOW_LOGS=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --api-only) API_ONLY=1 ;;
     --web-only) WEB_ONLY=1 ;;
+    --follow-logs|-f) FOLLOW_LOGS=1 ;;
+    --detach|--no-follow|--no-logs) FOLLOW_LOGS=0 ;;
     -h|--help)
-      sed -n '2,7p' "$0"
+      sed -n '2,10p' "$0"
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
@@ -41,4 +46,9 @@ echo ""
 echo "OVERSEEYER"
 echo "  API: http://127.0.0.1:${API_PORT}/api/observability"
 echo "  UI:  http://127.0.0.1:${WEB_PORT}"
-echo "  Logs: $LOG_DIR/overseeyer-*.log"
+echo "  Logs: $LOG_DIR/*.log"
+echo "  Tail only: ./scripts/tail_giop_stack_logs.sh"
+
+if [[ "$FOLLOW_LOGS" == "1" ]]; then
+  follow_stack_logs
+fi

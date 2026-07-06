@@ -71,6 +71,7 @@ def run_voice_turn(
     mrid: str | None = None,
     operator_id: str | None = None,
     context: dict[str, Any] | None = None,
+    fast_only: bool = False,
 ) -> AgentChatResponse:
     ctx = context or {}
     sid = session_id or voice_session.new_session_id()
@@ -95,6 +96,21 @@ def run_voice_turn(
                 "fast_path": True,
                 "session_id": sid,
                 "speak": fast.get("speak") or fast["content"],
+                "tts": voice_tts.status(),
+            },
+        )
+
+    if fast_only:
+        return AgentChatResponse(
+            content="",
+            findings=["Fast path miss"],
+            actions=[],
+            ui_actions=[],
+            agent={
+                "voice": True,
+                "fast_path": False,
+                "fast_only_miss": True,
+                "session_id": sid,
                 "tts": voice_tts.status(),
             },
         )

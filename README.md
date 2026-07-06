@@ -222,6 +222,7 @@ Energy accounting requires TimescaleDB with `timescaledb/timescale.sql` applied 
 | 10 | Portal lineage, DLQ, schematic, insights, APM widget | Implemented |
 | 6 | Spot-bill sync, telemetry ingest | Implemented |
 | 7 | Map SLD voltage layers + enriched Martin tile views (`00017`) | Phase 1–2 done — see `docs/map_implementation_checklist.md` |
+| 7 | Data scale / columnar vs PostGIS strategy | See `docs/data_scale_architecture.md` |
 | 7 | Viewport chunk topology (split view) | Implemented |
 | 7 | SLD voltage colors, ops name/voltage edit | Implemented |
 | 8 | Mobile offline captures + spot-bill queue | Implemented |

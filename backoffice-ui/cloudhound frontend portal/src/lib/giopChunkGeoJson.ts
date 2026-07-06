@@ -1,31 +1,40 @@
 import type { GiopGraphChunkResponse } from '../api/giop-api';
 import { voltageEdgeColor } from './giopSldTheme';
 
-function edgeLineCoordinates(edge: GiopGraphChunkResponse['edges'][number]): [number, number][] | null {
+function edgeLineCoordinates(
+  edge: GiopGraphChunkResponse['edges'][number],
+  coordByMrid?: Map<string, [number, number]>,
+): [number, number][] | null {
   if (edge.coordinates && edge.coordinates.length >= 2) {
     return edge.coordinates;
   }
-
   const source =
     edge.source_lon != null && edge.source_lat != null
       ? ([edge.source_lon, edge.source_lat] as [number, number])
-      : undefined;
+      : coordByMrid?.get(edge.source ?? '');
   const target =
     edge.target_lon != null && edge.target_lat != null
       ? ([edge.target_lon, edge.target_lat] as [number, number])
-      : undefined;
+      : coordByMrid?.get(edge.target ?? '');
   if (!source || !target) return null;
   return [source, target];
 }
 
-export function chunkToEdgeGeoJson(chunk: GiopGraphChunkResponse | null) {
+export function chunkToEdgeGeoJson(
+  chunk: GiopGraphChunkResponse | null,
+  _options?: { geomOnly?: boolean },
+) {
   if (!chunk) {
     return { type: 'FeatureCollection' as const, features: [] };
   }
 
+  const coordByMrid = new Map(
+    chunk.nodes.map((node) => [node.mrid, [node.lon, node.lat] as [number, number]]),
+  );
+
   const features = chunk.edges
     .map((edge) => {
-      const coordinates = edgeLineCoordinates(edge);
+      const coordinates = edgeLineCoordinates(edge, coordByMrid);
       if (!coordinates) return null;
       return {
         type: 'Feature' as const,

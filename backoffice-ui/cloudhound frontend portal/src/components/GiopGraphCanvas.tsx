@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY, type SimulationLinkDatum, type SimulationNodeDatum } from 'd3-force';
-import type { CloudHoundAIChatResponse, CloudHoundPolicyDocumentResponse, CloudHoundPortalGraphResponse } from '../api/giopGraphStubs';
+import type { CloudHoundAIChatResponse, CloudHoundPortalGraphResponse } from '../api/giopGraphStubs';
 import { GIOP_GRAPH_QUERY_OPTIONS, type GiopGraphQueryKey } from '../lib/giopGraphTypes';
-import { findCloudHoundPath, getCloudHoundPolicyDocument, type CloudHoundPathFindingResponse } from '../api/giopGraphStubs';
+import { findCloudHoundPath, type CloudHoundPathFindingResponse } from '../api/giopGraphStubs';
 import { voltageEdgeColor } from '../lib/giopSldTheme';
 import { computeGraphQuality, GRAPH_QUALITY, isOnScreen } from '../lib/giopGraphPerf';
-import { Lock, GitBranch, Sparkles } from 'lucide-react';
+import { Lock, GitBranch, Sparkles, PanelRightOpen, X } from 'lucide-react';
 import { AssistantRichText } from './AssistantRichText';
 
 interface GiopGraphCanvasProps {
@@ -24,6 +24,8 @@ interface GiopGraphCanvasProps {
   graphQuery?: GiopGraphQueryKey;
   onQueryChange?: (key: GiopGraphQueryKey) => void;
   graphQueryOptions?: typeof GIOP_GRAPH_QUERY_OPTIONS;
+  /** Combined Map + Topology: drawer inspector, compact toolbar. */
+  layoutMode?: 'default' | 'split';
 }
 
 const OPS_QUERY_LABELS: Partial<Record<GiopGraphQueryKey, string>> = {
@@ -73,16 +75,6 @@ interface GraphAiAssistPanelState {
   onSwitchMode?: (mode: 'graph' | 'graph_chat') => void;
   onClose: () => void;
   onApplyProposal: (proposal: GraphAiProposal) => void | Promise<void>;
-}
-
-interface PolicySummaryRecord {
-  statement_count?: number;
-  allow_actions?: string[];
-  deny_actions?: string[];
-  allow_resources?: string[];
-  deny_resources?: string[];
-  has_wildcard_actions?: boolean;
-  has_wildcard_resources?: boolean;
 }
 
 interface ContextMenuState {
@@ -145,6 +137,14 @@ const COLORS: Record<Filter, string> = {
   other: '#9aa4b3',
 };
 
+const GRID_NODE_LEGEND: Array<{ key: Filter; label: string }> = [
+  { key: 'substation', label: 'Substation' },
+  { key: 'transformer', label: 'Transformer' },
+  { key: 'feeder', label: 'Feeder / line segment' },
+  { key: 'meter', label: 'Meter / customer' },
+  { key: 'other', label: 'Other equipment' },
+];
+
 const RISK_COLORS: Record<RiskBand, string | null> = {
   critical: '#ef4444',
   high: '#f97316',
@@ -170,6 +170,57 @@ const EDGE_COLORS: Record<string, string> = {
   TOPOLOGY_GAP: 'rgba(239, 68, 68, 0.82)',
   PRIVILEGE_ESCALATION: 'rgba(239, 68, 68, 0.82)',
 };
+
+function GraphInspectorLegend() {
+  return (
+    <div>
+      <p className="text-[11px] uppercase tracking-[0.24em] text-premium-muted-dim">Legend</p>
+      <div className="mt-3 space-y-1 text-sm text-premium-text-secondary">
+        <p className="mb-1 text-[10px] uppercase tracking-widest text-premium-muted-dim">Asset types</p>
+        {GRID_NODE_LEGEND.map(({ key, label }) => (
+          <div key={key} className="flex items-center gap-2 rounded px-2 py-1">
+            <span className="inline-block h-3 w-3 rounded-full" style={{ backgroundColor: COLORS[key] }} />
+            <span>{label}</span>
+          </div>
+        ))}
+        <p className="mb-1 mt-2 text-[10px] uppercase tracking-widest text-premium-muted-dim">Asset signals</p>
+        <div className="flex items-center gap-2 rounded px-2 py-1">
+          <span className="inline-block h-4 w-4 rounded-full border-2 border-[#f4d06f]" />
+          <span>Critical asset</span>
+        </div>
+        <div className="flex items-center gap-2 rounded px-2 py-1">
+          <span className="inline-block h-4 w-4 rounded-full border-2 border-[#ff915a]" />
+          <span>Disconnected endpoint</span>
+        </div>
+        <div className="flex items-center gap-2 rounded px-2 py-1">
+          <span className="inline-block h-4 w-4 rounded-full border-2 border-[#ef4444] bg-[#ef4444]/20" />
+          <span>Topology conflict</span>
+        </div>
+        <p className="mb-1 mt-2 text-[10px] uppercase tracking-widest text-premium-muted-dim">Connections</p>
+        <div className="flex items-center gap-2 rounded px-2 py-1">
+          <span className="inline-block h-1 w-6 rounded" style={{ backgroundColor: EDGE_COLORS.TOPOLOGY_GAP }} />
+          <span>Topology gap / conflict</span>
+        </div>
+        <div className="flex items-center gap-2 rounded px-2 py-1">
+          <span className="inline-block h-1 w-6 rounded" style={{ backgroundColor: voltageEdgeColor('MV_33KV') }} />
+          <span>MV 33 kV</span>
+        </div>
+        <div className="flex items-center gap-2 rounded px-2 py-1">
+          <span className="inline-block h-1 w-6 rounded" style={{ backgroundColor: voltageEdgeColor('MV_11KV') }} />
+          <span>MV 11 kV</span>
+        </div>
+        <div className="flex items-center gap-2 rounded px-2 py-1">
+          <span className="inline-block h-1 w-6 rounded" style={{ backgroundColor: voltageEdgeColor('LV_400V') }} />
+          <span>LV</span>
+        </div>
+        <div className="flex items-center gap-2 rounded px-2 py-1">
+          <span className="inline-block h-1 w-6 rounded" style={{ backgroundColor: voltageEdgeColor(null) }} />
+          <span>Other link</span>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function edgeColor(relationshipType: string, isPrivilegeEscalation: boolean, voltage?: string): string {
   if (isPrivilegeEscalation) return EDGE_COLORS.PRIVILEGE_ESCALATION;
@@ -351,7 +402,84 @@ function writeCameraPrefs(camera: Camera) {
   }
 }
 
-export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId = '', isLightMode = false, focusNodeArn = null, onFocusNodeHandled, onNodeSelect, onRequestAiAssist, onRequestGraphAiMode, aiAssist, graphChrome = 'full', graphQuery, onQueryChange, graphQueryOptions }: GiopGraphCanvasProps) {
+function linkEndpointId(endpoint: string | SimNode): string {
+  return typeof endpoint === 'object' ? endpoint.id : endpoint;
+}
+
+/** Deterministic seed for small feeder-style graphs (reduces force-layout jitter). */
+function seedCompactGraphLayout(nodes: SimNode[], links: SimLink[], spacing: number): boolean {
+  if (nodes.length < 2 || nodes.length > 120) return false;
+
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const neighbors = new Map<string, string[]>();
+  const degree = new Map<string, number>();
+
+  links.forEach((link) => {
+    const source = linkEndpointId(link.source as string | SimNode);
+    const target = linkEndpointId(link.target as string | SimNode);
+    if (!byId.has(source) || !byId.has(target)) return;
+    neighbors.set(source, [...(neighbors.get(source) ?? []), target]);
+    neighbors.set(target, [...(neighbors.get(target) ?? []), source]);
+    degree.set(source, (degree.get(source) ?? 0) + 1);
+    degree.set(target, (degree.get(target) ?? 0) + 1);
+  });
+
+  if (neighbors.size === 0) return false;
+
+  let startId = nodes[0].id;
+  let startDegree = degree.get(startId) ?? 0;
+  for (const node of nodes) {
+    const nodeDegree = degree.get(node.id) ?? 0;
+    if (nodeDegree > startDegree) {
+      startDegree = nodeDegree;
+      startId = node.id;
+    }
+  }
+
+  const ordered: SimNode[] = [];
+  const visited = new Set<string>();
+  const queue = [startId];
+  while (queue.length) {
+    const id = queue.shift()!;
+    if (visited.has(id)) continue;
+    const node = byId.get(id);
+    if (!node) continue;
+    visited.add(id);
+    ordered.push(node);
+    const nextIds = (neighbors.get(id) ?? []).slice().sort((a, b) => (degree.get(a) ?? 0) - (degree.get(b) ?? 0));
+    nextIds.forEach((nextId) => {
+      if (!visited.has(nextId)) queue.push(nextId);
+    });
+  }
+
+  nodes.forEach((node) => {
+    if (!visited.has(node.id)) ordered.push(node);
+  });
+
+  const mid = (ordered.length - 1) / 2;
+  ordered.forEach((node, index) => {
+    node.x = (index - mid) * spacing;
+    node.y = ((index % 2) - 0.5) * spacing * 0.15;
+    node.vx = 0;
+    node.vy = 0;
+  });
+  return true;
+}
+
+function warmStartSimulation(
+  simulation: ReturnType<typeof forceSimulation<SimNode, SimLink>>,
+  ticks: number,
+): void {
+  if (ticks <= 0) return;
+  simulation.stop();
+  for (let i = 0; i < ticks; i += 1) {
+    simulation.tick();
+  }
+  simulation.alpha(0).alphaTarget(0);
+}
+
+export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId = '', isLightMode = false, focusNodeArn = null, onFocusNodeHandled, onNodeSelect, onRequestAiAssist, onRequestGraphAiMode, aiAssist, graphChrome = 'full', graphQuery, onQueryChange, graphQueryOptions, layoutMode = 'default' }: GiopGraphCanvasProps) {
+  const isSplitLayout = layoutMode === 'split';
   const isOpsChrome = graphChrome === 'operations';
   const opsQueryOptions = isOpsChrome ? graphQueryOptions : undefined;
   const initialForcePrefs = readForcePrefs();
@@ -423,11 +551,8 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
   const [displaySectionOpen, setDisplaySectionOpen] = useState(true);
   const [forcesSectionOpen, setForcesSectionOpen] = useState(false);
   const [controlsPanelOpen, setControlsPanelOpen] = useState(false);
-  const [policyDocument, setPolicyDocument] = useState<CloudHoundPolicyDocumentResponse | null>(null);
-  const [policyDocumentLoading, setPolicyDocumentLoading] = useState(false);
-  const [policyDocumentError, setPolicyDocumentError] = useState<string | null>(null);
   
-  // Context menu state for IAM actions
+  // Context menu state for admin grid actions
   const [contextMenu, setContextMenu] = useState<ContextMenuState>({ visible: false, x: 0, y: 0, node: null });
   const [emptySpaceMenu, setEmptySpaceMenu] = useState<EmptySpaceActionMenuState>({ visible: false, x: 0, y: 0 });
 
@@ -439,6 +564,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
   const [pathFindingLoading, setPathFindingLoading] = useState(false);
   const [aiAssistAnchor, setAiAssistAnchor] = useState<AiAssistAnchor>({ nodeX: 0, nodeY: 0, bubbleX: 0, bubbleY: 0, visible: false });
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [inspectorDrawerOpen, setInspectorDrawerOpen] = useState(false);
   const aiAssistAnchorRef = useRef<AiAssistAnchor>({ nodeX: 0, nodeY: 0, bubbleX: 0, bubbleY: 0, visible: false });
 
   useEffect(() => {
@@ -750,6 +876,12 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
 
   const focusId = hoverId || activeId || searchMatches[0]?.id || null;
   const selectedNode = useMemo(() => (focusId ? renderGraph.nodes.find((node) => node.id === focusId) || null : null), [focusId, renderGraph.nodes]);
+
+  useEffect(() => {
+    if (isSplitLayout && activeId) {
+      setInspectorDrawerOpen(true);
+    }
+  }, [activeId, isSplitLayout]);
   const hoverNode = useMemo(
     () => (hoverId ? renderGraph.nodes.find((node) => node.id === hoverId) || null : null),
     [hoverId, renderGraph.nodes],
@@ -777,68 +909,6 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       }))
       .filter((group) => group.nodes.length > 0);
   }, [relatedNodes]);
-  const selectedPolicySummary = useMemo(() => {
-    if (!selectedNode) return null;
-    const raw = selectedNode.properties.policy_summary;
-    if (!raw || typeof raw !== 'object') return null;
-    return raw as PolicySummaryRecord;
-  }, [selectedNode]);
-  const selectedPolicyActions = useMemo(() => {
-    if (!selectedNode) return [] as string[];
-    const raw = selectedNode.properties.policy_actions;
-    return Array.isArray(raw) ? raw.map((value) => String(value)).filter(Boolean) : [];
-  }, [selectedNode]);
-  const selectedPolicyResources = useMemo(() => {
-    if (!selectedNode) return [] as string[];
-    const raw = selectedNode.properties.policy_resources;
-    return Array.isArray(raw) ? raw.map((value) => String(value)).filter(Boolean) : [];
-  }, [selectedNode]);
-  const selectedDeniedActions = useMemo(() => {
-    const raw = selectedPolicySummary?.deny_actions;
-    return Array.isArray(raw) ? raw.map((value) => String(value)).filter(Boolean) : [];
-  }, [selectedPolicySummary]);
-  const selectedDeniedResources = useMemo(() => {
-    const raw = selectedPolicySummary?.deny_resources;
-    return Array.isArray(raw) ? raw.map((value) => String(value)).filter(Boolean) : [];
-  }, [selectedPolicySummary]);
-  useEffect(() => {
-    let cancelled = false;
-    const selectedName = selectedNode?.fullLabel || selectedNode?.label || '';
-
-    if (!selectedNode?.id) {
-      setPolicyDocument(null);
-      setPolicyDocumentError(null);
-      setPolicyDocumentLoading(false);
-      return;
-    }
-
-    setPolicyDocumentLoading(true);
-    setPolicyDocumentError(null);
-
-    getCloudHoundPolicyDocument({
-      selectedAwsAccountId: selectedAwsAccountId || 'giop',
-      policyName: selectedName || selectedNode.id,
-    })
-      .then((doc) => {
-        if (!cancelled) {
-          setPolicyDocument(doc);
-        }
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setPolicyDocument(null);
-        setPolicyDocumentError(err instanceof Error ? err.message : 'Failed to load policy document');
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setPolicyDocumentLoading(false);
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedAwsAccountId, selectedNode?.id, selectedNode?.category, selectedNode?.arn, selectedNode?.fullLabel, selectedNode?.label]);
   const selectedRelationshipCounts = useMemo(() => {
     return relatedNodeGroups.reduce<Record<Filter, number>>((acc, group) => {
       acc[group.category] = group.nodes.length;
@@ -848,6 +918,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
 
   const quality = computeGraphQuality(renderGraph.nodes.length, isOpsChrome);
   const qualityConfig = GRAPH_QUALITY[quality];
+  const layoutStable = isSplitLayout || isOpsChrome || renderGraph.nodes.length <= 200;
   const selectedEdges = focusId ? (adjacency.nodeEdges.get(focusId)?.size || 0) : 0;
   const selectedEscalationDetails = useMemo(() => {
     if (!focusId) return [] as Array<{ id: string; type: string; explanation: string; sourceName: string; targetName: string }>;
@@ -859,8 +930,8 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       const target = nodeById.get(edge.target);
       return {
         id: edge.id,
-        type: edge.escalationType || 'privilege_path',
-        explanation: edge.chainExplanation || 'This edge participates in a privilege escalation path. Follow adjacent red edges to inspect the chain.',
+        type: edge.escalationType || 'topology_gap',
+        explanation: edge.chainExplanation || 'This connection indicates a topology gap or data-quality conflict. Follow adjacent red links to inspect the issue.',
         sourceName: source?.fullLabel || edge.source,
         targetName: target?.fullLabel || edge.target,
       };
@@ -947,12 +1018,13 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
     };
   }, [aiQueryNodeIds, aiQueryTitle, isAiQueryGraph, renderGraph.edges.length, renderGraph.nodes.length]);
 
-  const escalationTypeLabel = (type: string) => {
-    if (type === 'direct_user_policy') return 'Direct user policy escalation';
-    if (type === 'direct_role_policy') return 'Direct role policy escalation';
-    if (type === 'group_membership') return 'Group membership chain';
-    if (type === 'group_policy_inheritance') return 'Group policy inheritance';
-    return 'Privilege escalation path';
+  const topologyIssueTypeLabel = (type: string) => {
+    if (type === 'direct_user_policy') return 'Direct endpoint mismatch';
+    if (type === 'direct_role_policy') return 'Direct voltage class mismatch';
+    if (type === 'group_membership') return 'Multi-hop connectivity gap';
+    if (type === 'group_policy_inheritance') return 'Inherited topology conflict';
+    if (type === 'topology_gap') return 'Topology gap';
+    return 'Topology conflict path';
   };
 
   const toggleFilter = (key: Filter) => {
@@ -990,30 +1062,41 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       canvas.style.height = `${rect.height}px`;
     };
 
-    const simNodes: SimNode[] = renderGraph.nodes.map((node) => ({
-      ...node,
-      x: (Math.random() - 0.5) * 30,
-      y: (Math.random() - 0.5) * 30,
-      vx: 0,
-      vy: 0,
-      drift: Math.random() * Math.PI * 2,
-      driftSpeed: 0.12 + Math.random() * 0.12,
-      driftRadius: 0.015 + Math.random() * 0.03,
-    }));
+    const previousPositions = new Map(
+      nodesRef.current.map((node) => [node.id, { x: node.x ?? 0, y: node.y ?? 0 }]),
+    );
+
+    const simNodes: SimNode[] = renderGraph.nodes.map((node) => {
+      const prev = previousPositions.get(node.id);
+      return {
+        ...node,
+        x: prev?.x ?? (Math.random() - 0.5) * 30,
+        y: prev?.y ?? (Math.random() - 0.5) * 30,
+        vx: 0,
+        vy: 0,
+        drift: Math.random() * Math.PI * 2,
+        driftSpeed: 0.12 + Math.random() * 0.12,
+        driftRadius: 0.015 + Math.random() * 0.03,
+      };
+    });
     const nodeIdSet = new Set(renderGraph.nodes.map((node) => node.id));
     const simLinks: SimLink[] = renderGraph.edges
       .filter((edge) => nodeIdSet.has(edge.source) && nodeIdSet.has(edge.target))
       .map((edge) => ({ source: edge.source, target: edge.target, weight: edge.weight, label: edge.label, confidence: edge.confidence, color: edge.color, isPrivilegeEscalation: edge.isPrivilegeEscalation }));
+
+    const layoutSpacing = forceParamsRef.current.linkDist;
+    const layoutSeeded = layoutStable && seedCompactGraphLayout(simNodes, simLinks, layoutSpacing);
+    const hasPriorLayout = previousPositions.size > 0;
 
     nodesRef.current = simNodes;
     edgesRef.current = simLinks;
     resize();
 
     const simulation = forceSimulation(simNodes)
-      .alpha(0.9)
-      .alphaMin(0.001)
-      .alphaDecay(0.05)
-      .velocityDecay(0.48)
+      .alpha(layoutSeeded || hasPriorLayout ? 0.28 : 0.9)
+      .alphaMin(layoutStable ? 0.02 : 0.001)
+      .alphaDecay(layoutStable ? 0.14 : 0.05)
+      .velocityDecay(layoutStable ? 0.72 : 0.48)
       .force('charge', forceManyBody<SimNode>().strength((node) => forceParamsRef.current.repel * Math.min(1.2, 240 / Math.max(90, simNodes.length)) * (1 + node.size * 0.02)).distanceMin(10).distanceMax(simNodes.length > 2400 ? 140 : 180).theta(0.86))
       .force('link', forceLink<SimNode, SimLink>(simLinks).id((d) => d.id).distance((link) => forceParamsRef.current.linkDist + (2 - Math.min(2, link.weight)) * 6).strength((link) => forceParamsRef.current.linkStr + Math.min(0.18, link.weight * 0.08)))
       .force('collide', forceCollide<SimNode>((node) => node.size + 4).strength(0.82).iterations(2))
@@ -1021,6 +1104,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       .force('centerY', forceY(0).strength(centerForce * 0.35))
       .stop();
     simRef.current = simulation;
+    warmStartSimulation(simulation, layoutStable ? (layoutSeeded ? 36 : 72) : 0);
 
     const hitTest = (clientX: number, clientY: number) => {
       const rect = canvas.getBoundingClientRect();
@@ -1514,7 +1598,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         setActiveId(node.id);
         const nodeRecord = renderGraph.nodes.find((n) => n.id === node.id);
         onNodeSelectRef.current?.(node.id, nodeRecord?.fullLabel || nodeRecord?.label);
-        simulation.alphaTarget(0.12).restart();
+        simulation.alphaTarget(layoutStable ? 0.05 : 0.12).restart();
       } else {
         modeRef.current = 'pan';
       }
@@ -1560,8 +1644,8 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       try { canvas.releasePointerCapture(event.pointerId); } catch { /* noop */ }
       if (modeRef.current === 'node' && dragRef.current) {
         const dragged = simNodes.find((item) => item.id === dragRef.current);
-        if (dragged) { dragged.fx = null; dragged.fy = null; dragged.vx = (dragged.vx || 0) * 0.4; dragged.vy = (dragged.vy || 0) * 0.4; }
-        simulation.alphaTarget(0.04);
+        if (dragged) { dragged.fx = null; dragged.fy = null; dragged.vx = 0; dragged.vy = 0; }
+        simulation.alphaTarget(layoutStable ? 0 : 0.04);
       }
       modeRef.current = 'none';
       dragRef.current = null;
@@ -1759,7 +1843,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       for (let i = 0; i < count; i += 1) {
         const alpha = simulation.alpha();
         const time = timestamp * 0.001;
-        if (qualityConfig.drift) {
+        if (qualityConfig.drift && !layoutStable) {
           simNodes.forEach((node) => {
             const currentAiAssist = aiAssistRef.current;
             const isAiAssistNode = currentAiAssist?.isOpen && currentAiAssist.nodeId === node.id;
@@ -1777,15 +1861,23 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         simulation.tick();
       }
       if (!dragRef.current) {
-        if (simNodes.length > 800) {
-          simulation.alphaTarget(simulation.alpha() < 0.025 ? 0 : 0.015);
+        if (layoutStable || simulation.alpha() < 0.04) {
+          simulation.alphaTarget(0);
+          if (layoutStable && simulation.alpha() < 0.02) {
+            simNodes.forEach((node) => {
+              node.vx = 0;
+              node.vy = 0;
+            });
+          }
+        } else if (simNodes.length > 800) {
+          simulation.alphaTarget(simulation.alpha() < 0.025 ? 0 : 0.012);
         } else {
-          simulation.alphaTarget(simulation.alpha() < 0.03 ? 0.018 : 0.03);
+          simulation.alphaTarget(simulation.alpha() < 0.03 ? 0 : 0.015);
         }
       }
       draw();
 
-      const allowIdlePause = quality !== 'ultra' || simNodes.length > 400;
+      const allowIdlePause = layoutStable || quality !== 'ultra' || simNodes.length > 400;
       const cameraMoving =
         Math.abs(cameraRef.current.x - cameraTargetRef.current.x) > 0.08
         || Math.abs(cameraRef.current.y - cameraTargetRef.current.y) > 0.08
@@ -1819,7 +1911,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       resizeRef.current?.disconnect();
       setAnimating(false);
     };
-  }, [adjacency.neighbors, isOpsChrome, quality, renderGraph]);
+  }, [adjacency.neighbors, isOpsChrome, isSplitLayout, quality, renderGraph]);
 
   const commitSearch = () => {
     const next = searchInput.trim();
@@ -2031,21 +2123,12 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
 
   const buildAiAssistPrompt = (node: NodeRecord) => {
     const focusSignals = [
-      node.dangerousPolicy ? 'privilege-escalation-capable policy' : null,
-      node.trustExternal ? 'external trust relationship' : null,
-      node.isHvt ? 'high-value target' : null,
-      node.riskBand !== 'low' ? `${node.riskBand} canonical risk` : null,
+      node.dangerousPolicy ? 'topology conflict' : null,
+      node.trustExternal ? 'disconnected endpoint' : null,
+      node.isHvt ? 'critical asset' : null,
+      node.riskBand !== 'low' ? `${node.riskBand} data-quality finding` : null,
     ].filter(Boolean);
 
-    const policyActions = Array.isArray(node.properties.policy_actions)
-      ? node.properties.policy_actions.slice(0, 8).map((value) => String(value))
-      : [];
-    const policyResources = Array.isArray(node.properties.policy_resources)
-      ? node.properties.policy_resources.slice(0, 5).map((value) => String(value))
-      : [];
-    const policySummary = node.properties.policy_summary && typeof node.properties.policy_summary === 'object'
-      ? node.properties.policy_summary as PolicySummaryRecord
-      : null;
     const relatedIds = adjacency.neighbors.get(node.id) || new Set<string>();
     const relatedCounts = Array.from(relatedIds).reduce<Record<Filter, number>>((acc, relatedId) => {
       const relatedNode = nodeById.get(relatedId);
@@ -2057,8 +2140,6 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
     const facts: string[] = [
       `type=${node.nodeType}`,
       `name=${node.fullLabel}`,
-      `risk_score=${node.riskLevel}`,
-      `risk_band=${node.riskBand}`,
     ];
 
     if (node.graphSignalLevel > 0) {
@@ -2066,7 +2147,15 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
     }
 
     if (node.arn) {
-      facts.push(`arn=${node.arn}`);
+      facts.push(`mrid=${node.arn}`);
+    }
+
+    if (node.properties.validation) {
+      facts.push(`validation=${String(node.properties.validation)}`);
+    }
+
+    if (node.properties.connected === false) {
+      facts.push('connected=false');
     }
 
     if (focusSignals.length) {
@@ -2079,36 +2168,8 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       );
     }
 
-    if (policySummary?.statement_count) {
-      facts.push(`policy_statements=${policySummary.statement_count}`);
-    }
-
-    if (policySummary?.has_wildcard_actions) {
-      facts.push('wildcard_actions=true');
-    }
-
-    if (policySummary?.has_wildcard_resources) {
-      facts.push('wildcard_resources=true');
-    }
-
-    if (policyActions.length) {
-      facts.push(`allow_actions=[${policyActions.join(', ')}]`);
-    }
-
-    if (policyResources.length) {
-      facts.push(`allow_resources=[${policyResources.join(', ')}]`);
-    }
-
-    if (Array.isArray(policySummary?.deny_actions) && policySummary?.deny_actions?.length) {
-      facts.push(`deny_actions=[${policySummary.deny_actions.slice(0, 8).join(', ')}]`);
-    }
-
-    if (Array.isArray(policySummary?.deny_resources) && policySummary?.deny_resources?.length) {
-      facts.push(`deny_resources=[${policySummary.deny_resources.slice(0, 5).join(', ')}]`);
-    }
-
     return [
-      'Selected node (context only, do not restate verbatim):',
+      'Selected grid asset (context only, do not restate verbatim):',
       ...facts.map((line) => `- ${line}`),
     ].join('\n');
   };
@@ -2146,7 +2207,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         const currentAccountId = selectedAwsAccountIdRef.current;
         if (!currentAccountId) {
           if (requestId === pathRequestSeqRef.current) {
-            setFoundPath({ found: false, path: { nodes: [], edges: [] }, message: 'Select an AWS account first' });
+            setFoundPath({ found: false, path: { nodes: [], edges: [] }, message: 'Select a network scope first' });
           }
           return;
         }
@@ -2216,6 +2277,13 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
     ? [...graphAiAssist.messages].reverse().find((msg) => msg.role === 'assistant') || graphAiAssist.messages[graphAiAssist.messages.length - 1]
     : null;
   const hideGraphChrome = isGraphAiAssistOpen;
+  const inspectorEligible = !isNodeAiAssistOpen && !hideGraphChrome && !isOpsChrome;
+  const inspectorVisible = inspectorEligible && (!isSplitLayout || inspectorDrawerOpen);
+  const toolbarMaxWidth = isSplitLayout
+    ? 'max-w-none'
+    : isFullscreen
+      ? 'max-w-[min(760px,max(240px,calc(100%-clamp(300px,32vw,360px)-284px)))]'
+      : 'max-w-[min(760px,max(240px,calc(100%-268px)))] lg:max-w-[min(760px,max(240px,calc(100%-clamp(300px,32vw,360px)-284px)))]';
 
   return (
     <div ref={graphShellRef} className="h-full flex flex-col">
@@ -2224,6 +2292,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         .chat-thinking-dot { animation: chat-thinking-bounce 1.2s infinite ease-in-out; }
       `}</style>
       <div className={`relative overflow-hidden flex-1 border-none ${isLightMode ? 'bg-slate-100/85' : 'bg-premium-bg'}`}>
+        {!isSplitLayout && (
         <div className={`absolute inset-x-0 top-0 z-40 flex items-center justify-between gap-2 border-b px-2 py-1.5 text-xs sm:px-3 sm:py-2 ${isLightMode ? 'border-slate-300/60 bg-slate-100/80 text-slate-700' : 'border-premium-border/50 bg-premium-sidebar/95 text-premium-text'}`}>
           {isOpsChrome && opsQueryOptions && onQueryChange ? (
             <div className={`flex shrink-0 rounded-md border p-0.5 ${isLightMode ? 'border-slate-300 bg-slate-200/60' : 'border-premium-border/55 bg-premium-surface/80'}`}>
@@ -2251,7 +2320,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
               })}
             </div>
           ) : (
-            <span>{isOpsChrome ? 'Network topology' : 'IAM Knowledge Graph'}</span>
+            <span>{isOpsChrome || isSplitLayout ? 'Network topology' : 'Grid network graph'}</span>
           )}
           <div className="flex min-w-0 items-center gap-1.5 sm:gap-2">
             {isOpsChrome && (
@@ -2267,8 +2336,9 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
             <span className={`h-2 w-2 shrink-0 rounded-full ${animating ? 'animate-pulse bg-sky-400' : 'bg-emerald-400'}`} />
           </div>
         </div>
+        )}
 
-        <div ref={containerRef} className={`relative h-full w-full ${isOpsChrome ? 'min-h-0' : 'min-h-[760px]'}`} aria-label={isOpsChrome ? 'Grid network topology graph' : 'IAM topology graph canvas'}>
+        <div ref={containerRef} className={`relative h-full w-full ${isOpsChrome || isSplitLayout ? 'min-h-0' : 'min-h-[760px]'}`} aria-label="Grid network topology graph">
           <canvas ref={canvasRef} className="h-full w-full touch-none" />
         </div>
 
@@ -2300,7 +2370,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                 <div>
                   <p className="text-[11px] uppercase tracking-[0.24em] text-sky-300/80">AI Assist</p>
                   <h3 className="mt-1 text-sm font-semibold text-premium-text">{nodeAiAssist.nodeTitle || 'Selected node'}</h3>
-                  <p className="mt-1 text-xs text-premium-muted">Ask about risk, permissions, graph exposure, or safe remediation for this node.</p>
+                  <p className="mt-1 text-xs text-premium-muted">Ask about connectivity, data quality, downstream impact, or remediation for this asset.</p>
                 </div>
                 <button
                   type="button"
@@ -2546,7 +2616,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                     </div>
                   ) : (
                     <p className="mt-2 line-clamp-5 text-sm text-premium-text">
-                      {graphAiAssist.lastInstruction || 'No instruction sent yet. Try “show me the most dangerous trust paths” or “focus on roles connected to dangerous policies”.'}
+                      {graphAiAssist.lastInstruction || 'No instruction sent yet. Try “show disconnected transformers on this feeder” or “highlight topology gaps within 2 hops”.'}
                     </p>
                   )}
                 </div>
@@ -2688,9 +2758,9 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
           </div>
         )}
 
-        {!hideGraphChrome && !isOpsChrome && (
+        {!hideGraphChrome && !isOpsChrome && !isSplitLayout && (
           <div className="pointer-events-none absolute inset-0 z-30 p-3 pt-12 sm:p-4 sm:pt-12">
-            <div className={`pointer-events-auto rounded-xl border p-2.5 backdrop-blur-lg ${isFullscreen ? 'max-w-[min(760px,max(240px,calc(100%-clamp(300px,32vw,360px)-284px)))]' : 'max-w-[min(760px,max(240px,calc(100%-268px)))] lg:max-w-[min(760px,max(240px,calc(100%-clamp(300px,32vw,360px)-284px)))]'} ${isLightMode ? 'border-slate-300/60 bg-slate-100/80' : 'border-premium-border/50 bg-premium-card/92'}`}>
+            <div className={`pointer-events-auto rounded-xl border p-2.5 backdrop-blur-lg ${toolbarMaxWidth} ${isLightMode ? 'border-slate-300/60 bg-slate-100/80' : 'border-premium-border/50 bg-premium-card/92'}`}>
             <div className="flex flex-wrap items-center gap-2">
               <input
                 value={searchInput}
@@ -2701,7 +2771,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                     commitSearch();
                   }
                 }}
-                placeholder="Search identities, roles, policies, ARNs (press Enter)"
+                placeholder="Search assets, feeders, MRIDs (press Enter)"
                 className={`min-w-[220px] flex-1 rounded-md border px-3 py-1.5 text-sm outline-none focus:border-premium-accent/60 ${isLightMode ? 'border-slate-300 bg-slate-50 text-slate-900 placeholder:text-premium-muted-dim' : 'border-premium-border/55 bg-premium-surface text-premium-text placeholder:text-premium-muted-dim'}`}
               />
               <button type="button" onClick={reframe} className={`inline-flex h-8 items-center rounded-lg border px-3 text-xs font-medium transition ${isLightMode ? 'border-slate-300 bg-slate-100 text-slate-700 hover:border-slate-400 hover:bg-slate-200' : 'border-premium-border/55 bg-premium-card text-premium-text hover:border-premium-accent/70 hover:bg-premium-hover/90'}`}>Center</button>
@@ -2767,10 +2837,10 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
               <div className="ml-auto hidden items-center gap-3 text-[11px] text-premium-muted sm:flex">
                 <span>N {graph.metrics?.total_nodes ?? graph.nodes.length}</span>
                 <span>E {graph.metrics?.total_edges ?? graph.edges.length}</span>
-                <span>Risk {graph.metrics?.high_risk_entities ?? 0}</span>
-                <span>HVT {graph.metrics?.hvt_count ?? 0}</span>
-                <span>Trust {graph.metrics?.external_trust_roles ?? 0}</span>
-                <span>Esc {graph.metrics?.privilege_escalation_paths ?? 0}</span>
+                <span>DQ {graph.metrics?.high_risk_entities ?? 0}</span>
+                <span>Critical {graph.metrics?.hvt_count ?? 0}</span>
+                <span>Isolated {graph.metrics?.external_trust_roles ?? 0}</span>
+                <span>Gaps {graph.metrics?.privilege_escalation_paths ?? 0}</span>
                 <span>{modeLabel}</span>
               </div>
             </div>
@@ -2786,7 +2856,36 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
           </div>
         )}
 
-        {!hideGraphChrome && !isOpsChrome && (
+        {!hideGraphChrome && !isOpsChrome && isSplitLayout && (
+          <div className="giop-graph-float pointer-events-none absolute bottom-3 left-3 z-30">
+            <div className={`giop-graph-float__cluster ${isLightMode ? 'giop-graph-float__cluster--light' : ''}`}>
+              <button type="button" onClick={reframe} className={`inline-flex h-7 items-center rounded-full border px-2.5 text-[11px] font-medium transition ${isLightMode ? 'border-slate-300/80 bg-white/90 text-slate-700 hover:bg-white' : 'border-premium-border/55 bg-premium-card/90 text-premium-text hover:bg-premium-hover/90'}`}>Center</button>
+              <button type="button" onClick={resetView} className={`inline-flex h-7 items-center rounded-full border px-2.5 text-[11px] font-medium transition ${isLightMode ? 'border-slate-300/80 bg-white/90 text-slate-700 hover:bg-white' : 'border-premium-border/55 bg-premium-card/90 text-premium-text hover:bg-premium-hover/90'}`}>Reset</button>
+              {selectedNode && (
+                <button
+                  type="button"
+                  onClick={() => setInspectorDrawerOpen(true)}
+                  className={`inline-flex h-7 items-center gap-1 rounded-full border px-2.5 text-[11px] font-medium transition ${isLightMode ? 'border-sky-300/80 bg-sky-50 text-sky-800 hover:bg-sky-100' : 'border-sky-500/50 bg-sky-950/40 text-sky-100 hover:bg-sky-900/50'}`}
+                >
+                  <PanelRightOpen className="h-3 w-3" />
+                  Inspect
+                </button>
+              )}
+            </div>
+            <div className={`giop-graph-float__filters ${isLightMode ? 'giop-graph-float__filters--light' : ''}`}>
+              {([
+                ['all', 'All', typeCounts.all], ['substation', 'Subs', typeCounts.substation], ['transformer', 'Tx', typeCounts.transformer], ['feeder', 'Feeders', typeCounts.feeder], ['meter', 'Meters', typeCounts.meter], ['other', 'Other', typeCounts.other],
+              ] as Array<[Filter, string, number]>).map(([key, label, count]) => (
+                <button key={key} type="button" onClick={() => toggleFilter(key)} className={`inline-flex h-6 items-center gap-1 rounded-full border px-2 text-[10px] font-medium transition ${isFilterActive(key) ? 'border-premium-accent/70 bg-premium-accent/18 text-premium-text' : isLightMode ? 'border-slate-300/70 bg-white/85 text-slate-600 hover:bg-white' : 'border-premium-border/55 bg-premium-surface/90 text-premium-text-secondary hover:bg-premium-hover/80 hover:text-premium-text'}`}>
+                  <span>{label}</span>
+                  <span className={`inline-flex min-w-[16px] items-center justify-center rounded-full px-1 text-[9px] ${isFilterActive(key) ? 'bg-premium-accent/25 text-premium-text' : isLightMode ? 'bg-slate-200/80 text-slate-600' : 'bg-premium-hover-strong/70 text-premium-text-secondary'}`}>{count}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {!hideGraphChrome && !isOpsChrome && !isSplitLayout && (
           <div className={`pointer-events-none absolute top-14 z-50 ${showInspectorPanel ? 'right-[calc(clamp(300px,32vw,360px)+32px)]' : 'right-4 lg:right-[calc(clamp(300px,32vw,360px)+32px)]'}`}>
             <div className={`pointer-events-auto w-[228px] overflow-hidden rounded-xl border bg-premium-card/98 p-3 text-sm backdrop-blur-xl transition-colors duration-300 ${controlsPanelOpen ? 'border-premium-accent/30 shadow-[0_20px_60px_rgba(212,212,212,0.08)]' : 'border-premium-border/55 shadow-lg'}`}>
             <button
@@ -2824,7 +2923,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                   <div className="flex items-center justify-between">
                     <div>
                       <span className="text-premium-text-secondary">Heat map</span>
-                      <p className="text-[10px] text-premium-muted-dim">Color nodes by canonical risk</p>
+                      <p className="text-[10px] text-premium-muted-dim">Color nodes by data-quality findings</p>
                     </div>
                     <button
                       type="button"
@@ -2898,26 +2997,33 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
             animation: chat-thinking-bounce 1.2s infinite ease-in-out;
           }
         `}</style>
-        {!isNodeAiAssistOpen && !hideGraphChrome && !isOpsChrome && (
-          <div className={`pointer-events-none absolute right-4 top-14 bottom-4 z-30 ${isFullscreen ? 'block w-[clamp(300px,32vw,360px)] max-w-[calc(100%-2rem)]' : 'hidden w-[clamp(300px,32vw,360px)] lg:block'}`}>
+        {inspectorVisible && (
+          <>
+          <div className={`pointer-events-none absolute ${isSplitLayout ? 'z-[95]' : 'z-40'} ${isSplitLayout ? 'right-0 top-0 bottom-0 w-[min(280px,46%)]' : `right-4 top-14 bottom-4 ${showInspectorPanel ? 'block' : 'hidden lg:block'} w-[clamp(300px,32vw,360px)] max-w-[calc(100%-2rem)]`}`}>
             <div className="pointer-events-auto h-full">
-              <div className="flex h-full flex-col rounded-2xl border border-premium-border/55 bg-premium-card/95 p-4 shadow-premium backdrop-blur-xl">
+              <div className={`flex h-full flex-col border border-premium-border/55 p-4 shadow-premium ${isSplitLayout ? 'rounded-l-2xl rounded-r-none border-r-0 bg-premium-card' : 'rounded-2xl bg-premium-card/95 backdrop-blur-xl'}`}>
+                {isSplitLayout && (
+                  <div className="mb-3 flex items-center justify-between gap-2 border-b border-premium-border/50 pb-3">
+                    <p className="text-[11px] uppercase tracking-[0.24em] text-premium-muted-dim">Inspector</p>
+                    <button
+                      type="button"
+                      onClick={() => setInspectorDrawerOpen(false)}
+                      className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-premium-border/55 text-premium-muted transition hover:border-premium-border hover:text-premium-text"
+                      aria-label="Close inspector panel"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                )}
                 <div className="inspector-scroll min-h-0 space-y-4 overflow-y-auto" style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}>
               <div>
+                {!isSplitLayout && (
                 <p className="text-[11px] uppercase tracking-[0.24em] text-premium-muted-dim">Inspector</p>
-                <div className="mt-3 space-y-3">
+                )}
+                <div className={`space-y-3 ${isSplitLayout ? '' : 'mt-3'}`}>
                   {selectedNode ? (
                     <>
                       <div><h3 className="text-lg font-semibold text-premium-text">{selectedNode.fullLabel}</h3><p className="text-sm text-premium-muted">{selectedNode.nodeType || selectedNode.category}</p></div>
-                      <div className={`rounded-lg border px-3 py-2 text-sm ${
-                        selectedNode.riskBand === 'critical'
-                          ? 'text-red-300 border-red-800/70 bg-red-950/30'
-                          : selectedNode.riskBand === 'high'
-                            ? 'text-orange-300 border-orange-800/70 bg-orange-950/30'
-                            : selectedNode.riskBand === 'medium'
-                              ? 'text-amber-300 border-amber-800/70 bg-amber-950/30'
-                              : 'text-premium-text-secondary border-premium-border/50 bg-premium-surface/90'
-                      }`}>Risk level: {selectedNode.riskLevel.toFixed(1)} ({selectedNode.riskBand})</div>
                       {onRequestAiAssist && (
                         <button
                           type="button"
@@ -2928,69 +3034,12 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                         </button>
                       )}
                       <div className="flex flex-wrap gap-2">
-                        {selectedNode.isHvt && <div className="rounded-lg border border-amber-700/70 bg-amber-950/30 px-3 py-2 text-xs text-amber-200">High-value target</div>}
-                        {selectedNode.trustExternal && <div className="rounded-lg border border-orange-700/70 bg-orange-950/30 px-3 py-2 text-xs text-orange-200">External trust</div>}
-                        {selectedNode.dangerousPolicy && <div className="rounded-lg border border-red-700/70 bg-red-950/30 px-3 py-2 text-xs text-red-200">Privilege escalation policy</div>}
-                        {selectedPolicySummary?.has_wildcard_actions && <div className="rounded-lg border border-sky-700/70 bg-sky-950/25 px-3 py-2 text-xs text-sky-200">Wildcard actions</div>}
-                        {selectedPolicySummary?.has_wildcard_resources && <div className="rounded-lg border border-sky-700/70 bg-sky-950/25 px-3 py-2 text-xs text-sky-200">Wildcard resources</div>}
+                        {selectedNode.isHvt && <div className="rounded-lg border border-amber-700/70 bg-amber-950/30 px-3 py-2 text-xs text-amber-200">Critical asset</div>}
+                        {selectedNode.trustExternal && <div className="rounded-lg border border-orange-700/70 bg-orange-950/30 px-3 py-2 text-xs text-orange-200">Disconnected endpoint</div>}
+                        {selectedNode.dangerousPolicy && <div className="rounded-lg border border-red-700/70 bg-red-950/30 px-3 py-2 text-xs text-red-200">Topology conflict</div>}
                       </div>
                       <div className="rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary"><p className="font-medium text-premium-text">Focus depth</p><p className="mt-1 text-premium-muted">Current expansion radius is {depth} hop{depth === 1 ? '' : 's'}</p></div>
-                      {selectedNode.arn && <div className="break-all rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-muted">{selectedNode.arn}</div>}
-                      {(selectedPolicySummary || selectedPolicyActions.length > 0 || selectedPolicyResources.length > 0) && (
-                        <div className="rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary">
-                          <p className="font-medium text-premium-text">Policy summary</p>
-                          <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
-                            <div className="rounded border border-premium-border/50 bg-premium-surface/85 px-2 py-2 text-premium-text-secondary">
-                              <span className="text-premium-muted-dim">Statements</span>
-                              <p className="mt-1 text-sm text-premium-text">{selectedPolicySummary?.statement_count ?? 0}</p>
-                            </div>
-                            <div className="rounded border border-premium-border/50 bg-premium-surface/85 px-2 py-2 text-premium-text-secondary">
-                              <span className="text-premium-muted-dim">Allowed actions</span>
-                              <p className="mt-1 text-sm text-premium-text">{selectedPolicyActions.length}</p>
-                            </div>
-                          </div>
-                          {selectedPolicyActions.length > 0 && (
-                            <div className="mt-3">
-                              <p className="text-[10px] uppercase tracking-wider text-premium-muted-dim">Allowed actions</p>
-                              <div className="mt-2 flex flex-wrap gap-1.5">
-                                {selectedPolicyActions.slice(0, 8).map((action) => (
-                                  <span key={action} className="rounded-full border border-premium-border/55 bg-premium-surface px-2 py-1 text-[10px] text-premium-text-secondary">{action}</span>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                          {selectedPolicyResources.length > 0 && (
-                            <div className="mt-3">
-                              <p className="text-[10px] uppercase tracking-wider text-premium-muted-dim">Allowed resources</p>
-                              <div className="mt-2 space-y-1">
-                                {selectedPolicyResources.slice(0, 5).map((resource) => (
-                                  <div key={resource} className="break-all rounded bg-premium-surface/85 px-2 py-1 text-[11px] text-premium-text-secondary">{resource}</div>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                          {selectedDeniedActions.length > 0 && (
-                            <div className="mt-3">
-                              <p className="text-[10px] uppercase tracking-wider text-premium-muted-dim">Denied actions</p>
-                              <div className="mt-2 flex flex-wrap gap-1.5">
-                                {selectedDeniedActions.slice(0, 6).map((action) => (
-                                  <span key={action} className="rounded-full border border-red-800/70 bg-red-950/20 px-2 py-1 text-[10px] text-red-200">{action}</span>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                          {selectedDeniedResources.length > 0 && (
-                            <div className="mt-3">
-                              <p className="text-[10px] uppercase tracking-wider text-premium-muted-dim">Denied resources</p>
-                              <div className="mt-2 space-y-1">
-                                {selectedDeniedResources.slice(0, 4).map((resource) => (
-                                  <div key={resource} className="break-all rounded bg-red-950/15 px-2 py-1 text-[11px] text-red-200">{resource}</div>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      )}
+                      {selectedNode.arn && <div className="break-all rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-muted"><span className="text-[10px] uppercase tracking-wider text-premium-muted-dim">MRID</span><p className="mt-1">{selectedNode.arn}</p></div>}
                       {selectedNode && (
                         <div className="rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary">
                           <p className="font-medium text-premium-text">Asset detail</p>
@@ -3003,23 +3052,11 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                       )}
                       {selectedNode && (
                         <div className="rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary">
-                          <p className="font-medium text-premium-text">Registry record (placeholder)</p>
-                          {policyDocumentLoading && (
-                            <p className="mt-2 text-[11px] text-premium-muted">Loading policy JSON from AWS IAM...</p>
-                          )}
-                          {policyDocumentError && !policyDocumentLoading && (
-                            <p className="mt-2 text-[11px] text-rose-300">{policyDocumentError}</p>
-                          )}
-                          {policyDocument?.document && !policyDocumentLoading && (
-                            <>
-                              <p className="mt-2 text-[10px] uppercase tracking-wider text-premium-muted-dim">
-                                Version {policyDocument.default_version_id}
-                              </p>
-                              <pre className="mt-2 max-h-56 overflow-auto rounded border border-premium-border/50 bg-premium-surface/90 p-2 text-[10px] leading-relaxed text-premium-text-secondary">
-                                {JSON.stringify(policyDocument.document, null, 2)}
-                              </pre>
-                            </>
-                          )}
+                          <p className="font-medium text-premium-text">CIM registry</p>
+                          <p className="mt-2 font-mono text-[11px] text-premium-muted">{selectedNode.id}</p>
+                          <p className="mt-1">Asset class: {selectedNode.category}</p>
+                          <p className="mt-1">Validation: {String(selectedNode.properties.validation ?? 'APPROVED')}</p>
+                          <p className="mt-1 text-premium-muted-dim">Full CIM export available from the asset registry.</p>
                         </div>
                       )}
                       <div className="rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary">
@@ -3035,11 +3072,11 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                       <div className="rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary"><p className="font-medium text-premium-text">Relationship count</p><p className="mt-1 text-premium-muted">{selectedEdges} nearby relationship{selectedEdges === 1 ? '' : 's'}</p></div>
                       {!!selectedEscalationDetails.length && (
                         <div className="rounded-lg border border-red-800/70 bg-red-950/20 p-3 text-xs text-red-100">
-                          <p className="font-medium text-red-200">Escalation chain explanation</p>
+                          <p className="font-medium text-red-200">Topology issue explanation</p>
                           <div className="mt-2 space-y-2">
                             {selectedEscalationDetails.slice(0, 4).map((item) => (
                               <div key={item.id} className="rounded border border-red-800/60 bg-red-950/20 px-2.5 py-2">
-                                <p className="text-[11px] font-semibold uppercase tracking-wide text-red-300">{escalationTypeLabel(item.type)}</p>
+                                <p className="text-[11px] font-semibold uppercase tracking-wide text-red-300">{topologyIssueTypeLabel(item.type)}</p>
                                 <p className="mt-1 text-red-100/95">{item.explanation}</p>
                                 <p className="mt-1 text-[11px] text-red-200/85">{item.sourceName} {'->'} {item.targetName}</p>
                               </div>
@@ -3052,12 +3089,13 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
                 </div>
               </div>
               <div><p className="text-[11px] uppercase tracking-[0.24em] text-premium-muted-dim">Focus controls</p><div className="mt-3 space-y-3 rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3"><div><div className="mb-1 flex items-center justify-between text-xs text-premium-muted"><span>Depth</span><span>{depth} hops</span></div><input type="range" min={1} max={4} value={depth} onChange={(e) => setDepth(Number(e.target.value))} className="w-full accent-sky-400" /></div><div className="flex items-center justify-between text-xs text-premium-muted"><span>Focused node</span><span className="truncate pl-2 text-premium-text-secondary">{focusId ? (selectedNode?.label || selectedNode?.fullLabel || focusId) : 'None'}</span></div></div></div>
-              <div><p className="text-[11px] uppercase tracking-[0.24em] text-premium-muted-dim">Legend</p><div className="mt-3 space-y-1 text-sm text-premium-text-secondary"><p className="text-[10px] uppercase tracking-widest text-premium-muted-dim mb-1">Node types</p><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#9ec5ff]" /><span>User</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#c9a9ff]" /><span>Role</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#7fd6c9]" /><span>Policy</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-3 h-3 rounded-full bg-[#ffd08a]" /><span>Group</span></div><p className="text-[10px] uppercase tracking-widest text-premium-muted-dim mt-2 mb-1">Security signals</p><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-4 h-4 rounded-full border-2 border-[#f4d06f]" /><span>High-value target</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-4 h-4 rounded-full border-2 border-[#ff915a]" /><span>External trust role</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-4 h-4 rounded-full border-2 border-[#ef4444] bg-[#ef4444]/20" /><span>Dangerous policy</span></div><p className="text-[10px] uppercase tracking-widest text-premium-muted-dim mt-2 mb-1">Edge relationships</p><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#ef4444'}} /><span>Privilege escalation path</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#7fd6c9'}} /><span>Attached / Has Policy</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#ff915a'}} /><span>Assumes / Trusts Role</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#ffd08a'}} /><span>Member of Group</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#a881ff'}} /><span>Granted / Grants</span></div><div className="flex items-center gap-2 rounded px-2 py-1"><span className="inline-block w-6 h-1 rounded" style={{backgroundColor:'#9aa4b3'}} /><span>Other</span></div></div></div>
+              <GraphInspectorLegend />
               <div><p className="text-[11px] uppercase tracking-[0.24em] text-premium-muted-dim">Selection</p><div className="mt-3 rounded-lg border border-premium-border/50 bg-premium-surface/90 p-3 text-xs text-premium-text-secondary">{hoverNode ? <div className="space-y-1"><p className="font-semibold text-premium-text">{hoverNode.fullLabel || hoverNode.label}</p><p className="text-[10px] uppercase tracking-wide text-premium-muted-dim">{hoverNode.nodeType}</p><p className="font-mono text-[10px] text-premium-muted">{hoverNode.id}</p>{hoverNode.properties?.validation ? <p className="text-premium-muted">Status: {String(hoverNode.properties.validation)}</p> : null}</div> : 'Hover nodes to preview, click to lock focus.'}</div></div>
                 </div>
               </div>
             </div>
           </div>
+          </>
         )}
 
         {isOpsChrome && selectedNode && (
@@ -3073,7 +3111,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
           </div>
         )}
 
-        {/* Context menu for admin IAM actions */}
+        {/* Context menu for admin grid actions */}
         {contextMenu.visible && contextMenu.node && isAdmin && !isOpsChrome && (
           <div
             className="absolute z-50 rounded-lg border border-premium-border/55 bg-premium-card/98 shadow-2xl"

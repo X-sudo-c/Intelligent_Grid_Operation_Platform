@@ -226,6 +226,92 @@ def _add_meter(root: ET.Element, meter: dict[str, Any]) -> None:
         gio_el.text = str(installed)
 
 
+def _pt_term_rdf_id(equipment_mrid: str) -> str:
+    safe = equipment_mrid.replace("-", "")
+    return f"pt_term_{safe}"
+
+
+def _add_power_transformer(root: ET.Element, pt: dict[str, Any], bv_seen: set[str]) -> None:
+    mrid = pt["mrid"]
+    cn_mrid = pt.get("connectivity_node_mrid")
+    if cn_mrid:
+        tid = _pt_term_rdf_id(mrid)
+        term = _cim(root, "Terminal")
+        term.set(f"{{{NS_RDF}}}ID", tid)
+        _lit(term, "IdentifiedObject.mRID", f"{mrid}-T1")
+        _ref(term, "Terminal.ConnectivityNode", f"#{_rdf_id(cn_mrid)}")
+        _ref(term, "Terminal.ConductingEquipment", f"#{_rdf_id(mrid)}")
+        _lit(term, "ACDCTerminal.sequenceNumber", 1, dtype="http://www.w3.org/2001/XMLSchema#integer")
+
+    el = _cim(root, "PowerTransformer")
+    el.set(f"{{{NS_RDF}}}ID", _rdf_id(mrid))
+    _identified_object(el, mrid=mrid, name=pt.get("name"), lifecycle=None)
+    phases = pt.get("phases")
+    if phases:
+        _lit(el, "ConductingEquipment.phases", phases)
+    voltage = pt.get("nominal_voltage")
+    bv_ref = _ensure_base_voltage(root, bv_seen, voltage)
+    if bv_ref:
+        _ref(el, "ConductingEquipment.BaseVoltage", bv_ref)
+    if cn_mrid:
+        _ref(el, "Equipment.Terminals", f"#{_pt_term_rdf_id(mrid)}")
+    rated = pt.get("rated_power_kva")
+    if rated is not None:
+        gio_el = _gio(el, "PowerTransformer.ratedPowerKva")
+        gio_el.text = str(rated)
+    vector_group = pt.get("vector_group")
+    if vector_group:
+        gio_el = _gio(el, "PowerTransformer.vectorGroup")
+        gio_el.text = str(vector_group)
+    kind = pt.get("transformer_kind")
+    if kind:
+        gio_el = _gio(el, "PowerTransformer.transformerKind")
+        gio_el.text = str(kind)
+    if cn_mrid:
+        _add_position(root, cn_mrid, pt.get("location"))
+
+
+def _add_cim_asset(root: ET.Element, asset: dict[str, Any]) -> None:
+    mrid = asset["mrid"]
+    equipment_mrid = asset.get("equipment_mrid")
+    el = _cim(root, "Asset")
+    el.set(f"{{{NS_RDF}}}ID", _rdf_id(mrid))
+    _identified_object(el, mrid=mrid, name=asset.get("name"), lifecycle=None)
+    if equipment_mrid:
+        _ref(el, "Asset.PowerSystemResources", f"#{_rdf_id(equipment_mrid)}")
+    kind = asset.get("asset_kind")
+    if kind:
+        gio_el = _gio(el, "Asset.assetKind")
+        gio_el.text = str(kind)
+
+
+def _add_asset_info(root: ET.Element, info: dict[str, Any]) -> None:
+    mrid = info["mrid"]
+    info_type = info.get("@type") or "PowerTransformerInfo"
+    tag = "PowerTransformerInfo" if info_type == "PowerTransformerInfo" else "AssetInfo"
+    el = _cim(root, tag)
+    el.set(f"{{{NS_RDF}}}ID", _rdf_id(mrid))
+    _identified_object(el, mrid=mrid, name=info.get("name"), lifecycle=None)
+    asset_mrid = info.get("asset_mrid")
+    if asset_mrid:
+        _ref(el, "AssetInfo.Asset", f"#{_rdf_id(asset_mrid)}")
+    manufacturer = info.get("manufacturer")
+    if manufacturer:
+        _lit(el, "AssetInfo.manufacturer", manufacturer)
+    model = info.get("model_number")
+    if model:
+        _lit(el, "AssetInfo.modelNumber", model)
+    serial = info.get("serial_number")
+    if serial:
+        _lit(el, "AssetInfo.serialNumber", serial)
+    rated = info.get("rated_power_kva")
+    if rated is not None and tag == "PowerTransformerInfo":
+        _lit(el, "PowerTransformerInfo.ratedPower", rated, dtype="http://www.w3.org/2001/XMLSchema#float")
+    year = info.get("year_of_manufacture")
+    if year is not None:
+        _lit(el, "AssetInfo.manufacturedYear", year, dtype="http://www.w3.org/2001/XMLSchema#integer")
+
+
 def _add_ghana_grid_asset(root: ET.Element, asset: dict[str, Any]) -> None:
     mrid = asset["mrid"]
     el = _cim(root, "PowerSystemResource")
@@ -278,6 +364,15 @@ def build_cim_rdf_xml(payload: dict[str, Any]) -> str:
 
     for line in payload.get("ACLineSegment") or []:
         _add_ac_line_segment(root, line, bv_seen)
+
+    for pt in payload.get("PowerTransformer") or []:
+        _add_power_transformer(root, pt, bv_seen)
+
+    for asset in payload.get("Asset") or []:
+        _add_cim_asset(root, asset)
+
+    for info in payload.get("AssetInfo") or []:
+        _add_asset_info(root, info)
 
     for up in payload.get("UsagePoint") or []:
         _add_usage_point(root, up)

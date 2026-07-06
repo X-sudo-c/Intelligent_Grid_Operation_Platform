@@ -547,3 +547,146 @@ def trace_connection_path(
         result["ui_action"] = ui
 
     return result
+
+
+def _impact_payload_to_geojson(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, float] | None]:
+    """Build map GeoJSON + bbox from topology/impact-style payload (nodes with lat/lon)."""
+    node_list = payload.get("nodes") or []
+    edge_list = payload.get("edges") or []
+    start_mrid = str(payload.get("start_mrid") or "")
+
+    node_features: list[dict[str, Any]] = []
+    coord_by_mrid: dict[str, tuple[float, float]] = {}
+    for node in node_list:
+        if not isinstance(node, dict):
+            continue
+        mrid = str(node.get("mrid") or "")
+        lat = node.get("latitude")
+        lon = node.get("longitude")
+        if lat is None or lon is None or not mrid:
+            continue
+        lon_f, lat_f = float(lon), float(lat)
+        coord_by_mrid[mrid] = (lon_f, lat_f)
+        node_features.append(
+            {
+                "type": "Feature",
+                "properties": {
+                    "mrid": mrid,
+                    "name": node.get("name") or mrid,
+                    "validation": node.get("validation") or "",
+                    "focus": mrid == start_mrid,
+                    "traced": bool(node.get("traced")),
+                },
+                "geometry": {"type": "Point", "coordinates": [lon_f, lat_f]},
+            }
+        )
+
+    edge_features: list[dict[str, Any]] = []
+    for edge in edge_list:
+        if not isinstance(edge, dict):
+            continue
+        source = str(edge.get("source") or "")
+        target = str(edge.get("target") or "")
+        src = coord_by_mrid.get(source)
+        tgt = coord_by_mrid.get(target)
+        if not src or not tgt:
+            continue
+        edge_features.append(
+            {
+                "type": "Feature",
+                "properties": {
+                    "mrid": edge.get("mrid"),
+                    "voltage": edge.get("voltage") or "",
+                    "phases": edge.get("phases") or "",
+                },
+                "geometry": {"type": "LineString", "coordinates": [list(src), list(tgt)]},
+            }
+        )
+
+    nodes_geojson = {"type": "FeatureCollection", "features": node_features}
+    edges_geojson = {"type": "FeatureCollection", "features": edge_features}
+    bbox = _bbox_from_geojson(nodes_geojson) or _bbox_from_geojson(edges_geojson)
+    return nodes_geojson, edges_geojson, bbox
+
+
+def trace_downstream_path(
+    conn,
+    *,
+    mrid: str | None = None,
+    context: dict[str, Any] | None = None,
+    max_nodes: int = 5000,
+    show_on_map: bool = True,
+) -> dict[str, Any]:
+    """Directed downstream walk from a seed node (same logic as GET /topology/impact)."""
+    from agents.portal_context import resolve_node_mrid
+    from topology_analysis import downstream_impact_payload
+
+    ctx = dict(context or {})
+    if not mrid and ctx.get("last_mrid"):
+        mrid = str(ctx["last_mrid"])
+
+    resolved = resolve_node_mrid(conn, ctx, explicit_mrid=(mrid or "").strip() or None)
+    if not resolved.get("mrid"):
+        return {
+            "error": resolved.get("error")
+            or "Select a node on the map first, or name the asset to trace downstream from.",
+            "mrid": None,
+        }
+
+    node_mrid = str(resolved["mrid"])
+    try:
+        cap = max(1, min(int(max_nodes or 5000), 20000))
+        payload = downstream_impact_payload(node_mrid, max_nodes=cap)
+    except Exception as exc:
+        return {"error": str(exc), "mrid": node_mrid}
+
+    nodes = payload.get("nodes") or []
+    if not nodes:
+        return {
+            "error": f"No downstream network found from {node_mrid}",
+            "mrid": node_mrid,
+            "start_mrid": node_mrid,
+        }
+
+    seed_name = next(
+        (str(n.get("name") or node_mrid) for n in nodes if isinstance(n, dict) and str(n.get("mrid")) == node_mrid),
+        node_mrid,
+    )
+    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+    downstream_count = int(metrics.get("downstream_nodes") or max(0, len(nodes) - 1))
+    edge_count = int(metrics.get("edge_count") or len(payload.get("edges") or []))
+    customers = metrics.get("customers_affected")
+    meters = metrics.get("meters_downstream")
+
+    _, _, bbox = _impact_payload_to_geojson(payload)
+
+    result: dict[str, Any] = {
+        "start_mrid": node_mrid,
+        "name": seed_name,
+        "mrid": node_mrid,
+        "metrics": metrics,
+        "downstream_nodes": downstream_count,
+        "edge_count": edge_count,
+        "impact": payload,
+    }
+    if customers is not None:
+        result["customers_affected"] = customers
+    if meters is not None:
+        result["meters_downstream"] = meters
+    if bbox:
+        result["bbox"] = bbox
+
+    if show_on_map:
+        label = seed_name or node_mrid
+        ui: dict[str, Any] = {
+            "type": "show_downstream_impact",
+            "tab": "map",
+            "start_mrid": node_mrid,
+            "label": f"Downstream from {label}",
+            "impact": payload,
+        }
+        if bbox:
+            ui["bbox"] = bbox
+        result["ui_action"] = ui
+
+    return result

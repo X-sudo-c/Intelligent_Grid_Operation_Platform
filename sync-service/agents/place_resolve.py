@@ -26,6 +26,22 @@ _METRO_REGION_QUERIES: dict[str, str] = {
     "accra metro": "%Accra%",
 }
 
+# Spoken city names that also match an ECG *region* row — geocode the city center,
+# not the union of every district in that region (e.g. "Tema" ≠ all of Tema Region).
+_CITY_LOCALITY_NAMES = frozenset(
+    {
+        "tema",
+        "tamale",
+        "takoradi",
+        "cape coast",
+        "sunyani",
+        "ho",
+        "kumasi",
+        "ashaiman",
+        "koforidua",
+    }
+)
+
 
 def _district_row_to_result(
     row: tuple[Any, ...],
@@ -255,12 +271,24 @@ def _lookup_district_exact(conn, query: str) -> dict[str, Any] | None:
             row = cur.fetchone()
     if not row or row[0] is None:
         return None
-    matched = row[0] if row[0] and str(row[0]).lower() == q.lower() else (row[1] or q)
+    district_name, region_name = row[0], row[1]
+    matched = (
+        district_name
+        if district_name and str(district_name).lower() == q.lower()
+        else (region_name or q)
+    )
+    # Region-only match (e.g. "Tema" → whole Tema Region polygon).
+    source = (
+        "region_exact"
+        if region_name and str(region_name).lower() == q.lower()
+        and (not district_name or str(district_name).lower() != q.lower())
+        else "district_exact"
+    )
     return _district_row_to_result(
         row,
         matched_as=str(matched),
         confidence=CONFIDENCE_DISTRICT_EXACT,
-        source="district_exact",
+        source=source,
         query=query,
     )
 
@@ -337,7 +365,11 @@ def _pick_osm_hit(query: str, hits: list[dict[str, Any]]) -> dict[str, Any] | No
 def _resolve_osm(conn, query: str) -> dict[str, Any] | None:
     hits = geocode_map_places(query, limit=5)
     if not hits and "," not in query:
-        hits = geocode_map_places(f"{query}, Accra, Ghana", limit=5)
+        q_low = query.strip().lower()
+        if q_low in _CITY_LOCALITY_NAMES and q_low != "accra":
+            hits = geocode_map_places(f"{query}, Ghana", limit=5)
+        if not hits:
+            hits = geocode_map_places(f"{query}, Accra, Ghana", limit=5)
     if not hits:
         return None
     best = _pick_osm_hit(query, hits)
@@ -411,23 +443,36 @@ def _resolve_metro_region(conn, query: str) -> dict[str, Any] | None:
     )
 
 
-def resolve_place(
+def _enrich_with_h3(result: dict[str, Any]) -> dict[str, Any]:
+    """Attach primary H3 cell for spatial cache keys / coverage joins."""
+    if result.get("h3_primary"):
+        return result
+    center = result.get("center")
+    if not isinstance(center, dict):
+        return result
+    lat, lon = center.get("lat"), center.get("lon")
+    if lat is None or lon is None:
+        return result
+    try:
+        import h3_index as h3x
+
+        if h3x.H3_AVAILABLE:
+            out = dict(result)
+            out["h3_primary"] = h3x.latlng_to_cell(float(lat), float(lon), h3x.DEFAULT_RES)
+            out["h3_resolution"] = h3x.DEFAULT_RES
+            return out
+    except Exception:
+        pass
+    return result
+
+
+def _resolve_place_uncached(
     conn,
     query: str,
     *,
-    allow_geocode: bool | None = None,
+    geocode: bool,
 ) -> dict[str, Any]:
-    """
-    Resolve a locality or district name to ECG territory bounds.
-
-    Order: alias exact → district exact → district fuzzy → OSM geocode (optional).
-    """
-    q = (query or "").strip()
-    if not q:
-        raise ValueError("query is required")
-
-    geocode = PLACE_GEOCODE_ENABLED if allow_geocode is None else allow_geocode
-
+    q = query.strip()
     metro = _resolve_metro_region(conn, q)
     if metro:
         return metro
@@ -435,6 +480,12 @@ def resolve_place(
     hit = _lookup_alias_exact(conn, q)
     if hit:
         return hit
+
+    # City names that collide with ECG region labels — prefer OSM city center.
+    if geocode and q.strip().lower() in _CITY_LOCALITY_NAMES:
+        hit = _resolve_osm(conn, q)
+        if hit:
+            return hit
 
     hit = _lookup_district_exact(conn, q)
     if hit:
@@ -513,6 +564,44 @@ def resolve_place(
     raise ValueError(f"Place not found: {q}")
 
 
+def resolve_place(
+    conn,
+    query: str,
+    *,
+    allow_geocode: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Resolve a locality or district name to ECG territory bounds.
+
+    Order: alias exact → district exact → district fuzzy → OSM geocode (optional).
+    Results are Redis-cached; repeat voice/map lookups skip Nominatim and DB fuzzy work.
+    """
+    q = (query or "").strip()
+    if not q:
+        raise ValueError("query is required")
+
+    geocode = PLACE_GEOCODE_ENABLED if allow_geocode is None else allow_geocode
+
+    from redis_cache import (
+        PLACE_RESOLVE_CACHE_TTL_SEC,
+        get_json,
+        place_resolve_key,
+        set_json,
+    )
+
+    cache_key = place_resolve_key(q, geocode_enabled=geocode)
+    cached = get_json(cache_key)
+    if isinstance(cached, dict) and cached.get("query"):
+        out = _enrich_with_h3(dict(cached))
+        out["cached"] = True
+        return out
+
+    result = _enrich_with_h3(_resolve_place_uncached(conn, q, geocode=geocode))
+    store = {k: v for k, v in result.items() if k != "cached"}
+    set_json(cache_key, store, PLACE_RESOLVE_CACHE_TTL_SEC)
+    return result
+
+
 LOCALITY_FLY_ZOOM = 16.5
 DISTRICT_CLOSE_FLY_ZOOM = 15.0
 LOCALITY_PAN_ZOOM = 15.5
@@ -565,7 +654,8 @@ def place_viewport_ui_action(
 
     if bbox and all(bbox.get(k) is not None for k in ("west", "south", "east", "north")):
         w, h = _bbox_span_deg(bbox)
-        if source == "metro_region" or max(w, h) >= LARGE_TERRITORY_SPAN_DEG:
+        wide_territory = source in ("metro_region", "region_exact") or max(w, h) >= LARGE_TERRITORY_SPAN_DEG
+        if wide_territory and not (wants_close and source == "region_exact" and isinstance(center, dict)):
             action: dict[str, Any] = {
                 "type": "fit_bounds",
                 "tab": tab,
@@ -574,6 +664,17 @@ def place_viewport_ui_action(
             if wants_close:
                 action["max_zoom"] = METRO_FIT_MAX_ZOOM
             return action
+        # Zoom-into a region name without OSM — fly to polygon centroid, not fit_bounds.
+        if wide_territory and wants_close and source == "region_exact" and isinstance(center, dict):
+            lon = center.get("lon")
+            lat = center.get("lat")
+            if lon is not None and lat is not None:
+                return {
+                    "type": "fly_to",
+                    "tab": tab,
+                    "center": {"lon": float(lon), "lat": float(lat)},
+                    "zoom": LOCALITY_FLY_ZOOM,
+                }
 
     if center and isinstance(center, dict):
         lon = center.get("lon")

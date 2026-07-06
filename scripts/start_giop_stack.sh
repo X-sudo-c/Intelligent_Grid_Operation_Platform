@@ -7,6 +7,7 @@
 #   ./scripts/start_giop_stack.sh --backoffice # also start backoffice-ui :8080
 #   ./scripts/start_giop_stack.sh --portal     # also start GIOP React portal :5173
 #   ./scripts/start_giop_stack.sh --bootstrap  # run memgraph/bootstrap.py after Memgraph is up
+#   ./scripts/start_giop_stack.sh --follow-logs  # start then stream .giop/logs to this terminal
 #
 # Environment (optional):
 #   START_BACKOFFICE=1   same as --backoffice
@@ -40,6 +41,7 @@ DOCKER_CONTAINERS=(
 )
 
 CHECK_ONLY=0
+FOLLOW_LOGS=0
 WITH_BACKOFFICE="${START_BACKOFFICE:-0}"
 WITH_PORTAL="${START_PORTAL:-0}"
 WITH_BOOTSTRAP="${RUN_BOOTSTRAP:-0}"
@@ -47,6 +49,7 @@ WITH_BOOTSTRAP="${RUN_BOOTSTRAP:-0}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --check-only|-c) CHECK_ONLY=1 ;;
+    --follow-logs|-f) FOLLOW_LOGS=1 ;;
     --backoffice) WITH_BACKOFFICE=1 ;;
     --portal) WITH_PORTAL=1 ;;
     --bootstrap) WITH_BOOTSTRAP=1 ;;
@@ -572,6 +575,12 @@ main() {
         exit 1
       fi
     done
+  fi
+
+  if [[ "$FOLLOW_LOGS" == "1" && "$CHECK_ONLY" != "1" ]]; then
+    # shellcheck disable=SC1091
+    source "$ROOT/scripts/lib_giop_logs.sh"
+    giop_tail_stack_logs
   fi
 }
 

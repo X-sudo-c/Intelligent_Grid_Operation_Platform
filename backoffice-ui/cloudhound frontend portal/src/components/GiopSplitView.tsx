@@ -1,13 +1,17 @@
-import { useCallback, useMemo } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { GiopMapView } from './GiopMapView';
 import { GiopTopologyTab } from './GiopTopologyTab';
+import { GiopMapSearchBar } from './GiopMapSearchBar';
+import type { GiopMapSearchResult } from '../api/giop-api';
 import { SPLIT_VIEW_GRAPH_QUERY_OPTIONS, GIOP_GRAPH_QUERY_OPTIONS, type GiopGraphQueryKey } from '../lib/giopGraphTypes';
 import type { PortalGraphResponse } from '../lib/giopGraphTypes';
 import type { GiopFieldTechnician, GiopStagingAsset, GiopWorkOrder, GiopTopologyPayload } from '../api/giop-api';
-import { useGiopGraphChunk } from '../hooks/useGiopGraphChunk';
-import { chunkToPortalGraph } from '../lib/giopGraphAdapter';
 import type { MapBbox } from '../hooks/useGiopGraphChunk';
 import type { FeederHighlightState } from '../lib/giopFeederHighlight';
+import type { GiopMapSearchBridge } from '../lib/giopMapSearchBridge';
+import { buildGraphNodeSearchCatalog, mergeSearchCatalogs } from '../lib/giopMapLocalSearch';
+
+type SearchCatalogSnapshot = Pick<GiopMapSearchBridge, 'placeCatalog' | 'opsCatalog' | 'placesReady'>;
 
 export interface GiopSplitViewProps {
   graph: PortalGraphResponse | null;
@@ -46,9 +50,7 @@ export interface GiopSplitViewProps {
   pulseFocus?: boolean;
   pulseFocusTentative?: boolean;
   mapChrome?: 'full' | 'operations';
-  /** Ops desk: topology highlight is independent of map/table focus. */
   topologyFocusMrid?: string | null;
-  /** Ops desk "View on map": imperative pan request forwarded to the embedded map. */
   flyRequest?: { id: number; coordinates: [number, number] | null } | null;
   topologyGraphQueryOptions?: typeof GIOP_GRAPH_QUERY_OPTIONS;
 }
@@ -82,10 +84,6 @@ export function GiopSplitView({
   onMapViewportChange,
   onTerritorySelect,
   mapRefreshToken = 0,
-  startMrid,
-  fieldTechnicians = [],
-  onTechnicianClick,
-  fieldCrews,
   workOrders = [],
   impactOverlay = null,
   feederHighlight = null,
@@ -98,74 +96,157 @@ export function GiopSplitView({
   topologyGraphQueryOptions,
 }: GiopSplitViewProps) {
   const isOpsDesk = mapChrome === 'operations';
+  const isCombinedView = !isOpsDesk;
   const ratio = readSplitRatio();
-  const { chunk, loading: chunkLoading, error: chunkError, loadBbox } = useGiopGraphChunk(startMrid);
+  const searchBridgeRef = useRef<GiopMapSearchBridge | null>(null);
+  const catalogSnapshotRef = useRef<SearchCatalogSnapshot | null>(null);
+  const [catalogSnapshot, setCatalogSnapshot] = useState<SearchCatalogSnapshot | null>(null);
+  const onSearchBridgeCatalog = useCallback((snapshot: SearchCatalogSnapshot) => {
+    const prev = catalogSnapshotRef.current;
+    if (
+      prev &&
+      prev.placeCatalog === snapshot.placeCatalog &&
+      prev.opsCatalog === snapshot.opsCatalog &&
+      prev.placesReady === snapshot.placesReady
+    ) {
+      return;
+    }
+    catalogSnapshotRef.current = snapshot;
+    setCatalogSnapshot(snapshot);
+  }, []);
 
-  const viewportGraph = useMemo(
-    () => (chunk ? chunkToPortalGraph(chunk, stagingAssets) : null),
-    [chunk, stagingAssets],
+  const queryOptions = topologyGraphQueryOptions ?? SPLIT_VIEW_GRAPH_QUERY_OPTIONS;
+
+  const unifiedOpsCatalog = useMemo(() => {
+    if (!catalogSnapshot) return [];
+    const ops = catalogSnapshot.opsCatalog.filter((item) => item.kind !== 'crew');
+    const graphNodes = buildGraphNodeSearchCatalog(graph);
+    return mergeSearchCatalogs(ops, graphNodes);
+  }, [catalogSnapshot, graph]);
+
+  const handleUnifiedSearchSelect = useCallback(
+    (result: GiopMapSearchResult) => {
+      searchBridgeRef.current?.onSelect(result);
+      const inGraph =
+        result.subtitle === 'Network node' ||
+        Boolean(graph?.nodes.some((node) => node.id === result.id));
+      if (inGraph) {
+        onGraphNodeSelect?.(result.id, result.title);
+      }
+    },
+    [graph?.nodes, onGraphNodeSelect],
   );
-
-  const displayGraph = graphQuery === 'viewport_subgraph' ? viewportGraph : graph;
-  const displayLoading = graphQuery === 'viewport_subgraph' ? chunkLoading && !viewportGraph : loading;
-  const displayError =
-    graphQuery === 'viewport_subgraph' ? chunkError || (viewportGraph ? null : error) : error;
 
   const handleViewportChange = useCallback(
     (bbox: MapBbox, zoom: number, center: { lon: number; lat: number }) => {
-      void loadBbox(bbox, zoom);
       onMapViewportChange?.(bbox, zoom, center);
     },
-    [loadBbox, onMapViewportChange],
+    [onMapViewportChange],
   );
 
+  const displayLoading = loading && !graph;
+
   return (
-    <div className="flex h-full min-h-0">
-      <div className="relative min-h-0 h-full border-r border-slate-800" style={{ width: `${ratio}%` }}>
-        <GiopMapView
-          isLightMode={isLightMode}
-          focusMrid={focusMrid}
-          focusCoordinates={focusCoordinates}
-          focusLabel={focusLabel}
-          pulseFocus={pulseFocus}
-          pulseFocusTentative={pulseFocusTentative}
-          mapChrome={mapChrome}
-          flyRequest={flyRequest}
-          stagingAssets={stagingAssets}
-          fieldTechnicians={fieldTechnicians}
-          fieldCrews={fieldCrews}
-          onNodeClick={onMapNodeClick}
-          onTechnicianClick={onTechnicianClick}
-          onViewportChange={handleViewportChange}
-          onTerritorySelect={onTerritorySelect}
-          refreshToken={mapRefreshToken}
-          startMrid={startMrid}
-          streamGraphChunk={false}
-          graphChunk={chunk}
-          chunkLoadingExternal={chunkLoading}
-          chunkErrorExternal={chunkError}
-          workOrders={workOrders}
-          impactOverlay={impactOverlay}
-          feederHighlight={feederHighlight}
-        />
+    <div className={`giop-split-view ${isLightMode ? 'giop-split-view--light' : ''}`}>
+      <div className="giop-split-panes">
+        <div
+          className={`giop-split-pane giop-split-pane--map relative ${isCombinedView ? '' : 'border-r border-slate-800'}`}
+          style={{ width: `${ratio}%` }}
+        >
+          <GiopMapView
+            isLightMode={isLightMode}
+            focusMrid={focusMrid}
+            focusCoordinates={focusCoordinates}
+            focusLabel={focusLabel}
+            pulseFocus={pulseFocus}
+            pulseFocusTentative={pulseFocusTentative}
+            mapChrome={isCombinedView ? 'split' : mapChrome}
+            flyRequest={flyRequest}
+            stagingAssets={stagingAssets}
+            onNodeClick={onMapNodeClick}
+            onViewportChange={handleViewportChange}
+            onTerritorySelect={onTerritorySelect}
+            refreshToken={mapRefreshToken}
+            workOrders={workOrders}
+            impactOverlay={impactOverlay}
+            feederHighlight={feederHighlight}
+            showSearchBar={!isCombinedView}
+            searchBridgeRef={isCombinedView ? searchBridgeRef : undefined}
+            onSearchBridgeCatalog={isCombinedView ? onSearchBridgeCatalog : undefined}
+          />
+        </div>
+        <div className="giop-split-pane flex-1 min-w-0">
+          <GiopTopologyTab
+            graph={graph}
+            loading={displayLoading}
+            revalidating={revalidating}
+            error={error}
+            graphQuery={graphQuery}
+            onQueryChange={onQueryChange}
+            isLightMode={isLightMode}
+            focusMrid={isOpsDesk ? topologyFocusMrid : focusMrid}
+            onFocusHandled={onFocusHandled}
+            onNodeSelect={onGraphNodeSelect}
+            graphQueryOptions={queryOptions}
+            compact
+            layoutMode={isCombinedView ? 'split' : 'default'}
+            graphChrome={isOpsDesk ? 'operations' : 'full'}
+          />
+        </div>
       </div>
-      <div className="min-h-0 flex-1">
-        <GiopTopologyTab
-          graph={displayGraph}
-          loading={displayLoading}
-          revalidating={revalidating}
-          error={displayError}
-          graphQuery={graphQuery}
-          onQueryChange={onQueryChange}
-          isLightMode={isLightMode}
-          focusMrid={isOpsDesk ? topologyFocusMrid : focusMrid}
-          onFocusHandled={onFocusHandled}
-          onNodeSelect={onGraphNodeSelect}
-          graphQueryOptions={topologyGraphQueryOptions ?? SPLIT_VIEW_GRAPH_QUERY_OPTIONS}
-          compact
-          graphChrome={isOpsDesk ? 'operations' : 'full'}
-        />
-      </div>
+
+      {isCombinedView && (
+        <div className="giop-split-chrome">
+          <div className="giop-split-chrome__modes">
+            {queryOptions.map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                onClick={() => onQueryChange(option.key)}
+                title={
+                  option.key === graphQuery && graph?.metrics?.note
+                    ? graph.metrics.note
+                    : option.label
+                }
+                className={`inline-flex h-7 items-center rounded-full border px-2.5 text-[11px] font-medium transition ${
+                  graphQuery === option.key
+                    ? 'border-premium-accent/70 bg-premium-accent/20 text-premium-text'
+                    : isLightMode
+                      ? 'border-transparent bg-white/90 text-slate-600 hover:bg-white'
+                      : 'border-transparent bg-premium-card/80 text-premium-muted hover:bg-premium-hover hover:text-premium-text'
+                }`}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="giop-split-chrome__search">
+            {catalogSnapshot ? (
+              <GiopMapSearchBar
+                variant="split"
+                isLightMode={isLightMode}
+                placeCatalog={catalogSnapshot.placeCatalog}
+                opsCatalog={unifiedOpsCatalog}
+                placesReady={catalogSnapshot.placesReady}
+                onPreview={(result) => searchBridgeRef.current?.onPreview(result)}
+                onSelect={handleUnifiedSearchSelect}
+                placeholder="Search map & network"
+                hideCrewFilter
+              />
+            ) : null}
+          </div>
+        </div>
+      )}
+
+      {isCombinedView && error && !graph && (
+        <div
+          className={`giop-split-float giop-split-float--meta ${isLightMode ? 'giop-split-float--meta-light' : ''}`}
+          style={{ top: 'auto', bottom: 12, right: 12 }}
+        >
+          {error}
+        </div>
+      )}
     </div>
   );
 }

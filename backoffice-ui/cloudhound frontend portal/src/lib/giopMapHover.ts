@@ -13,8 +13,9 @@ const LAYER_KIND: Record<string, GiopMapHoverKind> = {
   nodes: 'pole',
   'nodes-transformers-dt': 'transformer-dt',
   'nodes-transformers-pt': 'transformer-pt',
+  'master-transformers-dt': 'transformer-dt',
+  'master-transformers-pt': 'transformer-pt',
   'staging-points': 'staging',
-  'graph-chunk-nodes-layer': 'chunk',
   'field-technician-points': 'technician',
   'work-order-pins': 'work-order',
 };

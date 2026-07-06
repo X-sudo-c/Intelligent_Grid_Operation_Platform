@@ -6,13 +6,20 @@ from typing import Any
 
 import requests
 
+from redis_cache import (
+    PLACE_GEOCODE_CACHE_TTL_SEC,
+    geocode_places_key,
+    get_json,
+    set_json,
+)
+
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 USER_AGENT = "GIOP-MapSearch/1.0 (ECG grid operations; contact: ops@localhost)"
 # Ghana approximate viewbox: left, top, right, bottom (lon, lat)
 GHANA_VIEWBOX = "-3.35,11.35,1.35,4.5"
 
 
-def geocode_map_places(query: str, *, limit: int = 6) -> list[dict[str, Any]]:
+def _geocode_map_places_uncached(query: str, *, limit: int = 6) -> list[dict[str, Any]]:
     q = (query or "").strip()
     if len(q) < 2:
         return []
@@ -89,3 +96,21 @@ def geocode_map_places(query: str, *, limit: int = 6) -> list[dict[str, Any]]:
         )
 
     return out
+
+
+def geocode_map_places(query: str, *, limit: int = 6) -> list[dict[str, Any]]:
+    """Geocode with optional Redis cache (repeat voice/map place lookups)."""
+    q = (query or "").strip()
+    if len(q) < 2:
+        return []
+
+    limit = max(1, min(limit, 10))
+    cache_key = geocode_places_key(q, limit)
+    cached = get_json(cache_key)
+    if isinstance(cached, list):
+        return cached
+
+    results = _geocode_map_places_uncached(q, limit=limit)
+    if results:
+        set_json(cache_key, results, PLACE_GEOCODE_CACHE_TTL_SEC)
+    return results

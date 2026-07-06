@@ -179,10 +179,51 @@ def downstream_impact_payload(
     start_mrid: str,
     *,
     max_nodes: int | None = None,
+    graph_driver=None,
 ) -> dict[str, Any]:
     cap = max(1, min(max_nodes or TOPOLOGY_IMPACT_DEFAULT_MAX, 20000))
+    driver = graph_driver
+    memgraph_ready = False
+    downstream_impact_memgraph = None
+    try:
+        from memgraph_topology import (
+            downstream_impact_memgraph as _impact_mg,
+            get_trace_driver,
+            memgraph_trace_ready,
+        )
+
+        downstream_impact_memgraph = _impact_mg
+        if driver is None:
+            driver = get_trace_driver()
+        memgraph_ready = bool(driver and memgraph_trace_ready(driver))
+    except Exception:
+        memgraph_ready = False
+
     conn = _pg_connect()
     try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM public.connectivity_nodes")
+            pg_nodes = int(cur.fetchone()[0])
+            cur.execute("SELECT COUNT(*) FROM public.ac_line_segments")
+            pg_edges = int(cur.fetchone()[0])
+        graph_totals = {"nodes": pg_nodes, "edges": pg_edges}
+
+        if memgraph_ready and driver is not None and downstream_impact_memgraph is not None:
+            try:
+                return downstream_impact_memgraph(
+                    driver,
+                    conn,
+                    start_mrid,
+                    graph_totals=graph_totals,
+                    max_nodes=cap,
+                )
+            except Exception as exc:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "Memgraph impact failed, falling back to Postgres: %s", exc
+                )
+
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -240,45 +281,52 @@ def downstream_impact_payload(
                 (start_mrid, cap * 2),
             )
             edge_rows = cur.fetchall()
+
+        node_ids = {row[0] for row in node_rows}
+        nodes = [
+            {
+                "mrid": row[0],
+                "name": row[1] or row[0],
+                "validation": row[2],
+                "latitude": float(row[3]) if row[3] is not None else None,
+                "longitude": float(row[4]) if row[4] is not None else None,
+                "connected": True,
+                "traced": row[0] != start_mrid,
+                "type": ["ConnectivityNode"],
+            }
+            for row in node_rows
+        ]
+        edges = [
+            {
+                "mrid": row[0],
+                "source": row[1],
+                "target": row[2],
+                "phases": row[3],
+                "voltage": row[4],
+            }
+            for row in edge_rows
+            if row[1] in node_ids and row[2] in node_ids
+        ]
+
+        downstream_count = max(0, len(nodes) - (1 if start_mrid in node_ids else 0))
+        downstream_mrids = {n["mrid"] for n in nodes}
+        from memgraph_topology import count_meter_customer_impact
+
+        impact_counts = count_meter_customer_impact(conn, downstream_mrids)
+        return {
+            "start_mrid": start_mrid,
+            "nodes": nodes,
+            "edges": edges,
+            "metrics": {
+                "total_nodes": len(nodes),
+                "downstream_nodes": downstream_count,
+                "edge_count": len(edges),
+                "truncated": len(nodes) >= cap,
+                "max_nodes": cap,
+                **impact_counts,
+            },
+            "graph_totals": graph_totals,
+            "backend": "postgres",
+        }
     finally:
         conn.close()
-
-    node_ids = {row[0] for row in node_rows}
-    nodes = [
-        {
-            "mrid": row[0],
-            "name": row[1] or row[0],
-            "validation": row[2],
-            "latitude": float(row[3]) if row[3] is not None else None,
-            "longitude": float(row[4]) if row[4] is not None else None,
-            "connected": True,
-            "traced": row[0] != start_mrid,
-            "type": ["ConnectivityNode"],
-        }
-        for row in node_rows
-    ]
-    edges = [
-        {
-            "mrid": row[0],
-            "source": row[1],
-            "target": row[2],
-            "phases": row[3],
-            "voltage": row[4],
-        }
-        for row in edge_rows
-        if row[1] in node_ids and row[2] in node_ids
-    ]
-
-    downstream_count = max(0, len(nodes) - (1 if start_mrid in node_ids else 0))
-    return {
-        "start_mrid": start_mrid,
-        "nodes": nodes,
-        "edges": edges,
-        "metrics": {
-            "total_nodes": len(nodes),
-            "downstream_nodes": downstream_count,
-            "edge_count": len(edges),
-            "truncated": len(nodes) >= cap,
-            "max_nodes": cap,
-        },
-    }

@@ -681,12 +681,23 @@ def start_stack(portal: bool = False, backoffice: bool = False, bootstrap: bool 
         cmd.append("--backoffice")
     if bootstrap:
         cmd.append("--bootstrap")
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / "stack-start.log"
+    header = f"--- stack start {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {' '.join(cmd)} ---"
     proc = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=600, check=False)
+    with log_path.open("a", encoding="utf-8") as logf:
+        logf.write(f"\n{header}\n")
+        if proc.stdout:
+            logf.write(proc.stdout)
+        if proc.stderr:
+            logf.write(proc.stderr)
+        logf.write(f"--- exit {proc.returncode} ---\n")
     return {
         "action": "stack_start",
         "exit_code": proc.returncode,
         "stdout": proc.stdout[-8000:] if proc.stdout else "",
         "stderr": proc.stderr[-4000:] if proc.stderr else "",
+        "log_name": "stack-start.log",
         "status": stack_status(),
     }
 

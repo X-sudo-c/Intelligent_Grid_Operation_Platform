@@ -9,7 +9,7 @@ import {
 } from 'react';
 import { getAssetLocation, type GiopTopologyPayload } from '../api/giop-api';
 import { normalizeMapCoordinates, coordsNearlyEqual } from '../lib/giopMapCoordinates';
-import { DUPLICATE_CLUSTER_ZOOM } from '../lib/giopMapLayers';
+import { DUPLICATE_CLUSTER_ZOOM, readNetworkGeometryMode, writeNetworkGeometryMode, type NetworkGeometryMode } from '../lib/giopMapLayers';
 import { giopLog } from '../lib/giopDebugLog';
 import { writeGiopRouteToLocation, type GiopPortalTab } from '../lib/giopPortalRouting';
 import type { GiopMapFlyRequest } from '../lib/giopMapFlyRequest';
@@ -18,6 +18,7 @@ import type { TerritoryHighlightState } from '../lib/giopTerritoryHighlight';
 import type { GiopRepairPreviewLayers } from '../lib/giopRepairPreviewGeojson';
 import type { DuplicateClusterOverlay } from '../lib/giopDuplicateFan';
 import type { FeederHighlightState } from '../lib/giopFeederHighlight';
+import type { ImportSegmentHighlightState } from '../lib/giopImportSegmentHighlight';
 import { useGiopSelection } from './GiopSelectionContext';
 
 export type { TerritoryHighlightState };
@@ -46,6 +47,7 @@ export interface MapViewportCommand {
   center?: { lon: number; lat: number };
   zoom?: number;
   max_zoom?: number;
+  duration?: number;
 }
 
 interface GiopMapOverlayContextValue {
@@ -64,6 +66,10 @@ interface GiopMapOverlayContextValue {
   mapViewportCommand: MapViewportCommand | null;
   territoryHighlight: TerritoryHighlightState | null;
   feederHighlight: FeederHighlightState | null;
+  importSegmentHighlight: ImportSegmentHighlightState | null;
+  /** GIS import vs master line geometry (shared across Map tab and side preview). */
+  networkGeometryMode: NetworkGeometryMode;
+  setNetworkGeometryMode: (mode: NetworkGeometryMode) => void;
   /** MRID highlighted on the full Map tab after Full map / navigateTab (cleared on next map click). */
   mapIdentifyFocusMrid: string | null;
   clearFocusCamera: () => void;
@@ -72,6 +78,8 @@ interface GiopMapOverlayContextValue {
   clearTerritoryHighlight: () => void;
   setFeederHighlight: (highlight: FeederHighlightState | null) => void;
   clearFeederHighlight: () => void;
+  setImportSegmentHighlight: (highlight: ImportSegmentHighlightState | null) => void;
+  clearImportSegmentHighlight: () => void;
   clearMapIdentifyFocus: () => void;
   closeSideMap: () => void;
   queueMapViewportCommand: (cmd: Omit<MapViewportCommand, 'id'>) => void;
@@ -125,6 +133,11 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
     null,
   );
   const [feederHighlight, setFeederHighlightState] = useState<FeederHighlightState | null>(null);
+  const [importSegmentHighlight, setImportSegmentHighlightState] =
+    useState<ImportSegmentHighlightState | null>(null);
+  const [networkGeometryMode, setNetworkGeometryModeState] = useState<NetworkGeometryMode>(() =>
+    readNetworkGeometryMode(),
+  );
   const [mapIdentifyFocusMrid, setMapIdentifyFocusMrid] = useState<string | null>(null);
   const focusCameraRequestIdRef = useRef(0);
   const mapViewportCommandIdRef = useRef(0);
@@ -220,6 +233,19 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
 
   const clearFeederHighlight = useCallback(() => {
     setFeederHighlightState(null);
+  }, []);
+
+  const setImportSegmentHighlight = useCallback((highlight: ImportSegmentHighlightState | null) => {
+    setImportSegmentHighlightState(highlight);
+  }, []);
+
+  const setNetworkGeometryMode = useCallback((mode: NetworkGeometryMode) => {
+    writeNetworkGeometryMode(mode);
+    setNetworkGeometryModeState(mode);
+  }, []);
+
+  const clearImportSegmentHighlight = useCallback(() => {
+    setImportSegmentHighlightState(null);
   }, []);
 
   const clearMapIdentifyFocus = useCallback(() => {
@@ -388,6 +414,9 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
       mapViewportCommand,
       territoryHighlight,
       feederHighlight,
+      importSegmentHighlight,
+      networkGeometryMode,
+      setNetworkGeometryMode,
       mapIdentifyFocusMrid,
       clearFocusCamera,
       clearMapViewportCommand,
@@ -395,6 +424,8 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
       clearTerritoryHighlight,
       setFeederHighlight,
       clearFeederHighlight,
+      setImportSegmentHighlight,
+      clearImportSegmentHighlight,
       clearMapIdentifyFocus,
       closeSideMap,
       queueMapViewportCommand,
@@ -420,6 +451,9 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
       mapViewportCommand,
       territoryHighlight,
       feederHighlight,
+      importSegmentHighlight,
+      networkGeometryMode,
+      setNetworkGeometryMode,
       mapIdentifyFocusMrid,
       clearFocusCamera,
       clearMapViewportCommand,
@@ -427,6 +461,8 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
       clearTerritoryHighlight,
       setFeederHighlight,
       clearFeederHighlight,
+      setImportSegmentHighlight,
+      clearImportSegmentHighlight,
       clearMapIdentifyFocus,
       closeSideMap,
       queueMapViewportCommand,

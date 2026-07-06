@@ -27,6 +27,7 @@ import { GiopSelectionProvider, useGiopSelection } from '../context/GiopSelectio
 import { GiopMapOverlayProvider, useGiopMapOverlay } from '../context/GiopMapOverlayContext';
 import { GiopVoiceModeProvider } from '../context/GiopVoiceModeContext';
 import { useGiopTopology } from '../hooks/useGiopTopology';
+import { useGiopTopologySeed } from '../hooks/useGiopTopologySeed';
 import { useGiopRealtime } from '../hooks/useGiopRealtime';
 import { useGiopFieldTechnicians } from '../hooks/useGiopFieldTechnicians';
 import { DEFAULT_START_MRID, getAssetLocation, getSpatialTerritoryGeojson, getStagingAssets, listWorkOrders, type GiopStagingAsset, type GiopWorkOrder } from '../api/giop-api';
@@ -38,14 +39,17 @@ import {
 } from '../lib/giopPortalRouting';
 import type { GiopGraphQueryKey } from '../lib/giopGraphTypes';
 import { GIOP_GRAPH_QUERY_OPTIONS } from '../lib/giopGraphTypes';
+import type { PortalGraphResponse } from '../lib/giopGraphTypes';
 import { normalizeMapCoordinates, extractStagingGeomCoordinates } from '../lib/giopMapCoordinates';
 import type { GiopMapFlyRequest } from '../lib/giopMapFlyRequest';
 import { resolveTopologyStartMrid, isStagingOnlySeed } from '../lib/resolveTopologyStartMrid';
+import { isDemoIslandSeed } from '../lib/giopTopologySeed';
 import { giopLog } from '../lib/giopDebugLog';
 import { useGiopNavBadges } from '../hooks/useGiopNavBadges';
 import type { PortalNavGroup } from './EnhancedPortalShell';
 import { EnhancedCopilotPanel } from './EnhancedCopilotPanel';
 import { GiopRealtimeCopilot } from './GiopRealtimeCopilot';
+import { prefetchRealtimeSessionToken } from '../lib/giopRealtimeTokenCache';
 
 const REALTIME_VOICE_ENABLED = import.meta.env.VITE_GIOP_REALTIME === '1';
 import { isGiopPortalTab } from './GiopCopilotPanel';
@@ -54,12 +58,29 @@ import type {
   GiopCopilotUiAction,
   MapViewportContext,
 } from '../lib/giopCopilotTypes';
-import { buildCopilotContext, defaultMapViewport } from '../lib/giopMapViewport';
+import { buildCopilotContext, bboxFromCenterZoom, defaultMapViewport } from '../lib/giopMapViewport';
 import type { MapBbox } from '../hooks/useGiopGraphChunk';
 
 const OPS_TOPOLOGY_GRAPH_QUERY_OPTIONS = GIOP_GRAPH_QUERY_OPTIONS.filter(
   (o) => o.key === 'traced_subgraph' || o.key === 'network_topology',
 );
+
+function isSplitViewGraphQuery(key: GiopGraphQueryKey): boolean {
+  return key === 'viewport_subgraph' || key === 'traced_subgraph';
+}
+
+/** Spinner only while the active mode has no graph yet. Viewport skips seedReady gate. */
+function topologyPanelLoading(
+  queryKey: GiopGraphQueryKey,
+  loading: boolean,
+  graph: PortalGraphResponse | null,
+  seedReady: boolean,
+): boolean {
+  if (graph) return false;
+  if (loading) return true;
+  if (queryKey === 'viewport_subgraph') return false;
+  return !seedReady;
+}
 
 const NAV_GROUPS: PortalNavGroup[] = [
   {
@@ -204,9 +225,16 @@ function GiopPortalInner() {
   /** Guards against an older async territory-geojson fetch overwriting a newer one. */
   const territoryHighlightSeqRef = useRef(0);
 
+  useEffect(() => {
+    if (!REALTIME_VOICE_ENABLED) return;
+    void prefetchRealtimeSessionToken();
+  }, []);
+
   const { selection, setSelection } = useGiopSelection();
   const {
     impactOverlay,
+    setImpactOverlay,
+    clearImpactOverlay,
     feederHighlight,
     sideMap,
     closeSideMap,
@@ -230,6 +258,8 @@ function GiopPortalInner() {
   const routeStartMrid = route.startMrid || DEFAULT_START_MRID;
   const startMrid = routeStartMrid;
 
+  const { topologySeed, seedCenter, seedReady } = useGiopTopologySeed(route.startMrid);
+
   // Operations topology panel uses master Memgraph trace; map uses tiles + staging overlay.
   const needsTrace =
     route.tab === 'topology' || route.tab === 'combined' || route.tab === 'operations';
@@ -248,6 +278,10 @@ function GiopPortalInner() {
       setBoundaryFeederId(null);
       return;
     }
+    if (isStagingOnlySeed(mrid, stagingSeedRows)) {
+      setBoundaryFeederId(null);
+      return;
+    }
     let cancelled = false;
     void getAssetLocation(mrid)
       .then((loc) => {
@@ -261,12 +295,51 @@ function GiopPortalInner() {
     return () => {
       cancelled = true;
     };
-  }, [focusMridForCopilot]);
+  }, [focusMridForCopilot, stagingSeedRows]);
 
   const topologyStartMrid = useMemo(
-    () => resolveTopologyStartMrid(route.tab, route.startMrid, stagingSeedRows),
-    [route.tab, route.startMrid, stagingSeedRows],
+    () => resolveTopologyStartMrid(route.tab, route.startMrid, topologySeed, stagingSeedRows),
+    [route.tab, route.startMrid, topologySeed, stagingSeedRows],
   );
+
+  useEffect(() => {
+    if (!seedReady) return;
+    if (!topologySeed || isDemoIslandSeed(topologySeed)) return;
+    if (isDemoIslandSeed(route.startMrid) || !route.startMrid) {
+      writeGiopRouteToLocation(
+        {
+          tab: route.tab,
+          startMrid: topologySeed,
+          graphQuery: route.graphQuery,
+          focusMrid: route.focusMrid,
+        },
+        true,
+      );
+    }
+  }, [seedReady, topologySeed, route.tab, route.startMrid, route.graphQuery, route.focusMrid]);
+
+  useEffect(() => {
+    if (!seedReady || !seedCenter) return;
+    const vp: MapViewportContext = {
+      center: { lon: seedCenter.lon, lat: seedCenter.lat },
+      zoom: 14,
+      bbox: bboxFromCenterZoom(seedCenter.lon, seedCenter.lat, 14),
+    };
+    mapViewportRef.current = vp;
+    setMapViewport(vp);
+  }, [seedReady, seedCenter]);
+
+  /** Stable reference for topology hook — avoids render loops from inline `{ bbox, zoom }`. */
+  const topologyMapViewport = useMemo(() => {
+    if (!mapViewport) return null;
+    return { bbox: mapViewport.bbox, zoom: mapViewport.zoom };
+  }, [
+    mapViewport?.bbox.west,
+    mapViewport?.bbox.south,
+    mapViewport?.bbox.east,
+    mapViewport?.bbox.north,
+    mapViewport?.zoom,
+  ]);
 
   const {
     graph,
@@ -279,13 +352,14 @@ function GiopPortalInner() {
     refreshStaging,
     applyQuery,
   } = useGiopTopology(topologyStartMrid, {
-    traceActive: needsTrace,
+    traceActive: needsTrace && seedReady,
     initialGraphQuery:
       route.tab === 'combined'
         ? 'viewport_subgraph'
         : route.tab === 'operations'
           ? 'traced_subgraph'
           : 'traced_subgraph',
+    mapViewport: topologyMapViewport,
   });
 
   useEffect(() => {
@@ -307,13 +381,22 @@ function GiopPortalInner() {
   }, [route.tab, opsRefreshToken]);
 
   useEffect(() => {
-    if (route.tab === 'combined' && graphQuery !== 'viewport_subgraph' && graphQuery !== 'traced_subgraph') {
+    if (route.tab === 'combined' && !isSplitViewGraphQuery(graphQuery)) {
       applyQuery('viewport_subgraph');
+      writeGiopRouteToLocation(
+        {
+          tab: 'combined',
+          startMrid: topologyStartMrid,
+          graphQuery: 'viewport_subgraph',
+          focusMrid: route.focusMrid,
+        },
+        true,
+      );
     }
     if (route.tab === 'operations' && graphQuery !== 'traced_subgraph' && graphQuery !== 'network_topology') {
       applyQuery('traced_subgraph');
     }
-  }, [route.tab, graphQuery, applyQuery]);
+  }, [route.tab, graphQuery, applyQuery, topologyStartMrid, route.focusMrid]);
 
   useEffect(() => {
     if (route.tab !== 'operations' || !route.startMrid) return;
@@ -335,10 +418,11 @@ function GiopPortalInner() {
   }, [route.tab]);
 
   useEffect(() => {
-    if (route.graphQuery && route.graphQuery !== graphQuery) {
-      if (route.tab === 'operations') return;
-      applyQuery(route.graphQuery as GiopGraphQueryKey);
-    }
+    if (!route.graphQuery || route.graphQuery === graphQuery) return;
+    if (route.tab === 'operations') return;
+    const next = route.graphQuery as GiopGraphQueryKey;
+    if (route.tab === 'combined' && !isSplitViewGraphQuery(next)) return;
+    applyQuery(next);
   }, [route.graphQuery, graphQuery, applyQuery, route.tab]);
 
   useEffect(() => {
@@ -509,6 +593,7 @@ function GiopPortalInner() {
           type: 'fly_to',
           center: action.center,
           zoom: action.zoom,
+          duration: action.duration,
         });
         refreshMap();
         return;
@@ -568,6 +653,7 @@ function GiopPortalInner() {
       if (action.type === 'highlight_feeder') {
         ensureMapVisible(action.tab ? String(action.tab) : 'map');
         clearTerritoryHighlight();
+        clearImpactOverlay();
         setFeederHighlight({
           feederId: action.feeder_id,
           label: action.label ?? action.feeder_id,
@@ -576,6 +662,21 @@ function GiopPortalInner() {
         });
         if (action.bbox) {
           queueMapViewportCommand({ type: 'fit_bounds', bbox: action.bbox });
+        }
+        refreshMap();
+        return;
+      }
+
+      if (action.type === 'show_downstream_impact') {
+        ensureMapVisible(action.tab ? String(action.tab) : 'map');
+        clearTerritoryHighlight();
+        clearFeederHighlight();
+        setImpactOverlay(action.impact);
+        if (action.start_mrid) {
+          setSelection(action.start_mrid, { source: 'table' });
+        }
+        if (action.bbox) {
+          queueMapViewportCommand({ type: 'fit_bounds', bbox: action.bbox, max_zoom: 17 });
         }
         refreshMap();
       }
@@ -592,6 +693,8 @@ function GiopPortalInner() {
       setFeederHighlight,
       clearFeederHighlight,
       clearTerritoryHighlight,
+      setImpactOverlay,
+      clearImpactOverlay,
       startMrid,
     ],
   );
@@ -865,7 +968,7 @@ function GiopPortalInner() {
         <GiopOperationsDesk
           isLightMode={isLightMode}
           graph={graph}
-          loading={loading}
+          loading={topologyPanelLoading(graphQuery, loading, graph, seedReady)}
           revalidating={revalidating}
           error={error}
           graphQuery={graphQuery}
@@ -911,7 +1014,6 @@ function GiopPortalInner() {
             fieldTechnicians={technicians}
             fieldCrews={fieldCrewsPanel}
             refreshToken={mapRefreshToken}
-            startMrid={topologyStartMrid}
             onNodeClick={handleMapNodeClick}
             onTechnicianClick={selectTechnician}
             onViewportChange={handleMapViewportChange}
@@ -926,10 +1028,10 @@ function GiopPortalInner() {
       {route.tab === 'topology' && (
         <GiopTopologyTab
           graph={graph}
-          loading={loading}
+          loading={topologyPanelLoading(graphQuery, loading, graph, seedReady)}
           revalidating={revalidating}
           error={error}
-          graphQuery={(route.graphQuery as GiopGraphQueryKey) || graphQuery}
+          graphQuery={graphQuery}
           onQueryChange={onQueryChange}
           isLightMode={isLightMode}
           focusMrid={selection.mrid || route.focusMrid}
@@ -941,10 +1043,10 @@ function GiopPortalInner() {
       {route.tab === 'combined' && (
         <GiopSplitView
           graph={graph}
-          loading={loading}
+          loading={topologyPanelLoading(graphQuery, loading, graph, seedReady)}
           revalidating={revalidating}
           error={error}
-          graphQuery={(route.graphQuery as GiopGraphQueryKey) || graphQuery}
+          graphQuery={graphQuery}
           onQueryChange={onQueryChange}
           isLightMode={isLightMode}
           focusMrid={selection.mrid || route.focusMrid}
