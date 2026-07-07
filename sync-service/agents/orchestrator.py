@@ -278,6 +278,7 @@ def run_agent_validation_cycle(
         messages,
         run_id=run_id,
         agent_name="OrchestratorAgent",
+        llm_profile="cleanup",
     )
     content = react.get("content") or "Validation cycle completed."
     findings: list[str] = []
@@ -297,6 +298,7 @@ def run_agent_validation_cycle(
         agent={
             "provider": "openai-compatible",
             "model": react.get("model"),
+            "llm_profile": react.get("llm_profile") or "cleanup",
             "tools_used": react.get("tools_used") or [],
             "turns": react.get("turns", 1),
             "auto": bool(react.get("configured")),

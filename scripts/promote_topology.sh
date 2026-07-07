@@ -26,6 +26,11 @@ echo "$result" | sed 's/^/    /'
 echo "    completed in $((ended - started))s"
 
 echo
+echo "==> Unpromoted gap layer (Both mode cyan lines)"
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -Atqc \
+  "SELECT COUNT(*) FROM public.map_unpromoted_conductor_segments;" | sed 's/^/    segments: /'
+
+echo
 echo "==> Topology summary"
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -c \
   "SELECT 'connectivity_nodes' AS t, COUNT(*) FROM public.connectivity_nodes

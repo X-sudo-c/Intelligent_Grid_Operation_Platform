@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { getAssetLocation, type GiopTopologyPayload } from '../api/giop-api';
+import { getAssetLocation, type GiopTopologyPayload, isUuidMrid } from '../api/giop-api';
 import { normalizeMapCoordinates, coordsNearlyEqual } from '../lib/giopMapCoordinates';
 import { DUPLICATE_CLUSTER_ZOOM, readNetworkGeometryMode, writeNetworkGeometryMode, type NetworkGeometryMode } from '../lib/giopMapLayers';
 import { giopLog } from '../lib/giopDebugLog';
@@ -307,19 +307,23 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
       let name = opts?.name;
 
       if (!coordinates) {
-        giopLog.overlay.info('focusOnMap resolving coordinates via API', { mrid });
-        try {
-          const loc = await getAssetLocation(mrid);
-          if (loc.longitude != null && loc.latitude != null) {
-            coordinates = normalizeMapCoordinates([loc.longitude, loc.latitude]);
+        if (!isUuidMrid(mrid)) {
+          giopLog.overlay.warn('focusOnMap skipped API lookup — not a valid MRID', { mrid });
+        } else {
+          giopLog.overlay.info('focusOnMap resolving coordinates via API', { mrid });
+          try {
+            const loc = await getAssetLocation(mrid);
+            if (loc.longitude != null && loc.latitude != null) {
+              coordinates = normalizeMapCoordinates([loc.longitude, loc.latitude]);
+            }
+            name = name ?? loc.name ?? undefined;
+            giopLog.overlay.info('focusOnMap API resolved', { mrid, coordinates, name });
+          } catch (err) {
+            giopLog.overlay.error('focusOnMap asset location failed — fly may be skipped', {
+              mrid,
+              err,
+            });
           }
-          name = name ?? loc.name ?? undefined;
-          giopLog.overlay.info('focusOnMap API resolved', { mrid, coordinates, name });
-        } catch (err) {
-          giopLog.overlay.error('focusOnMap asset location failed — fly may be skipped', {
-            mrid,
-            err,
-          });
         }
         if (seq !== focusOnMapSeqRef.current) {
           giopLog.overlay.info('focusOnMap superseded by newer call — dropping', { mrid });

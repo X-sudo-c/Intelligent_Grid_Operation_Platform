@@ -5,6 +5,9 @@ import { GIOP_GRAPH_QUERY_OPTIONS, type GiopGraphQueryKey } from '../lib/giopGra
 import { findCloudHoundPath, type CloudHoundPathFindingResponse } from '../api/giopGraphStubs';
 import { voltageEdgeColor } from '../lib/giopSldTheme';
 import { computeGraphQuality, GRAPH_QUALITY, isOnScreen } from '../lib/giopGraphPerf';
+import { GiopWebGLRenderer, type WebGLNode, type WebGLEdge, type WebGLCamera } from '../lib/giopGraphWebGLRenderer';
+import { GiopSpatialIndex } from '../lib/giopGraphSpatialIndex';
+import { pinGeoLayoutNodes, seedGeoGraphLayout } from '../lib/giopGraphGeoLayout';
 import { Lock, GitBranch, Sparkles, PanelRightOpen, X } from 'lucide-react';
 import { AssistantRichText } from './AssistantRichText';
 
@@ -259,7 +262,7 @@ function readForcePrefs() {
     return {
       repelForce: clamp(Number(parsed.repelForce ?? 0.4), 0, 1.5),
       linkStrength: clamp(Number(parsed.linkStrength ?? 0.5), 0, 1),
-      linkDist: clamp(Number(parsed.linkDist ?? 60), 10, 300),
+      linkDist: clamp(Number(parsed.linkDist ?? 100), 10, 300),
       centerForce: clamp(Number(parsed.centerForce ?? 0.1), 0, 1.25),
     };
   } catch {
@@ -466,6 +469,130 @@ function seedCompactGraphLayout(nodes: SimNode[], links: SimLink[], spacing: num
   return true;
 }
 
+/** Layout tuning derived from graph size — shared by init + slider updates. */
+function graphLayoutDensity(nodeCount: number, layoutStable: boolean) {
+  const n = Math.max(1, nodeCount);
+  const densityCharge = layoutStable
+    ? Math.min(1.2, 240 / Math.max(90, n))
+    : Math.min(6, Math.sqrt(n / 180) * 1.35);
+  const linkDistBonus = n > 300 ? Math.min(200, 50 + (n - 300) / 12) : 0;
+  const collidePadding = n > 300 ? Math.min(36, 10 + Math.sqrt(n) * 0.45) : 8;
+  const centerScale = n > 300 ? Math.max(0.03, 0.35 - n / 18000) : 0.35;
+  const collideIterations = n > 800 ? 4 : n > 300 ? 3 : 2;
+  const warmTicks = layoutStable
+    ? null
+    : Math.min(500, Math.max(100, Math.floor(n / 6)));
+  return { densityCharge, linkDistBonus, collidePadding, centerScale, collideIterations, warmTicks };
+}
+
+/** Collision radius that reserves space for the node circle + label above it. */
+function nodeCollideRadius(node: SimNode, collidePadding: number): number {
+  const label = node.fullLabel || node.label || node.id;
+  const labelHalfW = Math.min(72, Math.max(18, label.length * 3.4));
+  const labelStack = node.size + 26;
+  return Math.sqrt(labelHalfW * labelHalfW + labelStack * labelStack) + collidePadding;
+}
+
+function simNodeFromLinkEndpoint(
+  endpoint: string | SimNode,
+  byId: Map<string, SimNode>,
+): SimNode | undefined {
+  if (typeof endpoint === 'object' && endpoint !== null) return endpoint as SimNode;
+  return byId.get(endpoint as string);
+}
+
+/** Grid seed for large graphs — gives force simulation room to separate labels. */
+function seedGridGraphLayout(nodes: SimNode[], spacing: number): boolean {
+  if (nodes.length <= 120) return false;
+  const cols = Math.max(1, Math.ceil(Math.sqrt(nodes.length * 1.55)));
+  const rows = Math.ceil(nodes.length / cols);
+  nodes.forEach((node, index) => {
+    const col = index % cols;
+    const row = Math.floor(index / cols);
+    node.x = (col - (cols - 1) / 2) * spacing;
+    node.y = (row - (rows - 1) / 2) * spacing * 0.92;
+    node.vx = 0;
+    node.vy = 0;
+  });
+  return true;
+}
+
+function applyGraphSimulationForces(
+  simulation: ReturnType<typeof forceSimulation<SimNode, SimLink>>,
+  simNodes: SimNode[],
+  simLinks: SimLink[],
+  forceParams: { repel: number; linkDist: number; linkStr: number },
+  layoutStable: boolean,
+  centerForce: number,
+  geoLayout = false,
+): void {
+  const density = graphLayoutDensity(simNodes.length, layoutStable);
+  const nodeById = new Map(simNodes.map((node) => [node.id, node]));
+
+  if (geoLayout) {
+    const chargeForce = simulation.force('charge') as ReturnType<typeof forceManyBody<SimNode>> | null;
+    chargeForce
+      ?.strength(-28)
+      .distanceMin(8)
+      .distanceMax(120)
+      .theta(0.9);
+
+    const linkForce = simulation.force('link') as ReturnType<typeof forceLink<SimNode, SimLink>> | null;
+    linkForce
+      ?.id((d) => d.id)
+      .distance((link) => {
+        const src = simNodeFromLinkEndpoint(link.source as string | SimNode, nodeById);
+        const tgt = simNodeFromLinkEndpoint(link.target as string | SimNode, nodeById);
+        const srcR = src ? nodeCollideRadius(src, 6) : 20;
+        const tgtR = tgt ? nodeCollideRadius(tgt, 6) : 20;
+        return Math.max(40, srcR + tgtR);
+      })
+      .strength(0.035);
+
+    const collideForce = simulation.force('collide') as ReturnType<typeof forceCollide<SimNode>> | null;
+    collideForce
+      ?.radius((node) => nodeCollideRadius(node, 6) * 0.55)
+      .strength(0.45)
+      .iterations(2);
+
+    simulation
+      .force('centerX', forceX(0).strength(0))
+      .force('centerY', forceY(0).strength(0));
+    return;
+  }
+
+  const chargeForce = simulation.force('charge') as ReturnType<typeof forceManyBody<SimNode>> | null;
+  chargeForce
+    ?.strength((node) => forceParams.repel * density.densityCharge * (1 + node.size * 0.02))
+    .distanceMin(12)
+    .distanceMax(Math.max(220, 80 + simNodes.length / 18))
+    .theta(0.82);
+
+  const linkForce = simulation.force('link') as ReturnType<typeof forceLink<SimNode, SimLink>> | null;
+  linkForce
+    ?.id((d) => d.id)
+    .distance((link) => {
+      const src = simNodeFromLinkEndpoint(link.source as string | SimNode, nodeById);
+      const tgt = simNodeFromLinkEndpoint(link.target as string | SimNode, nodeById);
+      const srcR = src ? nodeCollideRadius(src, density.collidePadding) : 24;
+      const tgtR = tgt ? nodeCollideRadius(tgt, density.collidePadding) : 24;
+      const minSpan = srcR + tgtR + 20;
+      const base = forceParams.linkDist + density.linkDistBonus;
+      return Math.max(base, minSpan) + (2 - Math.min(2, link.weight)) * 8;
+    })
+    .strength((link) => Math.max(0.03, forceParams.linkStr + Math.min(0.16, link.weight * 0.07)));
+
+  const collideForce = simulation.force('collide') as ReturnType<typeof forceCollide<SimNode>> | null;
+  collideForce
+    ?.radius((node) => nodeCollideRadius(node, density.collidePadding))
+    .strength(layoutStable ? 0.88 : 0.95)
+    .iterations(density.collideIterations);
+
+  simulation
+    .force('centerX', forceX(0).strength(centerForce * density.centerScale))
+    .force('centerY', forceY(0).strength(centerForce * density.centerScale));
+}
+
 function warmStartSimulation(
   simulation: ReturnType<typeof forceSimulation<SimNode, SimLink>>,
   ticks: number,
@@ -524,6 +651,12 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
   const selectedAwsAccountIdRef = useRef(selectedAwsAccountId);
   const previousAiAssistOpenRef = useRef(false);
   const animationTimeRef = useRef(0);
+  const simSettledRef = useRef(false);
+  const settlingSinceRef = useRef(0);
+  const webglCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const webglRef = useRef<GiopWebGLRenderer | null>(null);
+  const spatialIndexRef = useRef<GiopSpatialIndex<SimNode> | null>(null);
+  const geoLayoutRef = useRef(false);
   const aiAssistRef = useRef(aiAssist);
   const onNodeSelectRef = useRef(onNodeSelect);
   const pointerMovedRef = useRef(false);
@@ -546,7 +679,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
   const [edgeVisibility, setEdgeVisibility] = useState(1.0);
   const [repelForce, setRepelForce] = useState(initialForcePrefs?.repelForce ?? 0.4);
   const [linkStrength, setLinkStrength] = useState(initialForcePrefs?.linkStrength ?? 0.5);
-  const [linkDist, setLinkDist] = useState(initialForcePrefs?.linkDist ?? 60);
+  const [linkDist, setLinkDist] = useState(initialForcePrefs?.linkDist ?? 100);
   const [centerForce, setCenterForce] = useState(initialForcePrefs?.centerForce ?? 0.1);
   const [displaySectionOpen, setDisplaySectionOpen] = useState(true);
   const [forcesSectionOpen, setForcesSectionOpen] = useState(false);
@@ -635,31 +768,18 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
     forceParamsRef.current = { repel: mappedRepel, linkDist: mappedLinkDist, linkStr: mappedLinkStrength };
 
     const simulation = simRef.current;
-    if (simulation) {
-      const nodeCount = Math.max(90, nodesRef.current.length || 90);
-      const densityFactor = Math.min(1.2, 240 / nodeCount);
-
-      const chargeForce = simulation.force('charge') as any;
-      if (chargeForce?.strength) {
-        chargeForce
-          .strength((node: SimNode) => mappedRepel * densityFactor * (1 + node.size * 0.02))
-          .distanceMin(10)
-          .distanceMax(nodesRef.current.length > 2400 ? 140 : 180)
-          .theta(0.86);
-      }
-
-      const linkForce = simulation.force('link') as any;
-      if (linkForce?.distance && linkForce?.strength) {
-        linkForce
-          .distance((link: SimLink) => mappedLinkDist + (2 - Math.min(2, link.weight)) * 6)
-          .strength((link: SimLink) => Math.max(0.02, Math.min(1.85, mappedLinkStrength + Math.min(0.22, link.weight * 0.1))));
-      }
-
-      simulation
-        .force('centerX', forceX(0).strength(centerForce * 0.35))
-        .force('centerY', forceY(0).strength(centerForce * 0.35))
-        .alpha(0.82)
-        .restart();
+    if (simulation && nodesRef.current.length > 0) {
+      const layoutStable = nodesRef.current.length <= 200;
+      applyGraphSimulationForces(
+        simulation,
+        nodesRef.current,
+        edgesRef.current,
+        forceParamsRef.current,
+        layoutStable,
+        centerForce,
+        geoLayoutRef.current,
+      );
+      simulation.alpha(0.82).restart();
     }
   }, [repelForce, linkDist, linkStrength, centerForce]);
 
@@ -1046,11 +1166,20 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
   };
 
   useEffect(() => {
+    simSettledRef.current = false;
+    settlingSinceRef.current = 0;
     const container = containerRef.current;
     const canvas = canvasRef.current;
     if (!container || !canvas) return;
-    const ctx = canvas.getContext('2d', { alpha: false });
+    const ctx = canvas.getContext('2d', { alpha: true });
     if (!ctx) return;
+
+    // WebGL is opt-in: only used when GPU hardware is confirmed available.
+    // For CPU-only / weak machines, pure Canvas 2D + spatial index is optimal.
+    if (!webglRef.current && webglCanvasRef.current) {
+      webglRef.current = new GiopWebGLRenderer(webglCanvasRef.current);
+    }
+    const useWebGL = false; // Nodes + background render on Canvas 2D (WebGL layer sits behind opaque fill).
 
     const resize = () => {
       const rect = container.getBoundingClientRect();
@@ -1060,6 +1189,9 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       canvas.height = Math.floor(rect.height * dpr);
       canvas.style.width = `${rect.width}px`;
       canvas.style.height = `${rect.height}px`;
+      if (webglRef.current) {
+        webglRef.current.resize(rect.width, rect.height, dpr);
+      }
     };
 
     const previousPositions = new Map(
@@ -1068,10 +1200,18 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
 
     const simNodes: SimNode[] = renderGraph.nodes.map((node) => {
       const prev = previousPositions.get(node.id);
+      // Only shrink node glyph for non-geo force layouts; geo spread handles density.
+      const densitySize = renderGraph.nodes.length <= 500
+        ? 1.0
+        : Math.min(0.9, Math.sqrt(500 / Math.max(100, renderGraph.nodes.length)));
+      // Wider initial spread for large graphs so nodes don't start stacked.
+      // Small graphs get ±15px, 3000 nodes get ~±330px so they don't pile up.
+      const spread = Math.max(15, Math.sqrt(renderGraph.nodes.length) * 6);
       return {
         ...node,
-        x: prev?.x ?? (Math.random() - 0.5) * 30,
-        y: prev?.y ?? (Math.random() - 0.5) * 30,
+        size: node.size * densitySize,
+        x: prev?.x ?? (Math.random() - 0.5) * spread * 2,
+        y: prev?.y ?? (Math.random() - 0.5) * spread * 2,
         vx: 0,
         vy: 0,
         drift: Math.random() * Math.PI * 2,
@@ -1085,26 +1225,69 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       .map((edge) => ({ source: edge.source, target: edge.target, weight: edge.weight, label: edge.label, confidence: edge.confidence, color: edge.color, isPrivilegeEscalation: edge.isPrivilegeEscalation }));
 
     const layoutSpacing = forceParamsRef.current.linkDist;
-    const layoutSeeded = layoutStable && seedCompactGraphLayout(simNodes, simLinks, layoutSpacing);
+    const densityLayout = graphLayoutDensity(simNodes.length, layoutStable);
+    const gridSpacing = nodeCollideRadius(simNodes[0] ?? { size: 6, fullLabel: '', label: '', id: '' } as SimNode, densityLayout.collidePadding) * 2.35;
     const hasPriorLayout = previousPositions.size > 0;
+    const geoLinks = renderGraph.edges.map((edge) => ({
+      source: edge.source,
+      target: edge.target,
+      properties: edge.properties as Record<string, unknown> | undefined,
+    }));
+    const geoSeeded = !hasPriorLayout && seedGeoGraphLayout(simNodes, geoLinks);
+    geoLayoutRef.current = geoSeeded;
+    if (geoSeeded) {
+      simSettledRef.current = true;
+    }
+    const layoutSeeded = !hasPriorLayout && (
+      geoSeeded
+      || (layoutStable && seedCompactGraphLayout(simNodes, simLinks, layoutSpacing))
+      || (!layoutStable && !geoSeeded && seedGridGraphLayout(simNodes, gridSpacing))
+    );
 
     nodesRef.current = simNodes;
     edgesRef.current = simLinks;
+
+    // Rebuild spatial index for viewport culling
+    if (!spatialIndexRef.current) {
+      spatialIndexRef.current = new GiopSpatialIndex<SimNode>(300);
+    }
+    spatialIndexRef.current.build(simNodes);
+
     resize();
 
     const simulation = forceSimulation(simNodes)
-      .alpha(layoutSeeded || hasPriorLayout ? 0.28 : 0.9)
+      .alpha(layoutSeeded || hasPriorLayout ? 0.28 : 0.92)
       .alphaMin(layoutStable ? 0.02 : 0.001)
-      .alphaDecay(layoutStable ? 0.14 : 0.05)
-      .velocityDecay(layoutStable ? 0.72 : 0.48)
-      .force('charge', forceManyBody<SimNode>().strength((node) => forceParamsRef.current.repel * Math.min(1.2, 240 / Math.max(90, simNodes.length)) * (1 + node.size * 0.02)).distanceMin(10).distanceMax(simNodes.length > 2400 ? 140 : 180).theta(0.86))
-      .force('link', forceLink<SimNode, SimLink>(simLinks).id((d) => d.id).distance((link) => forceParamsRef.current.linkDist + (2 - Math.min(2, link.weight)) * 6).strength((link) => forceParamsRef.current.linkStr + Math.min(0.18, link.weight * 0.08)))
-      .force('collide', forceCollide<SimNode>((node) => node.size + 4).strength(0.82).iterations(2))
-      .force('centerX', forceX(0).strength(centerForce * 0.35))
-      .force('centerY', forceY(0).strength(centerForce * 0.35))
+      .alphaDecay(layoutStable ? 0.14 : 0.045)
+      .velocityDecay(layoutStable ? 0.72 : 0.55)
+      .force('charge', forceManyBody<SimNode>())
+      .force('link', forceLink<SimNode, SimLink>(simLinks).id((d) => d.id))
+      .force('collide', forceCollide<SimNode>())
+      .force('centerX', forceX(0))
+      .force('centerY', forceY(0))
       .stop();
+
+    applyGraphSimulationForces(
+      simulation,
+      simNodes,
+      simLinks,
+      forceParamsRef.current,
+      layoutStable,
+      centerForce,
+      geoSeeded,
+    );
+
     simRef.current = simulation;
-    warmStartSimulation(simulation, layoutStable ? (layoutSeeded ? 36 : 72) : 0);
+    if (geoSeeded) {
+      pinGeoLayoutNodes(simNodes);
+    } else {
+      warmStartSimulation(
+        simulation,
+        layoutStable
+          ? (layoutSeeded ? 48 : 96)
+          : (densityLayout.warmTicks ?? 0),
+      );
+    }
 
     const hitTest = (clientX: number, clientY: number) => {
       const rect = canvas.getBoundingClientRect();
@@ -1144,12 +1327,22 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       ctx2d.save();
       ctx2d.setTransform(sizeRef.current.dpr, 0, 0, sizeRef.current.dpr, 0, 0);
       ctx2d.clearRect(0, 0, width, height);
+      // Always draw the themed background gradient on Canvas 2D.
+      // The WebGL layer sits behind it as transparent, so the gradient
+      // shows through correctly regardless of render path.
       const bg = ctx2d.createRadialGradient(width / 2, height / 2, 20, width / 2, height / 2, Math.max(width, height) * 0.75);
       bg.addColorStop(0, palette.bgStart); bg.addColorStop(1, palette.bgEnd);
       ctx2d.fillStyle = bg; ctx2d.fillRect(0, 0, width, height);
 
       const zoom = camera.zoom;
       const edgeVisibilityBoost = edgeVisibilityRef.current;
+      const graphNodeCount = nodesRef.current.length;
+      const isDenseGraph = graphNodeCount > 500 || geoLayoutRef.current;
+      // Scale stroke width down as density grows (Memgraph-style hairball mitigation).
+      const edgeWidthScale = isDenseGraph
+        ? Math.max(0.14, Math.min(0.48, 240 / Math.max(600, graphNodeCount)))
+        : 1;
+      const drawArrowheads = showArrowsRef.current && (!isDenseGraph || zoom >= 0.62);
       // Keep link labels visible significantly longer while zooming out.
       const linkLabelZoomThreshold = clamp(1.35 - (edgeVisibilityBoost - 0.5) * 0.8, 0.38, 1.35);
       const linkLabelBaseAlpha = clamp(0.56 + edgeVisibilityBoost * 0.2, 0.56, 0.96);
@@ -1220,6 +1413,67 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         return { edge, score };
       }).sort((a, b) => b.score - a.score).slice(0, cap).map((entry) => entry.edge);
 
+      // ── Edge rendering: skipped entirely when zoomed too far out ──
+      const drawEdgesCanvas = zoom >= qualityConfig.edgeZoomMin || qualityConfig.edgeZoomMin === 0;
+      if (useWebGL) {
+        const wglCamera: WebGLCamera = {
+          x: camera.x, y: camera.y,
+          zoom: camera.zoom,
+          width: sizeRef.current.width, height: sizeRef.current.height,
+        };
+        // Clear then draw edges → nodes (correct Z-order)
+        webglRef.current!.clear(isLight);
+        // Build edge data for WebGL (skip if below edge zoom threshold)
+        if (!drawEdgesCanvas && visibleEdges.length > 0) {
+          const wglEdges: WebGLEdge[] = [];
+          for (const edge of visibleEdges) {
+            const src = typeof edge.source === 'object' && edge.source !== null ? edge.source as SimNode : nodeBySimId.get(edge.source as string);
+            const tgt = typeof edge.target === 'object' && edge.target !== null ? edge.target as SimNode : nodeBySimId.get(edge.target as string);
+            if (!src || !tgt) continue;
+            // Parse edge color to r,g,b
+            const hex = edge.color || 'rgba(154,164,179,0.58)';
+            let er = 0.6, eg = 0.64, eb = 0.7, ea = 0.35;
+            const rgbaMatch = hex.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+            if (rgbaMatch) {
+              er = parseInt(rgbaMatch[1]) / 255;
+              eg = parseInt(rgbaMatch[2]) / 255;
+              eb = parseInt(rgbaMatch[3]) / 255;
+              ea = rgbaMatch[4] ? parseFloat(rgbaMatch[4]) : (hex.startsWith('rgba') ? 1 : 0.5);
+            }
+            wglEdges.push({ x1: src.x ?? 0, y1: src.y ?? 0, x2: tgt.x ?? 0, y2: tgt.y ?? 0, r: er, g: eg, b: eb, a: ea });
+          }
+          if (wglEdges.length > 0) {
+            webglRef.current!.drawEdgeBatch(wglEdges, wglCamera);
+          }
+        }
+        // Build node data for WebGL
+        const wglNodes: WebGLNode[] = [];
+        nodesRef.current.forEach((node) => {
+          if (!visibleNodes.has(node.id)) return;
+          const p = screen(node, camera, width, height);
+          if (qualityConfig.viewportCull && !isOnScreen(p.x, p.y, width, height, 72)) return;
+          // Parse node color to r,g,b
+          const hex = node.color || '#888888';
+          let r = 0.53, g = 0.53, b = 0.53;
+          if (hex.startsWith('#')) {
+            if (hex.length === 7) {
+              r = parseInt(hex.slice(1, 3), 16) / 255;
+              g = parseInt(hex.slice(3, 5), 16) / 255;
+              b = parseInt(hex.slice(5, 7), 16) / 255;
+            } else if (hex.length === 4) {
+              r = parseInt(hex[1] + hex[1], 16) / 255;
+              g = parseInt(hex[2] + hex[2], 16) / 255;
+              b = parseInt(hex[3] + hex[3], 16) / 255;
+            }
+          }
+          wglNodes.push({ x: node.x ?? 0, y: node.y ?? 0, r, g, b, a: 0.9, radius: Math.max(4, node.size) });
+        });
+        if (wglNodes.length > 0) {
+          webglRef.current!.drawNodeBatch(wglNodes, wglCamera);
+        }
+      }
+
+      if (drawEdgesCanvas) {
       visibleEdges.forEach((edge) => {
         const source = typeof edge.source === 'object' && edge.source !== null ? edge.source as SimNode : nodeBySimId.get(edge.source as string);
         const target = typeof edge.target === 'object' && edge.target !== null ? edge.target as SimNode : nodeBySimId.get(edge.target as string);
@@ -1240,8 +1494,10 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         ctx2d.save();
         // Privilege escalation edges are always highly visible
         // Path edges should be highly visible when path is found
-        const baseEdgeAlpha = Math.min(1, 0.72 + edgeVisibilityBoost * 0.24);
-        const lowZoomAlphaBoost = zoom < 0.9 ? (0.9 - zoom) * 0.2 : 0;
+        const baseEdgeAlpha = isDenseGraph
+          ? Math.min(0.52, 0.28 + edgeVisibilityBoost * 0.14)
+          : Math.min(1, 0.72 + edgeVisibilityBoost * 0.24);
+        const lowZoomAlphaBoost = zoom < 0.9 ? (0.9 - zoom) * (isDenseGraph ? 0.08 : 0.2) : 0;
         ctx2d.globalAlpha = isPathEdge
           ? 0.98
           : isAiQueryEdge
@@ -1274,20 +1530,24 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
           ctx2d.strokeStyle = edge.color;
         }
         
-        const baseThickness = edge.weight * 1.1 * linkThicknessRef.current;
-        const lowZoomWidthBoost = zoom < 1 ? 1 + (1 - zoom) * 0.9 : 1;
-        const minRegularEdgeWidth = 0.55 + edgeVisibilityBoost * 0.6;
+        const baseThickness = edge.weight * 0.85 * linkThicknessRef.current * edgeWidthScale;
+        const lowZoomWidthBoost = isDenseGraph
+          ? Math.max(0.35, zoom * 0.95)
+          : (zoom < 1 ? 1 + (1 - zoom) * 0.9 : 1);
+        const minRegularEdgeWidth = isDenseGraph
+          ? 0.2 + edgeVisibilityBoost * 0.18
+          : 0.55 + edgeVisibilityBoost * 0.6;
         ctx2d.lineWidth = isPathEdge
-          ? 3.2
+          ? 2.4
           : isAiQueryEdge
-            ? Math.max(1.8, baseThickness * 1.2)
+            ? Math.max(1.1, baseThickness * 1.1)
           : connectedHover
-            ? 2.8
+            ? Math.max(1.2, 1.8 * edgeWidthScale)
             : connectedFocus
-              ? 2.4
+              ? Math.max(1.0, 1.5 * edgeWidthScale)
               : isPrivEsc
-                ? Math.max(0.7, baseThickness)
-                : Math.max(minRegularEdgeWidth, baseThickness * Math.max(0.85, zoom * 0.78) * lowZoomWidthBoost);
+                ? Math.max(0.45, baseThickness)
+                : Math.max(minRegularEdgeWidth, baseThickness * Math.max(0.55, zoom * 0.65) * lowZoomWidthBoost);
         
         // Enhanced shadow for privilege escalation and path edges (skipped at balanced/safe tiers)
         if (qualityConfig.shadows) {
@@ -1313,10 +1573,10 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         let arrowTipX = t.x;
         let arrowTipY = t.y;
         let arrowAngle = Math.atan2(t.y - s.y, t.x - s.x);
-        let arrowLength = clamp(6.2 + zoom * 1.25, 5.5, 12.5);
-        let arrowHalfWidth = clamp(2.8 + zoom * 0.55, 2.6, 6.2);
+        let arrowLength = clamp((4.2 + zoom * 0.9) * edgeWidthScale, 2.8, 9);
+        let arrowHalfWidth = clamp((1.8 + zoom * 0.35) * edgeWidthScale, 1.4, 4.5);
 
-        if (showArrowsRef.current) {
+        if (drawArrowheads) {
           const angle = Math.atan2(t.y - s.y, t.x - s.x);
           const targetFocused = activeRef.current === tgtId;
           const targetHovered = hoverStateRef.current === tgtId;
@@ -1332,8 +1592,8 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
           arrowTipX = tipX;
           arrowTipY = tipY;
           arrowAngle = angle;
-          arrowLength = clamp(6.2 + zoom * 1.25, 5.5, 12.5);
-          arrowHalfWidth = clamp(2.8 + zoom * 0.55, 2.6, 6.2);
+          arrowLength = clamp((4.2 + zoom * 0.9) * edgeWidthScale, 2.8, 9);
+          arrowHalfWidth = clamp((1.8 + zoom * 0.35) * edgeWidthScale, 1.4, 4.5);
         }
 
         ctx2d.beginPath();
@@ -1342,7 +1602,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         ctx2d.stroke();
         ctx2d.shadowBlur = 0;
         
-        if (showArrowsRef.current) {
+        if (drawArrowheads) {
           ctx2d.save();
           ctx2d.translate(arrowTipX, arrowTipY);
           ctx2d.rotate(arrowAngle);
@@ -1358,7 +1618,8 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
           ctx2d.restore();
         }
         // Show edge label on focused connection or when zoomed in
-        const showLabel = connectedFocus || isPrivEsc || zoom >= linkLabelZoomThreshold;
+        const showLabel = (connectedFocus || isPrivEsc || zoom >= linkLabelZoomThreshold)
+          && (!isDenseGraph || connectedFocus || connectedHover || isPrivEsc || zoom >= linkLabelZoomThreshold + 0.45);
         if (showLabel) {
           const labelAlpha = connectedFocus || isPrivEsc
             ? Math.min(1, linkLabelBaseAlpha + 0.2)
@@ -1368,10 +1629,11 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
           roundRect(ctx2d, (s.x + t.x) / 2 - edgeWidth / 2, (s.y + t.y) / 2 - 18, edgeWidth, 20, 7, isPrivEsc ? palette.edgeLabelBgEsc : palette.edgeLabelBg, labelAlpha);
           ctx2d.globalAlpha = labelAlpha; 
           ctx2d.fillStyle = connectedFocus ? palette.edgeLabelTextFocus : isPrivEsc ? palette.edgeLabelTextEsc : palette.edgeLabelText; 
-          ctx2d.textAlign = 'center'; ctx2d.textBaseline = 'middle'; ctx2d.fillText(edge.label, (s.x + t.x) / 2, (s.y + t.y) / 2 - 8);
+          ctx2d.textAlign = 'center'; ctx2d.textBaseline = 'middle';           ctx2d.fillText(edge.label, (s.x + t.x) / 2, (s.y + t.y) / 2 - 8);
         }
         ctx2d.restore();
       });
+      }
 
       nodesRef.current.forEach((node) => {
         if (!visibleNodes.has(node.id)) return;
@@ -1403,8 +1665,14 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         const ripplePhaseSecondary = shouldPulse ? (ripplePhase + 0.5) % 1 : 0;
         const heatColor = heatMapEnabledRef.current ? node.riskColor : null;
         const nodeDisplayColor = isAiAssistNode ? node.color : focused ? '#f8fafc' : searchHit ? '#f4d06f' : heatColor ?? node.color;
-        const radius = Math.max(4, node.size * nodeSizeMultRef.current * (focused ? 1.5 : hovered ? 1.25 : isPathNode ? 1.3 : 1) * pulseScale);
-        const labelVisible = hovered || searchHit || isPathNode || isAiQueryNode || (drawAll && zoom >= qualityConfig.labelZoom);
+        const sizeScale = focused ? 1.5 : hovered ? 1.25 : isPathNode ? 1.3 : 1;
+        const worldRadius = node.size * nodeSizeMultRef.current * sizeScale * pulseScale;
+        const radius = Math.max(
+          isDenseGraph ? 3.2 : 4,
+          worldRadius * Math.max(0.65, zoom),
+        );
+        const labelVisible = hovered || searchHit || isPathNode || isAiQueryNode
+          || (drawAll && zoom >= qualityConfig.labelZoom && (!isDenseGraph || zoom >= qualityConfig.labelZoom + 0.55));
         const label = labelVisible ? node.fullLabel : node.label;
         ctx2d.save();
         ctx2d.globalAlpha = dimmed ? 0.35 : 1;
@@ -1674,7 +1942,9 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let maxY = -Infinity;
       nodesRef.current.forEach((node) => { minX = Math.min(minX, node.x || 0); minY = Math.min(minY, node.y || 0); maxX = Math.max(maxX, node.x || 0); maxY = Math.max(maxY, node.y || 0); });
       const width = sizeRef.current.width; const height = sizeRef.current.height;
-      const zoom = clamp(Math.min(width / Math.max(1, maxX - minX), height / Math.max(1, maxY - minY)) * 0.72, 0.3, 3.2);
+      const pad = geoLayoutRef.current ? 0.88 : 0.72;
+      const minZoom = geoLayoutRef.current ? 0.12 : 0.3;
+      const zoom = clamp(Math.min(width / Math.max(1, maxX - minX), height / Math.max(1, maxY - minY)) * pad, minZoom, 3.2);
       const next = { x: (minX + maxX) / 2, y: (minY + maxY) / 2, zoom };
       if (animate) cameraTargetRef.current = next; else { cameraRef.current = next; cameraTargetRef.current = next; }
     };
@@ -1720,7 +1990,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
     resizeRef.current?.disconnect();
     resizeRef.current = new ResizeObserver(() => { resize(); draw(); scheduleFrame(); });
     resizeRef.current.observe(container);
-    const restoredCamera = readCameraPrefs();
+    const restoredCamera = geoSeeded ? null : readCameraPrefs();
     if (restoredCamera) {
       cameraRef.current = restoredCamera;
       cameraTargetRef.current = restoredCamera;
@@ -1840,30 +2110,47 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
       animationTimeRef.current = timestamp * 0.001;
       const dt = Math.min(2.2, elapsed / 16.67);
       const count = Math.max(1, Math.round(qualityConfig.simTicks * dt));
-      for (let i = 0; i < count; i += 1) {
+
+      if (!dragRef.current && !simSettledRef.current) {
         const alpha = simulation.alpha();
-        const time = timestamp * 0.001;
-        if (qualityConfig.drift && !layoutStable) {
-          simNodes.forEach((node) => {
-            const currentAiAssist = aiAssistRef.current;
-            const isAiAssistNode = currentAiAssist?.isOpen && currentAiAssist.nodeId === node.id;
-            const nodeValidation =
-              typeof node.properties?.validation === 'string' ? node.properties.validation : undefined;
-            const isStagingNode =
-              nodeValidation === 'PENDING_FIELD' || nodeValidation === 'STAGED';
-            const isFocusedNode = activeRef.current === node.id;
-            const driftMultiplier = isAiAssistNode ? 0.22 : isStagingNode ? 0.45 : isFocusedNode ? 0.55 : 1;
-            const sway = node.driftRadius * (0.08 + alpha * 0.18) * dt * driftMultiplier;
-            node.vx = (node.vx || 0) + Math.cos(time * node.driftSpeed + node.drift) * sway;
-            node.vy = (node.vy || 0) + Math.sin(time * node.driftSpeed * 0.87 + node.drift * 1.1) * sway;
-          });
+        if (alpha < 0.028) {
+          if (settlingSinceRef.current === 0) {
+            settlingSinceRef.current = timestamp;
+          } else if (timestamp - settlingSinceRef.current > 5000) {
+            simSettledRef.current = true;
+            simulation.alpha(0);
+          }
+        } else {
+          settlingSinceRef.current = 0;
         }
-        simulation.tick();
+      }
+
+      if (!simSettledRef.current) {
+        for (let i = 0; i < count; i += 1) {
+          const alpha = simulation.alpha();
+          const time = timestamp * 0.001;
+          if (qualityConfig.drift && !layoutStable) {
+            simNodes.forEach((node) => {
+              const currentAiAssist = aiAssistRef.current;
+              const isAiAssistNode = currentAiAssist?.isOpen && currentAiAssist.nodeId === node.id;
+              const nodeValidation =
+                typeof node.properties?.validation === 'string' ? node.properties.validation : undefined;
+              const isStagingNode =
+                nodeValidation === 'PENDING_FIELD' || nodeValidation === 'STAGED';
+              const isFocusedNode = activeRef.current === node.id;
+              const driftMultiplier = isAiAssistNode ? 0.22 : isStagingNode ? 0.45 : isFocusedNode ? 0.55 : 1;
+              const sway = node.driftRadius * (0.08 + alpha * 0.18) * dt * driftMultiplier;
+              node.vx = (node.vx || 0) + Math.cos(time * node.driftSpeed + node.drift) * sway;
+              node.vy = (node.vy || 0) + Math.sin(time * node.driftSpeed * 0.87 + node.drift * 1.1) * sway;
+            });
+          }
+          simulation.tick();
+        }
       }
       if (!dragRef.current) {
-        if (layoutStable || simulation.alpha() < 0.04) {
+        if (simSettledRef.current || layoutStable || simulation.alpha() < 0.04) {
           simulation.alphaTarget(0);
-          if (layoutStable && simulation.alpha() < 0.02) {
+          if ((simSettledRef.current || layoutStable) && simulation.alpha() < 0.04) {
             simNodes.forEach((node) => {
               node.vx = 0;
               node.vy = 0;
@@ -1913,6 +2200,16 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
     };
   }, [adjacency.neighbors, isOpsChrome, isSplitLayout, quality, renderGraph]);
 
+  // Clean up WebGL renderer on unmount
+  useEffect(() => {
+    return () => {
+      if (webglRef.current) {
+        webglRef.current.destroy();
+        webglRef.current = null;
+      }
+    };
+  }, []);
+
   const commitSearch = () => {
     const next = searchInput.trim();
     setSearch(next);
@@ -1956,7 +2253,7 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
     cameraTargetRef.current = { x: (minX + maxX) / 2, y: (minY + maxY) / 2, zoom };
   };
 
-  const modeLabel = quality === 'safe' ? 'dense' : quality === 'balanced' ? 'balanced' : 'ultra';
+  const modeLabel = quality === 'minimal' ? 'low-cpu' : quality === 'safe' ? 'dense' : quality === 'balanced' ? 'balanced' : 'ultra';
 
   const focusNodeInFrame = (nodeId: string, panelOpen: boolean) => {
     const match = nodesRef.current.find((item) => item.id === nodeId);
@@ -2339,7 +2636,8 @@ export function GiopGraphCanvas({ graph, isAdmin = false, selectedAwsAccountId =
         )}
 
         <div ref={containerRef} className={`relative h-full w-full ${isOpsChrome || isSplitLayout ? 'min-h-0' : 'min-h-[760px]'}`} aria-label="Grid network topology graph">
-          <canvas ref={canvasRef} className="h-full w-full touch-none" />
+          <canvas ref={webglCanvasRef} className="absolute inset-0 h-full w-full touch-none" />
+          <canvas ref={canvasRef} className="relative h-full w-full touch-none" />
         </div>
 
         {isNodeAiAssistOpen && aiAssistAnchor.visible && (

@@ -5,6 +5,15 @@ set -euo pipefail
 NAME="${REDIS_CONTAINER:-giop-redis}"
 PORT="${REDIS_PORT:-6379}"
 IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
+MAXMEM="${REDIS_MAXMEMORY:-2gb}"
+MAXMEM_POLICY="${REDIS_MAXMEMORY_POLICY:-allkeys-lru}"
+REDIS_SERVER_ARGS=(
+  redis-server
+  --save ""
+  --appendonly no
+  --maxmemory "$MAXMEM"
+  --maxmemory-policy "$MAXMEM_POLICY"
+)
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "ensure_redis: docker not installed" >&2
@@ -18,7 +27,7 @@ if ! docker inspect "$NAME" >/dev/null 2>&1; then
     --label "giop.service=redis" \
     -p "${PORT}:6379" \
     "$IMAGE" \
-    redis-server --save "" --appendonly no >/dev/null
+    "${REDIS_SERVER_ARGS[@]}" >/dev/null
 else
   echo "==> Starting existing $NAME"
   docker start "$NAME" >/dev/null 2>&1 || true

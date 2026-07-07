@@ -2,6 +2,7 @@ import type { GiopTopologyPayload } from '../api/giop-api';
 import type { GiopPortalTab } from '../lib/giopPortalRouting';
 import type { FeederHighlightGeoJson } from '../lib/giopFeederHighlight';
 import type { TerritoryGeoJson } from '../lib/giopTerritoryHighlight';
+import type { CopilotStructuredContent } from './giopCopilotMessageContent';
 
 export interface MapBboxContext {
   west: number;
@@ -112,6 +113,9 @@ export interface GiopCopilotMessage {
   actions?: string[];
   uiActions?: GiopCopilotUiAction[];
   pending?: boolean;
+  pendingQuery?: string;
+  requestId?: string;
+  structured?: CopilotStructuredContent;
 }
 
 export interface GiopCopilotPortalContext {

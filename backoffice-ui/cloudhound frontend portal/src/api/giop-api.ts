@@ -433,7 +433,17 @@ export interface GiopAssetLocation {
 }
 
 export async function getAssetLocation(mrid: string): Promise<GiopAssetLocation> {
-  return fetchJson(`${SYNC_BASE}/assets/${encodeURIComponent(mrid)}`);
+  const id = (mrid || '').trim();
+  if (!isUuidMrid(id)) {
+    throw new Error(`Invalid asset MRID: ${mrid}`);
+  }
+  return fetchJson(`${SYNC_BASE}/assets/${encodeURIComponent(id)}`);
+}
+
+/** Strict UUID v4-ish check for connectivity node MRIDs. */
+export function isUuidMrid(value: string | null | undefined): boolean {
+  if (!value) return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim());
 }
 
 export type GiopMapSearchKind = 'asset' | 'place' | 'work_order' | 'crew';
@@ -1125,6 +1135,264 @@ export async function snapGisConductors(options?: {
   });
 }
 
+export type GiopEndpointFixTier = 'tier_a' | 'tier_b';
+export type GiopEndpointFixStatus = 'pending' | 'approved' | 'rejected' | 'applied';
+export type GiopEndpointFixDataTier = 'gis' | 'staging';
+
+export interface GiopEndpointFixProposal {
+  id: string;
+  segment_id: number;
+  segment_mrid?: string | null;
+  data_tier?: GiopEndpointFixDataTier;
+  district?: string | null;
+  source_layer?: string | null;
+  source_fid?: number | null;
+  import_reason?: string | null;
+  current_from?: string | null;
+  current_to?: string | null;
+  proposed_from: string;
+  proposed_to: string;
+  start_dist_m?: number | null;
+  end_dist_m?: number | null;
+  start_nearest_pole?: string | null;
+  end_nearest_pole?: string | null;
+  tier: GiopEndpointFixTier;
+  rationale?: string | null;
+  status: GiopEndpointFixStatus;
+  batch_id: string;
+  created_at?: string | null;
+  reviewed_at?: string | null;
+  reviewed_by?: string | null;
+  applied_at?: string | null;
+  ai_rationale?: string | null;
+  ai_confidence?: 'high' | 'medium' | 'low' | null;
+  ai_agrees?: boolean | null;
+  ai_scan_id?: string | null;
+}
+
+export interface GiopEndpointFixProposalPage {
+  total: number;
+  limit: number;
+  offset: number;
+  proposals: GiopEndpointFixProposal[];
+}
+
+export interface GiopEndpointFixGenerateResult {
+  batch_id: string;
+  district: string;
+  inserted: number;
+  pending_total: number;
+  tier_a_pending: number;
+  tier_b_pending: number;
+  tolerance_m: number;
+  assisted_m: number;
+}
+
+export async function generateGisEndpointFixProposals(payload: {
+  district: string;
+  data_tier?: GiopEndpointFixDataTier;
+  tolerance_m?: number;
+  assisted_m?: number;
+  limit?: number;
+  include_tier_b?: boolean;
+  replace_pending?: boolean;
+}): Promise<GiopEndpointFixGenerateResult> {
+  return fetchJson(`${SYNC_BASE}/gis/endpoint-fix-proposals/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function listGisEndpointFixProposals(options?: {
+  district?: string;
+  data_tier?: GiopEndpointFixDataTier;
+  status?: GiopEndpointFixStatus;
+  tier?: GiopEndpointFixTier;
+  batch_id?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<GiopEndpointFixProposalPage> {
+  const q = new URLSearchParams();
+  if (options?.data_tier) q.set('data_tier', options.data_tier);
+  if (options?.district) q.set('district', options.district);
+  if (options?.status) q.set('status', options.status);
+  if (options?.tier) q.set('tier', options.tier);
+  if (options?.batch_id) q.set('batch_id', options.batch_id);
+  q.set('limit', String(options?.limit ?? 50));
+  q.set('offset', String(options?.offset ?? 0));
+  return fetchJson(`${SYNC_BASE}/gis/endpoint-fix-proposals?${q}`);
+}
+
+export async function reviewGisEndpointFixProposals(payload: {
+  proposal_ids: string[];
+  status: 'approved' | 'rejected';
+  data_tier?: GiopEndpointFixDataTier;
+  reviewed_by?: string;
+}): Promise<{ updated: number; proposal_ids: string[]; status: string }> {
+  return fetchJson(`${SYNC_BASE}/gis/endpoint-fix-proposals/review`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function applyGisEndpointFixProposals(payload?: {
+  proposal_ids?: string[];
+  district?: string;
+  data_tier?: GiopEndpointFixDataTier;
+  operator_id?: string;
+}): Promise<{ applied: number; operator?: string | null; district?: string | null }> {
+  return fetchJson(`${SYNC_BASE}/gis/endpoint-fix-proposals/apply`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload ?? {}),
+  });
+}
+
+export async function getGisEndpointFixProposalSummary(
+  district?: string,
+  dataTier: GiopEndpointFixDataTier = 'gis',
+): Promise<{
+  pending: number;
+  approved: number;
+  by_status_tier: Record<string, number>;
+}> {
+  const q = new URLSearchParams();
+  if (district) q.set('district', district);
+  if (dataTier) q.set('data_tier', dataTier);
+  const suffix = q.toString() ? `?${q}` : '';
+  return fetchJson(`${SYNC_BASE}/gis/endpoint-fix-proposals/summary${suffix}`);
+}
+
+export interface GiopEndpointFixAiTranscriptEntry {
+  role: 'user' | 'assistant' | 'tool';
+  content?: string;
+  tool_calls?: Array<{ name?: string; arguments?: string }>;
+}
+
+export interface GiopEndpointFixAiReview {
+  proposal_id?: string;
+  segment_id?: number;
+  agree?: boolean;
+  confidence?: 'high' | 'medium' | 'low';
+  rationale?: string;
+  proposed_from?: string | null;
+  proposed_to?: string | null;
+}
+
+export interface GiopEndpointFixAiScanResult {
+  scan_id: string;
+  district: string;
+  model?: string | null;
+  proposals_reviewed: number;
+  thoughts?: string | null;
+  transcript: GiopEndpointFixAiTranscriptEntry[];
+  reviews: GiopEndpointFixAiReview[];
+  configured: boolean;
+  mode?: 'agent' | 'batch' | 'tiered';
+  reasoning_depth?: 'quick' | 'deep';
+  auto_reviewed?: number;
+  llm_reviewed?: number;
+  limit?: number;
+  offset?: number;
+  remaining_unscanned?: number | null;
+}
+
+export interface GiopEndpointFixAiScanRecord extends GiopEndpointFixAiScanResult {
+  id: string;
+  proposal_batch_id?: string | null;
+  llm_profile?: string | null;
+  status: 'running' | 'completed' | 'failed';
+  error_message?: string | null;
+  created_at?: string | null;
+  completed_at?: string | null;
+}
+
+export async function aiScanGisEndpointFixProposals(payload: {
+  district: string;
+  data_tier?: GiopEndpointFixDataTier;
+  batch_id?: string;
+  limit?: number;
+  offset?: number;
+  unscanned_only?: boolean;
+  mode?: 'agent' | 'batch' | 'tiered';
+  reasoning_depth?: 'quick' | 'deep';
+}): Promise<GiopEndpointFixAiScanResult> {
+  return fetchJson(`${SYNC_BASE}/gis/endpoint-fix-proposals/ai-scan`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+export interface GiopEndpointFixAiDistrictRun {
+  id: string;
+  district: string;
+  data_tier?: GiopEndpointFixDataTier;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  reasoning_depth: 'quick' | 'deep';
+  batch_size: number;
+  total_pending: number;
+  rows_reviewed: number;
+  batches_completed: number;
+  swarm_workers?: number;
+  remaining_unscanned?: number;
+  progress_pct?: number;
+  last_model?: string | null;
+  error_message?: string | null;
+  created_at?: string | null;
+  completed_at?: string | null;
+}
+
+export async function startGisEndpointFixDistrictAiScan(payload: {
+  district: string;
+  data_tier?: GiopEndpointFixDataTier;
+  batch_size?: number;
+  reasoning_depth?: 'quick' | 'deep';
+}): Promise<GiopEndpointFixAiDistrictRun> {
+  return fetchJson(`${SYNC_BASE}/gis/endpoint-fix-proposals/ai-scan/district`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getGisEndpointFixAiDistrictRun(
+  runId: string,
+): Promise<GiopEndpointFixAiDistrictRun> {
+  return fetchJson(`${SYNC_BASE}/gis/endpoint-fix-proposals/ai-scan/runs/${encodeURIComponent(runId)}`);
+}
+
+export async function getActiveGisEndpointFixAiDistrictRun(
+  district: string,
+  dataTier: GiopEndpointFixDataTier = 'gis',
+): Promise<GiopEndpointFixAiDistrictRun> {
+  const q = new URLSearchParams({ district, data_tier: dataTier });
+  return fetchJson(`${SYNC_BASE}/gis/endpoint-fix-proposals/ai-scan/runs/active?${q}`);
+}
+
+export async function bulkReviewGisEndpointFixProposals(payload: {
+  district: string;
+  data_tier?: GiopEndpointFixDataTier;
+  filter: 'tier_a' | 'ai_high' | 'ai_agrees';
+  reviewed_by?: string;
+}): Promise<{ updated: number; filter: string; district: string }> {
+  return fetchJson(`${SYNC_BASE}/gis/endpoint-fix-proposals/review/bulk`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getLatestGisEndpointFixAiScan(
+  district: string,
+  dataTier: GiopEndpointFixDataTier = 'gis',
+): Promise<GiopEndpointFixAiScanRecord> {
+  const q = new URLSearchParams({ district, data_tier: dataTier });
+  return fetchJson(`${SYNC_BASE}/gis/endpoint-fix-proposals/ai-scans/latest?${q}`);
+}
+
 export interface GiopDqExceptionPage {
   exceptions: GiopDqException[];
   count: number;
@@ -1315,6 +1583,12 @@ export interface GiopAgentsStatus {
   llm_tool_count?: number;
   llm_reachable?: boolean;
   llm_error?: string | null;
+  cleanup_llm_configured?: boolean;
+  cleanup_llm_model?: string | null;
+  cleanup_llm_base_url?: string | null;
+  cleanup_llm_distinct?: boolean;
+  cleanup_llm_reachable?: boolean;
+  cleanup_llm_error?: string | null;
   agents: string[];
 }
 
@@ -1583,6 +1857,7 @@ export async function portalAiVoiceAudioTurn(options: {
 export async function portalAiVoiceTurn(options: {
   text: string;
   sessionId?: string;
+  requestId?: string;
   exceptionId?: string;
   mrid?: string;
   context?: Record<string, unknown>;
@@ -1596,6 +1871,8 @@ export async function portalAiVoiceTurn(options: {
   agent?: Record<string, unknown> & {
     speak?: string;
     session_id?: string;
+    request_id?: string;
+    structured?: Record<string, unknown>;
     fast_path?: boolean;
     fast_only_miss?: boolean;
     voice?: boolean;
@@ -1608,6 +1885,7 @@ export async function portalAiVoiceTurn(options: {
     body: JSON.stringify({
       text: options.text,
       session_id: options.sessionId,
+      request_id: options.requestId,
       exception_id: options.exceptionId,
       mrid: options.mrid,
       context: options.context,
@@ -1615,6 +1893,23 @@ export async function portalAiVoiceTurn(options: {
     }),
   });
 }
+
+export async function getCopilotProgress(requestId: string): Promise<{
+  request_id: string;
+  steps: Array<{ label: string; detail?: string | null; status?: string; ts?: number }>;
+}> {
+  const query = new URLSearchParams({ request_id: requestId });
+  return fetchJson(`${SYNC_BASE}/portal/ai/copilot-progress?${query}`);
+}
+
+function newCopilotRequestId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID().replace(/-/g, '');
+  }
+  return `${Date.now().toString(16)}${Math.random().toString(16).slice(2, 10)}`;
+}
+
+export { newCopilotRequestId };
 
 export interface GiopStagingSummary {
   pending_total: number;
@@ -1952,6 +2247,21 @@ async function probeMartinNetworkCatalog(
     return catalog.some(
       (entry) => entry.id === 'oh_conductor_11kv' || entry.id === 'oh_conductor_33kv',
     );
+  } catch {
+    return false;
+  }
+}
+
+/** Whether Martin catalog lists the unpromoted gap layer (Both compare mode). */
+export async function probeUnpromotedGapAvailable(
+  martinUrl: string = MARTIN_URL,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${martinUrl}/catalog`, { signal });
+    if (!res.ok) return false;
+    const catalog = (await res.json()) as Array<{ id?: string }>;
+    return catalog.some((entry) => entry.id === 'map_unpromoted_conductor_segments');
   } catch {
     return false;
   }

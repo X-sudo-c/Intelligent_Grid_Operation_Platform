@@ -57,6 +57,7 @@ from integrations.sap.sync_customers import (
 from graph_sync import apply_webhook_event, graph_parity_report, reconcile_memgraph
 from redis_cache import (
     GRAPH_CHUNK_CACHE_TTL_SEC,
+    MAP_SEARCH_CACHE_TTL_SEC,
     OPS_CACHE_TTL_SEC,
     TOPOLOGY_SNAPSHOT_CACHE_TTL_SEC,
     REFERENCE_LAYERS_CACHE_TTL_SEC,
@@ -95,6 +96,7 @@ from redis_cache import (
     invalidate_topology_cache,
     lock,
     map_nodes_key,
+    map_search_key,
     nav_badges_key,
     node_connections_key,
     repair_lock_key,
@@ -155,10 +157,39 @@ from gis_import import (
     GIS_IMPORT_SUMMARY_CACHE_TTL_SEC,
     UNPROMOTED_REASONS,
     endpoint_diagnostics_summary,
+    infer_conductor_endpoint_ids_tier_a,
     list_unpromoted_segments,
     snap_conductor_endpoints,
     unpromoted_segment_geojson,
     unpromoted_segments_summary,
+)
+from geometry_cleanup import (
+    execute_geom_cleanup_proposal,
+    preview_geom_snap_candidate,
+    propose_district_geom_cleanup,
+    scan_district_geom_cleanup,
+)
+from endpoint_proposals import (
+    apply_endpoint_fix_proposals,
+    bulk_review_endpoint_fix_proposals,
+    endpoint_fix_proposal_summary,
+    generate_endpoint_fix_proposals,
+    list_endpoint_fix_proposals,
+    review_endpoint_fix_proposals,
+)
+from endpoint_proposals_ai import (
+    AI_SCAN_DEFAULT_LIMIT,
+    AI_SCAN_MAX_LIMIT,
+    ai_scan_endpoint_fix_proposals,
+    get_endpoint_fix_ai_scan,
+    get_latest_endpoint_fix_ai_scan,
+)
+from endpoint_fix_ai_runs import (
+    EndpointFixAiRunInProgressError,
+    DEFAULT_DISTRICT_BATCH_SIZE,
+    create_endpoint_fix_ai_run,
+    find_active_endpoint_fix_ai_run,
+    get_endpoint_fix_ai_run,
 )
 from map_nodes import fetch_nodes_near_location
 import h3_index as h3x
@@ -3163,12 +3194,17 @@ async def api_map_search(
             raise HTTPException(status_code=400, detail=f"Invalid kind: {', '.join(sorted(invalid))}")
         kinds = parsed or None
     try:
-        conn = pooled_connect(SUPABASE_DB_URI)
-        try:
-            results = search_map(conn, query=q, limit=limit, kinds=kinds)
-        finally:
-            conn.close()
-        return {"query": q, "results": results}
+        kind_tag = ",".join(sorted(kinds)) if kinds else None
+        cache_key = map_search_key(q, limit, kind_tag)
+
+        def _fetch():
+            conn = pooled_connect(SUPABASE_DB_URI)
+            try:
+                return {"query": q, "results": search_map(conn, query=q, limit=limit, kinds=kinds)}
+            finally:
+                conn.close()
+
+        return cached_json(cache_key, _fetch, ttl_sec=MAP_SEARCH_CACHE_TTL_SEC)
     except HTTPException:
         raise
     except Exception as exc:
@@ -3976,6 +4012,517 @@ async def post_gis_snap_conductors(payload: GisSnapConductorsPayload | None = No
         conn.close()
 
 
+class GisInferEndpointsPayload(BaseModel):
+    tolerance_m: float = Field(default=5.0, ge=0.01, le=50.0)
+    district: str | None = None
+
+
+@app.post("/api/v1/gis/infer-endpoint-ids")
+async def post_gis_infer_endpoint_ids(payload: GisInferEndpointsPayload | None = None):
+    """Tier A: infer conductor endpoint text IDs from nearest pole geometry."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    body = payload or GisInferEndpointsPayload()
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return infer_conductor_endpoint_ids_tier_a(
+            conn,
+            tolerance_m=body.tolerance_m,
+            district=body.district,
+        )
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/gis/geom-cleanup/preview/{segment_id}")
+async def get_gis_geom_cleanup_preview(
+    segment_id: int,
+    tolerance_m: float = Query(default=5.0, ge=0.01, le=50.0),
+    assisted_m: float = Query(default=15.0, ge=0.01, le=100.0),
+):
+    """Preview nearest-pole geometry cleanup for one unpromoted GIS segment."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return preview_geom_snap_candidate(
+            conn,
+            segment_id,
+            tolerance_m=tolerance_m,
+            assisted_m=assisted_m,
+        )
+    except ValueError as exc:
+        code = str(exc)
+        if code == "segment_not_found":
+            raise HTTPException(status_code=404, detail=code) from exc
+        raise HTTPException(status_code=400, detail=code) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/gis/geom-cleanup/scan")
+async def get_gis_geom_cleanup_scan(
+    district: str = Query(..., min_length=1),
+    tolerance_m: float = Query(default=5.0, ge=0.01, le=50.0),
+    assisted_m: float = Query(default=15.0, ge=0.01, le=100.0),
+    sample_limit: int = Query(default=5, ge=0, le=20),
+):
+    """Classify unpromoted GIS segments in a district by geometry-distance cleanup tier."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return scan_district_geom_cleanup(
+            conn,
+            district,
+            tolerance_m=tolerance_m,
+            assisted_m=assisted_m,
+            sample_limit=sample_limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+class GisGeomCleanupProposePayload(BaseModel):
+    district: str
+    tolerance_m: float = Field(default=5.0, ge=0.01, le=50.0)
+    assisted_m: float = Field(default=15.0, ge=0.01, le=100.0)
+    operator_id: str | None = None
+
+
+@app.post("/api/v1/gis/geom-cleanup/propose")
+async def post_gis_geom_cleanup_propose(payload: GisGeomCleanupProposePayload):
+    """Scan a district and queue an approval-gated geometry cleanup plan (no writes)."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return propose_district_geom_cleanup(
+            conn,
+            payload.district,
+            tolerance_m=payload.tolerance_m,
+            assisted_m=payload.assisted_m,
+            operator_id=payload.operator_id,
+        )
+    except ValueError as exc:
+        code = str(exc)
+        status = 404 if code == "no_tier_a_candidates" else 400
+        raise HTTPException(status_code=status, detail=code) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+class GisGeomCleanupExecutePayload(BaseModel):
+    operator_id: str | None = None
+    force: bool = False
+
+
+@app.post("/api/v1/gis/geom-cleanup/{cleanup_id}/execute")
+async def post_gis_geom_cleanup_execute(
+    cleanup_id: str,
+    payload: GisGeomCleanupExecutePayload | None = None,
+):
+    """Run approved district geometry cleanup: infer → snap → district promote."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    body = payload or GisGeomCleanupExecutePayload()
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return execute_geom_cleanup_proposal(
+            conn,
+            cleanup_id,
+            operator_id=body.operator_id,
+            force=body.force,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+class GisEndpointFixGeneratePayload(BaseModel):
+    district: str
+    data_tier: Literal["gis", "staging"] = "gis"
+    tolerance_m: float = Field(default=5.0, ge=0.01, le=50.0)
+    assisted_m: float = Field(default=15.0, ge=0.01, le=100.0)
+    limit: int = Field(default=5000, ge=1, le=50000)
+    include_tier_b: bool = True
+    replace_pending: bool = False
+
+
+@app.post("/api/v1/gis/endpoint-fix-proposals/generate")
+async def post_gis_endpoint_fix_proposals_generate(payload: GisEndpointFixGeneratePayload):
+    """Scan unpromoted GIS segments and queue geometry-based from/to ID proposals (no writes)."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return generate_endpoint_fix_proposals(
+            conn,
+            payload.district,
+            data_tier=payload.data_tier,
+            tolerance_m=payload.tolerance_m,
+            assisted_m=payload.assisted_m,
+            limit=payload.limit,
+            include_tier_b=payload.include_tier_b,
+            replace_pending=payload.replace_pending,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/gis/endpoint-fix-proposals/summary")
+async def get_gis_endpoint_fix_proposals_summary(
+    district: str | None = Query(default=None),
+    data_tier: Literal["gis", "staging"] = Query(default="gis"),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return endpoint_fix_proposal_summary(conn, district, data_tier=data_tier)
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/gis/endpoint-fix-proposals")
+async def get_gis_endpoint_fix_proposals(
+    district: str | None = Query(default=None),
+    data_tier: Literal["gis", "staging"] = Query(default="gis"),
+    status: str | None = Query(default="pending"),
+    tier: str | None = Query(default=None),
+    batch_id: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return list_endpoint_fix_proposals(
+            conn,
+            data_tier=data_tier,
+            district=district,
+            status=status,
+            tier=tier,
+            batch_id=batch_id,
+            limit=limit,
+            offset=offset,
+        )
+    finally:
+        conn.close()
+
+
+class GisEndpointFixReviewPayload(BaseModel):
+    proposal_ids: list[str]
+    status: Literal["approved", "rejected"]
+    data_tier: Literal["gis", "staging"] = "gis"
+    reviewed_by: str | None = None
+
+
+@app.post("/api/v1/gis/endpoint-fix-proposals/review")
+async def post_gis_endpoint_fix_proposals_review(payload: GisEndpointFixReviewPayload):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return review_endpoint_fix_proposals(
+            conn,
+            payload.proposal_ids,
+            data_tier=payload.data_tier,
+            status=payload.status,
+            reviewed_by=payload.reviewed_by,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+class GisEndpointFixApplyPayload(BaseModel):
+    proposal_ids: list[str] | None = None
+    district: str | None = None
+    data_tier: Literal["gis", "staging"] = "gis"
+    operator_id: str | None = None
+
+
+@app.post("/api/v1/gis/endpoint-fix-proposals/apply")
+async def post_gis_endpoint_fix_proposals_apply(payload: GisEndpointFixApplyPayload | None = None):
+    """Apply approved proposals — writes originating_node_id / end_node_id on conductor_segments."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    body = payload or GisEndpointFixApplyPayload()
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return apply_endpoint_fix_proposals(
+            conn,
+            data_tier=body.data_tier,
+            proposal_ids=body.proposal_ids,
+            district=body.district,
+            operator_id=body.operator_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+class GisEndpointFixAiScanPayload(BaseModel):
+    district: str
+    data_tier: Literal["gis", "staging"] = "gis"
+    batch_id: str | None = None
+    limit: int = Field(default=AI_SCAN_DEFAULT_LIMIT, ge=1, le=AI_SCAN_MAX_LIMIT)
+    offset: int = Field(default=0, ge=0)
+    unscanned_only: bool = False
+    mode: Literal["agent", "batch", "tiered"] = "tiered"
+    reasoning_depth: Literal["quick", "deep"] = "quick"
+
+
+class GisEndpointFixDistrictAiScanPayload(BaseModel):
+    district: str
+    data_tier: Literal["gis", "staging"] = "gis"
+    batch_size: int = Field(default=DEFAULT_DISTRICT_BATCH_SIZE, ge=10, le=AI_SCAN_MAX_LIMIT)
+    reasoning_depth: Literal["quick", "deep"] = "quick"
+    requested_by: str | None = None
+
+
+class GisEndpointFixBulkReviewPayload(BaseModel):
+    district: str
+    data_tier: Literal["gis", "staging"] = "gis"
+    filter: Literal["tier_a", "ai_high", "ai_agrees"]
+    reviewed_by: str | None = None
+
+
+@app.post("/api/v1/gis/endpoint-fix-proposals/ai-scan")
+async def post_gis_endpoint_fix_proposals_ai_scan(payload: GisEndpointFixAiScanPayload):
+    """Run cleanup LLM steward review over pending endpoint proposals; stores thoughts + rationale."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return ai_scan_endpoint_fix_proposals(
+            conn,
+            payload.district,
+            data_tier=payload.data_tier,
+            batch_id=payload.batch_id,
+            limit=payload.limit,
+            offset=payload.offset,
+            unscanned_only=payload.unscanned_only,
+            mode=payload.mode,
+            reasoning_depth=payload.reasoning_depth,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        code = 400
+        if detail == "no_pending_proposals":
+            code = 404
+        raise HTTPException(status_code=code, detail=detail) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/gis/endpoint-fix-proposals/ai-scan/district")
+async def post_gis_endpoint_fix_district_ai_scan(
+    payload: GisEndpointFixDistrictAiScanPayload,
+    background_tasks: BackgroundTasks,
+):
+    """Queue district-wide AI scan — processes unscanned pending rows in batches via pgmq."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    from pgmq_worker import PGMQ_CONSUMER_ENABLED, fan_out_endpoint_fix_ai_jobs
+    from endpoint_fix_ai_runs import execute_endpoint_fix_ai_batch, SWARM_MAX_INFLIGHT
+
+    conn = pooled_connect(SUPABASE_DB_URI)
+    run_id: str | None = None
+    try:
+        run = create_endpoint_fix_ai_run(
+            conn,
+            payload.district,
+            data_tier=payload.data_tier,
+            batch_size=payload.batch_size,
+            reasoning_depth=payload.reasoning_depth,
+            requested_by=payload.requested_by,
+        )
+        run_id = run["id"]
+        use_background = False
+        if PGMQ_CONSUMER_ENABLED:
+            try:
+                workers = int(run.get("swarm_workers") or SWARM_MAX_INFLIGHT)
+                fan_out_endpoint_fix_ai_jobs(conn, run_id, workers)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "pgmq fan-out failed for endpoint AI scan — in-process fallback",
+                    exc_info=True,
+                )
+                use_background = True
+        else:
+            use_background = True
+        conn.commit()
+
+        if use_background:
+            workers = int(run.get("swarm_workers") or SWARM_MAX_INFLIGHT)
+
+            def _swarm_worker() -> None:
+                if not run_id:
+                    return
+                bg = pooled_connect(SUPABASE_DB_URI)
+                try:
+                    while True:
+                        result = execute_endpoint_fix_ai_batch(bg, run_id, requeue_pgmq=False)
+                        if result.get("status") != "running":
+                            break
+                        if not result.get("requeue"):
+                            remaining = int(result.get("remaining_unscanned") or 0)
+                            if remaining == 0:
+                                break
+                            if int(result.get("rows_reviewed") or 0) == 0:
+                                break
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Endpoint AI district scan %s failed", run_id
+                    )
+                finally:
+                    bg.close()
+
+            def _run_swarm() -> None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [pool.submit(_swarm_worker) for _ in range(workers)]
+                    for future in futures:
+                        future.result()
+
+            background_tasks.add_task(_run_swarm)
+        return get_endpoint_fix_ai_run(conn, run_id) or run
+    except EndpointFixAiRunInProgressError as exc:
+        conn.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "ai_scan_in_progress", "run_id": exc.run_id},
+        ) from exc
+    except ValueError as exc:
+        detail = str(exc)
+        code = 400
+        if detail in ("no_unscanned_proposals", "llm_not_configured"):
+            code = 404 if detail == "no_unscanned_proposals" else 503
+        raise HTTPException(status_code=code, detail=detail) from exc
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/gis/endpoint-fix-proposals/ai-scan/runs/active")
+async def get_gis_endpoint_fix_active_ai_run(
+    district: str = Query(..., min_length=1),
+    data_tier: Literal["gis", "staging"] = Query(default="gis"),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        run = find_active_endpoint_fix_ai_run(conn, district, data_tier=data_tier)
+        if not run:
+            raise HTTPException(status_code=404, detail="no_active_run")
+        return get_endpoint_fix_ai_run(conn, run["id"])
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/gis/endpoint-fix-proposals/ai-scan/runs/{run_id}")
+async def get_gis_endpoint_fix_ai_run(run_id: str):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        run = get_endpoint_fix_ai_run(conn, run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="run_not_found")
+        return run
+    finally:
+        conn.close()
+
+
+@app.post("/api/v1/gis/endpoint-fix-proposals/review/bulk")
+async def post_gis_endpoint_fix_bulk_review(payload: GisEndpointFixBulkReviewPayload):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return bulk_review_endpoint_fix_proposals(
+            conn,
+            payload.district,
+            data_tier=payload.data_tier,
+            filter=payload.filter,
+            reviewed_by=payload.reviewed_by,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/gis/endpoint-fix-proposals/ai-scans/latest")
+async def get_gis_endpoint_fix_proposals_ai_scan_latest(
+    district: str = Query(..., min_length=1),
+    data_tier: Literal["gis", "staging"] = Query(default="gis"),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        scan = get_latest_endpoint_fix_ai_scan(conn, district, data_tier=data_tier)
+        if not scan:
+            raise HTTPException(status_code=404, detail="no_ai_scan")
+        return scan
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/gis/endpoint-fix-proposals/ai-scans/{scan_id}")
+async def get_gis_endpoint_fix_proposals_ai_scan(scan_id: str):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        scan = get_endpoint_fix_ai_scan(conn, scan_id)
+        if not scan:
+            raise HTTPException(status_code=404, detail="scan_not_found")
+        return scan
+    finally:
+        conn.close()
+
+
 class DqReleasePayload(BaseModel):
     operator_id: str | None = None
     run_checks: bool = True
@@ -4117,11 +4664,20 @@ async def get_validation_run_progress(run_id: str):
 
 @app.get("/api/v1/agents/status")
 async def get_agents_status(probe: bool = Query(default=False)):
-    from agents.llm.provider import llm_base_url, llm_configured, llm_health, llm_model
+    from agents.llm.provider import (
+        cleanup_llm_configured,
+        cleanup_llm_uses_distinct_provider,
+        get_llm_profile,
+        llm_base_url,
+        llm_configured,
+        llm_health,
+        llm_model,
+    )
     from agents.llm.react import tool_names
 
     configured = llm_configured()
     model = llm_model()
+    cleanup_cfg = get_llm_profile("cleanup")
     tools = tool_names()
     payload: dict[str, Any] = {
         "engine": "online" if SUPABASE_DB_URI else "offline",
@@ -4130,6 +4686,10 @@ async def get_agents_status(probe: bool = Query(default=False)):
         "llm_base_url": llm_base_url() if configured else None,
         "llm_tools": tools,
         "llm_tool_count": len(tools),
+        "cleanup_llm_configured": cleanup_llm_configured(),
+        "cleanup_llm_model": cleanup_cfg.model if cleanup_llm_configured() else None,
+        "cleanup_llm_base_url": cleanup_cfg.base_url if cleanup_llm_configured() else None,
+        "cleanup_llm_distinct": cleanup_llm_uses_distinct_provider(),
         "agents": [
             "OrchestratorAgent",
             "ValidatorAgent",
@@ -4144,6 +4704,10 @@ async def get_agents_status(probe: bool = Query(default=False)):
         health = await asyncio.to_thread(llm_health, force=probe)
         payload["llm_reachable"] = bool(health.get("reachable"))
         payload["llm_error"] = health.get("error")
+    if cleanup_llm_configured():
+        cleanup_health = await asyncio.to_thread(llm_health, profile="cleanup", force=probe)
+        payload["cleanup_llm_reachable"] = bool(cleanup_health.get("reachable"))
+        payload["cleanup_llm_error"] = cleanup_health.get("error")
     return payload
 
 
@@ -4258,6 +4822,7 @@ async def portal_ai_chat(payload: PortalAiChatPayload):
 class PortalVoiceTurnPayload(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
     session_id: str | None = Field(default=None, max_length=64)
+    request_id: str | None = Field(default=None, max_length=64)
     exception_id: str | None = None
     mrid: str | None = None
     operator_id: str | None = Field(default=None, max_length=100)
@@ -4450,7 +5015,12 @@ async def portal_voice_audio_turn(
 async def portal_voice_turn(payload: PortalVoiceTurnPayload):
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    from agents.copilot_progress import new_request_id
     from agents.voice import run_voice_turn
+
+    request_id = (payload.request_id or "").strip() or new_request_id()
+    context = dict(payload.context or {})
+    context["copilot_request_id"] = request_id
 
     conn = pooled_connect(SUPABASE_DB_URI)
     try:
@@ -4462,16 +5032,26 @@ async def portal_voice_turn(payload: PortalVoiceTurnPayload):
             exception_id=payload.exception_id,
             mrid=payload.mrid,
             operator_id=payload.operator_id,
-            context=payload.context,
+            context=context,
             fast_only=payload.fast_only,
         )
         conn.commit()
-        return result.model_dump()
+        dumped = result.model_dump()
+        dumped.setdefault("agent", {})
+        dumped["agent"]["request_id"] = request_id
+        return dumped
     except Exception as exc:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         conn.close()
+
+
+@app.get("/api/v1/portal/ai/copilot-progress")
+async def portal_copilot_progress(request_id: str = Query(min_length=8, max_length=64)):
+    from agents.copilot_progress import get_progress
+
+    return {"request_id": request_id, "steps": get_progress(request_id)}
 
 
 @app.post("/api/v1/portal/ai/speak")
@@ -4601,6 +5181,78 @@ async def get_spatial_inventory(
             conn,
             tier=tier,
             asset_kind=asset_kind,
+            district=district,
+            region=region,
+            bbox=bbox,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/spatial/assets")
+async def get_spatial_assets(
+    tier: str = Query(default="master"),
+    asset_kind: str | None = Query(default=None),
+    district: str | None = Query(default=None),
+    region: str | None = Query(default=None),
+    west: float | None = Query(default=None),
+    south: float | None = Query(default=None),
+    east: float | None = Query(default=None),
+    north: float | None = Query(default=None),
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    include_geom: bool = Query(default=False),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    from agents import spatial
+
+    bbox = None
+    if None not in (west, south, east, north):
+        bbox = {"west": west, "south": south, "east": east, "north": north}
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return spatial.list_assets_in_territory(
+            conn,
+            tier=tier,
+            asset_kind=asset_kind,
+            district=district,
+            region=region,
+            bbox=bbox,
+            limit=limit,
+            offset=offset,
+            include_geom=include_geom,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/spatial/network-summary")
+async def get_spatial_network_summary(
+    tier: str = Query(default="master"),
+    district: str | None = Query(default=None),
+    region: str | None = Query(default=None),
+    west: float | None = Query(default=None),
+    south: float | None = Query(default=None),
+    east: float | None = Query(default=None),
+    north: float | None = Query(default=None),
+):
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    from agents import spatial
+
+    bbox = None
+    if None not in (west, south, east, north):
+        bbox = {"west": west, "south": south, "east": east, "north": north}
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return spatial.territory_network_summary(
+            conn,
+            tier=tier,
             district=district,
             region=region,
             bbox=bbox,

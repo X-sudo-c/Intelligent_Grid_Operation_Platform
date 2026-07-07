@@ -253,16 +253,6 @@ export function GiopMapSearchBar({
     setActiveIndex(results.length > 0 ? 0 : -1);
   }, [results]);
 
-  useEffect(() => {
-    const onDocClick = (event: MouseEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', onDocClick);
-    return () => document.removeEventListener('mousedown', onDocClick);
-  }, []);
-
   const pickResult = useCallback(
     (result: GiopMapSearchResult) => {
       const displayQuery = result.title.trim();
@@ -276,6 +266,24 @@ export function GiopMapSearchBar({
     },
     [filter, onSelect],
   );
+
+  const confirmSearch = useCallback(() => {
+    const index = activeIndex >= 0 ? activeIndex : 0;
+    const target = results[index] ?? results[0];
+    if (target) {
+      pickResult(target);
+    }
+  }, [activeIndex, pickResult, results]);
+
+  useEffect(() => {
+    const onDocPointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('pointerdown', onDocPointerDown);
+    return () => document.removeEventListener('pointerdown', onDocPointerDown);
+  }, []);
 
   const onKeyDown = useCallback(
     (event: KeyboardEvent<HTMLInputElement>) => {
@@ -294,11 +302,7 @@ export function GiopMapSearchBar({
       }
       if (event.key === 'Enter') {
         event.preventDefault();
-        if (activeIndex >= 0 && results[activeIndex]) {
-          pickResult(results[activeIndex]);
-        } else if (results[0]) {
-          pickResult(results[0]);
-        }
+        confirmSearch();
         return;
       }
       if (event.key === 'Escape') {
@@ -310,7 +314,7 @@ export function GiopMapSearchBar({
         inputRef.current?.blur();
       }
     },
-    [activeIndex, open, onPreview, pickResult, results],
+    [confirmSearch, open, onPreview],
   );
 
   const showPanel = open && query.trim().length >= 1;
@@ -327,7 +331,22 @@ export function GiopMapSearchBar({
       role="search"
     >
       <div className="giop-map-spotlight__bar">
-        <Search className="giop-map-spotlight__search-icon" aria-hidden />
+        <button
+          type="button"
+          className="giop-map-spotlight__search-icon-btn"
+          aria-label="Search"
+          title="Search"
+          onClick={() => {
+            setOpen(true);
+            if (query.trim() && results.length > 0) {
+              confirmSearch();
+            } else {
+              inputRef.current?.focus();
+            }
+          }}
+        >
+          <Search className="giop-map-spotlight__search-icon" aria-hidden />
+        </button>
         <input
           ref={inputRef}
           type="text"
@@ -367,7 +386,13 @@ export function GiopMapSearchBar({
               title={title}
               aria-label={title}
               aria-pressed={active}
-              onClick={() => setSearchFilter(id)}
+              onClick={() => {
+                if (query.trim() && results.length > 0) {
+                  confirmSearch();
+                  return;
+                }
+                setSearchFilter(id);
+              }}
               className={`giop-map-spotlight__filter-btn${active ? ' giop-map-spotlight__filter-btn--active' : ''}`}
             >
               <Icon className="h-4 w-4" aria-hidden />
@@ -434,6 +459,9 @@ export function GiopMapSearchBar({
               className={`giop-map-spotlight__result${
                 index === activeIndex ? ' giop-map-spotlight__result--active' : ''
               }`}
+              onMouseDown={(event) => {
+                event.preventDefault();
+              }}
               onMouseEnter={() => {
                 confirmedRef.current = null;
                 setActiveIndex(index);

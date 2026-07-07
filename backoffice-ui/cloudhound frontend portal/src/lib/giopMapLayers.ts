@@ -280,6 +280,7 @@ export function martinLayerPath(sourceId: string): string {
 export const MARTIN_MASTER_REFRESH_SOURCE_IDS = [
   'map_connectivity_nodes',
   'map_ac_line_segments',
+  'map_unpromoted_conductor_segments',
   'map_power_transformers',
   H3_REBUILD_COVERAGE_SOURCE,
 ] as const;
@@ -341,6 +342,22 @@ export const MASTER_NETWORK_TRANSFORMER_LAYER_IDS = [
   'master-transformers-pt',
 ] as const;
 
+/** GIS import geometry color (GPKG overview + compare gaps). */
+export const GIS_IMPORT_MAGENTA = '#c026d3';
+
+/** GIS segments not yet in master — compare-mode gap layer. */
+export const UNPROMOTED_GIS_GAP_LAYER_ID = 'unpromoted-gis-lines' as const;
+
+export const UNPROMOTED_GIS_GAP_LAYER_IDS = [UNPROMOTED_GIS_GAP_LAYER_ID] as const;
+
+/** @deprecated Use GIS_IMPORT_MAGENTA — kept for import-queue highlight styling. */
+export const UNPROMOTED_GIS_GAP_CYAN_LIGHT = '#06b6d4';
+/** @deprecated Use GIS_IMPORT_MAGENTA */
+export const UNPROMOTED_GIS_GAP_CYAN_DARK = '#22d3ee';
+
+/** Same zoom as master detail lines. */
+export const UNPROMOTED_GIS_GAP_MIN_ZOOM = DETAIL_LINE_MIN_ZOOM;
+
 /** Detail transformer symbol layers for click/hover (GIS + master). */
 export const TRANSFORMER_SYMBOL_LAYER_IDS = [
   'nodes-transformers-dt',
@@ -359,7 +376,7 @@ export function readNetworkGeometryMode(): NetworkGeometryMode {
   } catch {
     /* ignore */
   }
-  return 'both';
+  return 'master';
 }
 
 export function writeNetworkGeometryMode(mode: NetworkGeometryMode): void {
@@ -376,23 +393,29 @@ export const NETWORK_GEOMETRY_MODE_META: Record<
 > = {
   gis: {
     label: 'GIS import',
-    hint: 'Raw GPKG geometry — all imported lines, including unpromoted',
-    swatch: '#c026d3',
+    hint: 'Full GPKG geometry in magenta — raw GIS topology',
+    swatch: GIS_IMPORT_MAGENTA,
   },
   master: {
     label: 'Master network',
-    hint: 'Promoted lines only — trusted topology for operations',
+    hint: 'Promoted CIM lines only — trusted operational topology',
     swatch: '#b91c1c',
   },
   both: {
-    label: 'Both (compare)',
-    hint: 'Magenta = GIS import · SLD colors = master — visible together at street zoom',
-    swatch: '#64748b',
+    label: 'Gaps (compare)',
+    hint: 'Master SLD underneath · dashed magenta = GIS not promoted in this view',
+    swatch: GIS_IMPORT_MAGENTA,
   },
 };
 
-/** Extend GIS overview layers to this zoom when comparing (map tab default is z13). */
+/** Extend GIS overview / compare gap layers through street zoom (map tab default is z13). */
 export const GIS_COMPARE_MAX_ZOOM = 16;
+
+/** Martin vector tile max zoom — MapLibre overzooms sources above this. */
+export const MARTIN_VECTOR_SOURCE_MAX_ZOOM = GIS_COMPARE_MAX_ZOOM;
+
+/** Layer maxzoom ceiling (exclusive); 24 = visible through map maxZoom 20. */
+export const GIOP_VECTOR_LAYER_MAX_ZOOM = 24;
 
 const GIS_OVERVIEW_LINE_STYLE: Record<
   string,
@@ -427,14 +450,14 @@ function applyGisOverviewLinePaint(
     return;
   }
 
-  const opacity = compare === 'both' ? 0.58 : 0.9;
-  map.setPaintProperty(layerId, 'line-color', '#c026d3');
-  map.setPaintProperty(
-    layerId,
-    'line-width',
-    ['interpolate', ['linear'], ['zoom'], 11, 2.2, 14, 3.2, 18, 4.5],
-  );
-  map.setPaintProperty(layerId, 'line-opacity', opacity);
+  const importPaint = gisImportLinePaint();
+  const basePaint = style.underground
+    ? overviewUgLinePaint(style.color)
+    : overviewLinePaint(style.color);
+  map.setPaintProperty(layerId, 'line-color', importPaint['line-color']);
+  // Match SLD overview stroke — same weight as master country/mid zoom, not thick magenta.
+  map.setPaintProperty(layerId, 'line-width', basePaint['line-width']);
+  map.setPaintProperty(layerId, 'line-opacity', basePaint['line-opacity']);
   if (style.underground) {
     map.setPaintProperty(layerId, 'line-dasharray', [2, 1.5]);
   } else {
@@ -447,8 +470,8 @@ function applyGisOverviewZoomRange(
   mode: NetworkGeometryMode,
   gisOk: boolean,
 ): void {
-  const extend = gisOk && (mode === 'gis' || mode === 'both');
-  const maxZoom = extend ? GIS_COMPARE_MAX_ZOOM : NODE_DETAIL_ZOOM;
+  const extend = gisOk && mode === 'gis';
+  const maxZoom = extend ? GIOP_VECTOR_LAYER_MAX_ZOOM : NODE_DETAIL_ZOOM;
   for (const layerId of GIS_IMPORT_GEOMETRY_LAYER_IDS) {
     if (!map.getLayer(layerId)) continue;
     const spec = GIS_OVERVIEW_LINE_STYLE[layerId];
@@ -457,18 +480,44 @@ function applyGisOverviewZoomRange(
   }
 }
 
+function applyUnpromotedGapZoomRange(map: MaplibreMap, mode: NetworkGeometryMode): void {
+  if (!map.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID)) return;
+  const maxZoom = mode === 'both' ? GIOP_VECTOR_LAYER_MAX_ZOOM : NODE_DETAIL_ZOOM;
+  map.setLayerZoomRange(UNPROMOTED_GIS_GAP_LAYER_ID, UNPROMOTED_GIS_GAP_MIN_ZOOM, maxZoom);
+}
+
+/** Magenta GIS import lines (full GPKG overview). */
+export function gisImportLinePaint() {
+  return {
+    'line-color': GIS_IMPORT_MAGENTA,
+    'line-width': TILE_LINE_WIDTH,
+    'line-opacity': TILE_LINE_OPACITY,
+  } as const;
+}
+
+/** Compare-mode gaps only — dashed magenta, same weight as master. */
+export function unpromotedGapLinePaint(_light: boolean) {
+  return {
+    ...gisImportLinePaint(),
+    'line-dasharray': [2.5, 1.5] as [number, number],
+  } as const;
+}
+
+function isCountryScaleZoom(zoom: number): boolean {
+  return zoom < DETAIL_LINE_MIN_ZOOM;
+}
+
 function applyNetworkGeometryModeOverride(
   map: MaplibreMap,
   mode: NetworkGeometryMode,
   options?: { gisOverviewAvailable?: boolean },
 ): void {
   const gisOk = options?.gisOverviewAvailable !== false;
-  const showGis = gisOk && (mode === 'gis' || mode === 'both');
-  const showMaster = mode === 'master' || mode === 'both';
-  const comparePaint: 'gis' | 'both' | 'default' =
-    mode === 'gis' ? 'gis' : mode === 'both' ? 'both' : 'default';
+  const showFullGis = gisOk && mode === 'gis';
+  const countryScale = isCountryScaleZoom(map.getZoom());
 
   applyGisOverviewZoomRange(map, mode, gisOk);
+  applyUnpromotedGapZoomRange(map, mode);
 
   for (const layerId of GIS_IMPORT_GEOMETRY_LAYER_IDS) {
     const spec = GIS_OVERVIEW_LINE_STYLE[layerId];
@@ -477,10 +526,12 @@ function applyNetworkGeometryModeOverride(
         map,
         layerId,
         spec,
-        showGis ? comparePaint : 'default',
+        showFullGis ? 'gis' : 'default',
       );
     }
   }
+
+  setGiopLayerVisibility(map, UNPROMOTED_GIS_GAP_LAYER_ID, false);
 
   if (mode === 'gis' && gisOk) {
     for (const layerId of GIS_IMPORT_GEOMETRY_LAYER_IDS) {
@@ -496,35 +547,63 @@ function applyNetworkGeometryModeOverride(
     for (const layerId of MASTER_NETWORK_TRANSFORMER_LAYER_IDS) {
       setGiopLayerVisibility(map, layerId, false);
     }
+    // Master connectivity nodes do not align with raw GIS geometry.
+    setGiopLayerVisibility(map, 'nodes', false);
+    setGiopLayerVisibility(map, UNPROMOTED_GIS_GAP_LAYER_ID, false);
     return;
   }
 
   if (mode === 'master') {
-    for (const layerId of GIS_IMPORT_GEOMETRY_LAYER_IDS) {
-      setGiopLayerVisibility(map, layerId, false);
+    if (!countryScale) {
+      for (const layerId of GIS_IMPORT_GEOMETRY_LAYER_IDS) {
+        setGiopLayerVisibility(map, layerId, false);
+      }
+      for (const layerId of GIS_TRANSFORMER_LAYER_IDS) {
+        setGiopLayerVisibility(map, layerId, false);
+      }
     }
-    for (const layerId of GIS_TRANSFORMER_LAYER_IDS) {
-      setGiopLayerVisibility(map, layerId, false);
-    }
+    setGiopLayerVisibility(map, UNPROMOTED_GIS_GAP_LAYER_ID, false);
     return;
   }
 
-  if (!showGis) {
-    for (const layerId of GIS_IMPORT_GEOMETRY_LAYER_IDS) {
-      setGiopLayerVisibility(map, layerId, false);
+  if (mode === 'both') {
+    if (!countryScale) {
+      for (const layerId of GIS_IMPORT_GEOMETRY_LAYER_IDS) {
+        setGiopLayerVisibility(map, layerId, false);
+      }
+      for (const layerId of GIS_TRANSFORMER_LAYER_IDS) {
+        setGiopLayerVisibility(map, layerId, false);
+      }
+      setGiopLayerVisibility(
+        map,
+        UNPROMOTED_GIS_GAP_LAYER_ID,
+        Boolean(map.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID)),
+      );
     }
-    for (const layerId of GIS_TRANSFORMER_LAYER_IDS) {
-      setGiopLayerVisibility(map, layerId, false);
+    return;
+  }
+}
+
+/** Attach optional gap tiles and apply master/gis/both visibility rules. */
+export function syncNetworkGeometryModeOnMap(
+  map: MaplibreMap,
+  mode: NetworkGeometryMode,
+  options?: { gisOverviewAvailable?: boolean; light?: boolean; martinUrl?: string },
+): void {
+  const gisOk = options?.gisOverviewAvailable !== false;
+  const countryScale = isCountryScaleZoom(map.getZoom());
+
+  if (options?.martinUrl && gisOk) {
+    if (mode === 'gis' || countryScale) {
+      ensureGisOverviewOnMap(map, options.martinUrl, options.light ?? true);
+    }
+    if (mode === 'both' && !countryScale) {
+      ensureUnpromotedGapOnMap(map, options.martinUrl, options.light ?? true);
     }
   }
-  if (!showMaster) {
-    for (const layerId of MASTER_NETWORK_LINE_LAYER_IDS) {
-      setGiopLayerVisibility(map, layerId, false);
-    }
-    for (const layerId of MASTER_NETWORK_TRANSFORMER_LAYER_IDS) {
-      setGiopLayerVisibility(map, layerId, false);
-    }
-  }
+  applyNetworkGeometryModeOverride(map, mode, {
+    gisOverviewAvailable: options?.gisOverviewAvailable,
+  });
 }
 
 export function overviewLinePaint(color: string) {
@@ -559,6 +638,114 @@ const LV_VOLTAGE_FILTER: ['in', ['get', string], ['literal', string[]]] = [
   ['literal', ['LV_230V', 'LV_400V']],
 ];
 
+const TILE_LINE_WIDTH: NonNullable<LineLayerSpecification['paint']>['line-width'] = [
+  'interpolate',
+  ['linear'],
+  ['zoom'],
+  11,
+  [
+    'match',
+    ['get', 'nominal_voltage'],
+    'HV_161KV',
+    2.2,
+    'HV_330KV',
+    2.2,
+    'MV_33KV',
+    1.4,
+    'MV_11KV',
+    1.1,
+    0.9,
+  ],
+  12,
+  [
+    'match',
+    ['get', 'nominal_voltage'],
+    'HV_161KV',
+    2.8,
+    'HV_330KV',
+    2.8,
+    'MV_33KV',
+    1.8,
+    'MV_11KV',
+    1.4,
+    1.2,
+  ],
+  13,
+  [
+    'match',
+    ['get', 'nominal_voltage'],
+    'HV_161KV',
+    3,
+    'HV_330KV',
+    3,
+    'MV_33KV',
+    1.8,
+    'MV_11KV',
+    1.4,
+    1.2,
+  ],
+  14,
+  [
+    'match',
+    ['get', 'nominal_voltage'],
+    'HV_161KV',
+    2.8,
+    'HV_330KV',
+    2.8,
+    'MV_33KV',
+    1.5,
+    'MV_11KV',
+    1.2,
+    1.1,
+  ],
+  15,
+  [
+    'match',
+    ['get', 'nominal_voltage'],
+    'HV_161KV',
+    2.4,
+    'HV_330KV',
+    2.4,
+    'MV_33KV',
+    1.55,
+    'MV_11KV',
+    1.25,
+    1,
+  ],
+  17,
+  [
+    'match',
+    ['get', 'nominal_voltage'],
+    'HV_161KV',
+    2.1,
+    'HV_330KV',
+    2.1,
+    'MV_33KV',
+    1.35,
+    'MV_11KV',
+    1.1,
+    0.9,
+  ],
+];
+
+const TILE_LINE_OPACITY: NonNullable<LineLayerSpecification['paint']>['line-opacity'] = [
+  'interpolate',
+  ['linear'],
+  ['zoom'],
+  11,
+  0.72,
+  12,
+  0.85,
+  14,
+  0.9,
+  15,
+  0.94,
+  16,
+  0.92,
+  18,
+  0.88,
+];
+
 /** Detail Martin MV/HV lines — LV uses dedicated layers below. */
 export function tileLinePaint(light: boolean): TileLinePaint {
   const fallback = light ? '#64748b' : '#94a3b8';
@@ -576,112 +763,8 @@ export function tileLinePaint(light: boolean): TileLinePaint {
       SLD_MV_11KV,
       fallback,
     ],
-    'line-width': [
-      'interpolate',
-      ['linear'],
-      ['zoom'],
-      11,
-      [
-        'match',
-        ['get', 'nominal_voltage'],
-        'HV_161KV',
-        2.2,
-        'HV_330KV',
-        2.2,
-        'MV_33KV',
-        1.4,
-        'MV_11KV',
-        1.1,
-        0.9,
-      ],
-      12,
-      [
-        'match',
-        ['get', 'nominal_voltage'],
-        'HV_161KV',
-        2.8,
-        'HV_330KV',
-        2.8,
-        'MV_33KV',
-        1.8,
-        'MV_11KV',
-        1.4,
-        1.2,
-      ],
-      13,
-      [
-        'match',
-        ['get', 'nominal_voltage'],
-        'HV_161KV',
-        3,
-        'HV_330KV',
-        3,
-        'MV_33KV',
-        1.8,
-        'MV_11KV',
-        1.4,
-        1.2,
-      ],
-      14,
-      [
-        'match',
-        ['get', 'nominal_voltage'],
-        'HV_161KV',
-        2.8,
-        'HV_330KV',
-        2.8,
-        'MV_33KV',
-        1.5,
-        'MV_11KV',
-        1.2,
-        1.1,
-      ],
-      15,
-      [
-        'match',
-        ['get', 'nominal_voltage'],
-        'HV_161KV',
-        2.4,
-        'HV_330KV',
-        2.4,
-        'MV_33KV',
-        1.55,
-        'MV_11KV',
-        1.25,
-        1,
-      ],
-      17,
-      [
-        'match',
-        ['get', 'nominal_voltage'],
-        'HV_161KV',
-        2.1,
-        'HV_330KV',
-        2.1,
-        'MV_33KV',
-        1.35,
-        'MV_11KV',
-        1.1,
-        0.9,
-      ],
-    ],
-    'line-opacity': [
-      'interpolate',
-      ['linear'],
-      ['zoom'],
-      11,
-      0.72,
-      12,
-      0.85,
-      14,
-      0.9,
-      15,
-      0.94,
-      16,
-      0.92,
-      18,
-      0.88,
-    ],
+    'line-width': TILE_LINE_WIDTH,
+    'line-opacity': TILE_LINE_OPACITY,
   };
 }
 
@@ -1062,6 +1145,12 @@ export function syncGiopMapTheme(map: MaplibreMap, isLightMode: boolean): void {
     applyLvOverheadPaint(layerId);
   }
   applyLvUndergroundPaint('lines-underground-lv');
+  if (map.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID)) {
+    const gapPaint = unpromotedGapLinePaint(isLightMode);
+    for (const key of Object.keys(gapPaint) as Array<keyof typeof gapPaint>) {
+      map.setPaintProperty(UNPROMOTED_GIS_GAP_LAYER_ID, key, gapPaint[key]);
+    }
+  }
   if (map.getLayer('nodes')) {
     const nodePaint = tileNodeCirclePaint(isLightMode);
     map.setPaintProperty('nodes', 'circle-radius', nodePaint['circle-radius']);
@@ -1219,18 +1308,98 @@ function martinVectorSource(
 }
 
 function gisOverviewSourceEntries(martinUrl: string): Record<string, ReturnType<typeof martinVectorSource>> {
+  const maxZoom = MARTIN_VECTOR_SOURCE_MAX_ZOOM;
   return {
-    overview_ug_cable_33kv: martinVectorSource(martinUrl, 'ug_cable_33kv', 10),
-    overview_ug_cable_11kv: martinVectorSource(martinUrl, 'ug_cable_11kv', 10),
-    overview_oh_conductor_33kv: martinVectorSource(martinUrl, 'oh_conductor_33kv', OVERVIEW_OH_33_MIN_ZOOM),
-    overview_oh_conductor_11kv: martinVectorSource(martinUrl, 'oh_conductor_11kv', OVERVIEW_OH_11_MIN_ZOOM),
-    overview_power_transformer: martinVectorSource(martinUrl, 'power_transformer', MIN_MAP_ZOOM),
+    overview_ug_cable_33kv: martinVectorSource(martinUrl, 'ug_cable_33kv', 10, maxZoom),
+    overview_ug_cable_11kv: martinVectorSource(martinUrl, 'ug_cable_11kv', 10, maxZoom),
+    overview_oh_conductor_33kv: martinVectorSource(
+      martinUrl,
+      'oh_conductor_33kv',
+      OVERVIEW_OH_33_MIN_ZOOM,
+      maxZoom,
+    ),
+    overview_oh_conductor_11kv: martinVectorSource(
+      martinUrl,
+      'oh_conductor_11kv',
+      OVERVIEW_OH_11_MIN_ZOOM,
+      maxZoom,
+    ),
+    overview_power_transformer: martinVectorSource(martinUrl, 'power_transformer', MIN_MAP_ZOOM, maxZoom),
     overview_distribution_transformer: martinVectorSource(
       martinUrl,
       'distribution_transformer',
       TRANSFORMER_ICON_MIN_ZOOM,
+      maxZoom,
     ),
   };
+}
+
+/** Whether the cyan GIS gap layer is on the map style. */
+export function unpromotedGapOnMap(map: MaplibreMap): boolean {
+  return Boolean(map.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID));
+}
+
+function unpromotedGapLayerEntry(light: boolean): StyleSpecification['layers'] {
+  return [
+    {
+      id: UNPROMOTED_GIS_GAP_LAYER_ID,
+      type: 'line',
+      source: 'map_unpromoted_conductor_segments',
+      'source-layer': 'map_unpromoted_conductor_segments',
+      minzoom: UNPROMOTED_GIS_GAP_MIN_ZOOM,
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: unpromotedGapLinePaint(light),
+    },
+  ] as StyleSpecification['layers'];
+}
+
+/** Keep dashed gap strokes above master SLD lines (below nodes). */
+function pinUnpromotedGapAboveMasterLines(map: MaplibreMap): void {
+  if (!map.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID)) return;
+  const anchor = map.getLayer('nodes') ? 'nodes' : undefined;
+  if (!anchor) return;
+  try {
+    map.moveLayer(UNPROMOTED_GIS_GAP_LAYER_ID, anchor);
+  } catch {
+    /* style may be mid-update */
+  }
+}
+
+/**
+ * Attach unpromoted-only Martin layer (Both mode). No-ops when anchor layers missing.
+ */
+export function ensureUnpromotedGapOnMap(map: MaplibreMap, martinUrl: string, light: boolean): boolean {
+  if (!map.getLayer('lines-overhead-mv')) return false;
+
+  const sourceId = 'map_unpromoted_conductor_segments';
+  if (!map.getSource(sourceId)) {
+    map.addSource(
+      sourceId,
+      martinVectorSource(
+        martinUrl,
+        'map_unpromoted_conductor_segments',
+        UNPROMOTED_GIS_GAP_MIN_ZOOM,
+        MARTIN_VECTOR_SOURCE_MAX_ZOOM,
+      ),
+    );
+  }
+
+  if (!unpromotedGapOnMap(map)) {
+    for (const layer of unpromotedGapLayerEntry(light)) {
+      if (!map.getLayer(layer.id)) {
+        map.addLayer(layer, 'nodes');
+      }
+    }
+  } else {
+    const gapPaint = unpromotedGapLinePaint(light);
+    for (const key of Object.keys(gapPaint) as Array<keyof typeof gapPaint>) {
+      map.setPaintProperty(UNPROMOTED_GIS_GAP_LAYER_ID, key, gapPaint[key]);
+    }
+  }
+
+  pinUnpromotedGapAboveMasterLines(map);
+  applyUnpromotedGapZoomRange(map, 'both');
+  return unpromotedGapOnMap(map);
 }
 
 function gisOverviewConductorLayerEntries(light: boolean): StyleSpecification['layers'] {
@@ -1682,6 +1851,7 @@ export const GIOP_LAYER_ZOOM_RANGE: Record<string, { min?: number; max?: number 
   'lines-underground-mv': { min: DETAIL_LINE_MIN_ZOOM },
   'lines-overhead-lv': { min: DETAIL_LV_MIN_ZOOM },
   'lines-underground-lv': { min: DETAIL_LV_MIN_ZOOM },
+  [UNPROMOTED_GIS_GAP_LAYER_ID]: { min: UNPROMOTED_GIS_GAP_MIN_ZOOM },
   nodes: { min: 11.5 },
   'nodes-transformers-dt': { min: TRANSFORMER_ICON_MIN_ZOOM },
   'nodes-transformers-pt': { min: TRANSFORMER_ICON_MIN_ZOOM },
@@ -1724,6 +1894,13 @@ export function buildGiopLegendGroups(
   const includeGisOverview = options.includeGisOverview === true;
   const lv = isLightMode ? SLD_LV : '#cbd5e1';
   const groups: GiopLegendGroup[] = [
+    {
+      id: 'gis-unpromoted-gap',
+      label: 'GIS gaps (dashed magenta)',
+      color: GIS_IMPORT_MAGENTA,
+      dashed: true,
+      layerIds: [...UNPROMOTED_GIS_GAP_LAYER_IDS],
+    },
     {
       id: 'hv-overhead',
       label: '161 kV / HV — overhead',
@@ -1878,7 +2055,7 @@ export function applyGiopLegendVisibility(
     gisOverviewAvailable?: boolean;
   },
 ): void {
-  const geometryMode = options?.geometryMode ?? 'both';
+  const geometryMode = options?.geometryMode ?? 'master';
   const mvVoltages = enabledMvVoltages(state);
   const undergroundOn = giopLegendGroupOn(state, 'underground');
 
@@ -1938,4 +2115,12 @@ export function applyGiopLegendVisibility(
   applyNetworkGeometryModeOverride(map, geometryMode, {
     gisOverviewAvailable: options?.gisOverviewAvailable,
   });
+
+  if (geometryMode === 'both' && map.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID)) {
+    setGiopLayerVisibility(
+      map,
+      UNPROMOTED_GIS_GAP_LAYER_ID,
+      giopLegendGroupOn(state, 'gis-unpromoted-gap'),
+    );
+  }
 }

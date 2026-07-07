@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from agents import voice_session, voice_stt, voice_tts
+from agents.copilot_progress import complete_progress, new_request_id, push_progress
 from agents.llm.chat import run_steward_chat
 from agents.models import AgentChatResponse
 from agents.voice_normalize import normalize_transcript
@@ -76,31 +77,41 @@ def run_voice_turn(
     ctx = context or {}
     sid = session_id or voice_session.new_session_id()
     state = voice_session.load(sid)
+    request_id = str(ctx.get("copilot_request_id") or new_request_id())
+    ctx = {**ctx, "copilot_request_id": request_id}
 
     voice_stt.warm_boundary_prompt(conn)
     text, _norm = normalize_transcript(text)
 
+    push_progress(request_id, "Understanding your question")
+
     intent, fast = try_copilot_fast_path(
-        conn, text, context=ctx, session=state, normalize=False
+        conn, text, context=ctx, session=state, normalize=False, request_id=request_id
     )
 
     if fast:
         voice_session.merge(sid, fast.get("session_patch") or {})
+        complete_progress(request_id, "Ready")
+        agent = {
+            "voice": True,
+            "fast_path": True,
+            "session_id": sid,
+            "request_id": request_id,
+            "speak": fast.get("speak") or fast["content"],
+            "tts": voice_tts.status(),
+        }
+        if fast.get("structured"):
+            agent["structured"] = fast["structured"]
         return AgentChatResponse(
             content=fast["content"],
             findings=[f"Voice fast path: {intent.kind if intent else 'unknown'}"],
             actions=["Spoken reply ready"],
             ui_actions=fast.get("ui_actions") or [],
-            agent={
-                "voice": True,
-                "fast_path": True,
-                "session_id": sid,
-                "speak": fast.get("speak") or fast["content"],
-                "tts": voice_tts.status(),
-            },
+            agent=agent,
         )
 
     if fast_only:
+        complete_progress(request_id, "No quick match")
         return AgentChatResponse(
             content="",
             findings=["Fast path miss"],
@@ -111,10 +122,12 @@ def run_voice_turn(
                 "fast_path": False,
                 "fast_only_miss": True,
                 "session_id": sid,
+                "request_id": request_id,
                 "tts": voice_tts.status(),
             },
         )
 
+    push_progress(request_id, "Consulting steward assistant")
     # Slow path — full steward assistant.
     chat = run_steward_chat(
         conn,
@@ -131,10 +144,14 @@ def run_voice_turn(
             "voice": True,
             "fast_path": False,
             "session_id": sid,
+            "request_id": request_id,
             "speak": speak,
             "tts": voice_tts.status(),
         }
     )
+    if chat.agent.get("structured"):
+        agent["structured"] = chat.agent["structured"]
+    complete_progress(request_id, "Ready")
     return AgentChatResponse(
         content=chat.content,
         findings=chat.findings,

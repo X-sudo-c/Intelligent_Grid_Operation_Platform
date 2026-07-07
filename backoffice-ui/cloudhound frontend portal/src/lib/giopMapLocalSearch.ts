@@ -45,8 +45,9 @@ export function fuzzyMatchesMapQuery(haystack: string, query: string): boolean {
 
   for (const token of hTokens) {
     if (token.startsWith(q)) return true;
-    if (q.length >= 3 && token.length >= 3) {
-      const maxDist = q.length <= 4 ? 1 : q.length <= 6 ? 2 : 3;
+    if (q.length >= 4 && token.length >= 4) {
+      const maxDist = q.length <= 6 ? 2 : q.length <= 8 ? 3 : 4;
+      if (levenshtein(q, token) <= maxDist) return true;
       const window = token.slice(0, Math.max(token.length, q.length + 1));
       if (levenshtein(q, window) <= maxDist) return true;
     }

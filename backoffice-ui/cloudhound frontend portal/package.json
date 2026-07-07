@@ -28,6 +28,7 @@
     "react": "^19.2.5",
     "react-cytoscapejs": "^2.0.0",
     "react-dom": "^19.2.5",
+    "regl": "^2.1.1",
     "sigma": "^3.0.3",
     "tailwind-merge": "^3.5.0",
     "zod": "^4.4.3"

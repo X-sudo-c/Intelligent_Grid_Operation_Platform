@@ -79,7 +79,7 @@ export function GiopMapLegend({
   mapZoom,
   mapReady = true,
   includeGisOverview = false,
-  geometryMode = 'both',
+  geometryMode = 'master',
 }: GiopMapLegendProps) {
   const groups = useMemo(
     () => buildGiopLegendGroups(isLightMode, { includeGisOverview }),
@@ -104,7 +104,7 @@ export function GiopMapLegend({
       geometryMode,
       gisOverviewAvailable: includeGisOverview,
     });
-  }, [mapRef, mapReady, visibility, geometryMode, includeGisOverview]);
+  }, [mapRef, mapReady, visibility, geometryMode, includeGisOverview, mapZoom]);
 
   const handleRowDoubleClick = useCallback(
     (group: GiopLegendGroup) => {
@@ -135,10 +135,10 @@ export function GiopMapLegend({
         {(geometryMode === 'both' || geometryMode === 'gis') && (
           <>
             {' '}
-            <span className={geometryMode === 'both' ? 'text-fuchsia-600 dark:text-fuchsia-400' : ''}>
+            <span className={geometryMode === 'both' ? 'text-fuchsia-700 dark:text-fuchsia-400' : ''}>
               {geometryMode === 'both'
-                ? 'Compare: magenta = GIS import · SLD colors = master.'
-                : 'GIS import geometry (magenta) shown through street zoom.'}
+                ? 'Gaps only: dashed magenta where GIS ≠ master. No dashes = already promoted — use GIS import for full GPKG.'
+                : 'Full GPKG geometry in magenta — master lines hidden at street zoom.'}
             </span>
           </>
         )}

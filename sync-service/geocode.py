@@ -19,6 +19,35 @@ USER_AGENT = "GIOP-MapSearch/1.0 (ECG grid operations; contact: ops@localhost)"
 GHANA_VIEWBOX = "-3.35,11.35,1.35,4.5"
 
 
+def _geocode_query_variants(query: str) -> list[str]:
+    """Typo / partial-word variants for OSM (e.g. continenta → continental)."""
+    q = (query or "").strip()
+    if len(q) < 2:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def add(candidate: str) -> None:
+        item = candidate.strip()
+        key = item.lower()
+        if item and key not in seen:
+            seen.add(key)
+            out.append(item)
+
+    add(q)
+    low = q.lower()
+    if len(low) >= 5:
+        for suffix in ("l", "al", "le", "n"):
+            add(f"{q}{suffix}")
+        if low.endswith("a"):
+            add(f"{q}l")
+        if low.endswith("ta"):
+            add(f"{q}l")
+    if len(low) >= 5:
+        add(q[:-1])
+    return out
+
+
 def _geocode_map_places_uncached(query: str, *, limit: int = 6) -> list[dict[str, Any]]:
     q = (query or "").strip()
     if len(q) < 2:
@@ -111,6 +140,11 @@ def geocode_map_places(query: str, *, limit: int = 6) -> list[dict[str, Any]]:
         return cached
 
     results = _geocode_map_places_uncached(q, limit=limit)
+    if not results:
+        for variant in _geocode_query_variants(q)[1:]:
+            results = _geocode_map_places_uncached(variant, limit=limit)
+            if results:
+                break
     if results:
         set_json(cache_key, results, PLACE_GEOCODE_CACHE_TTL_SEC)
     return results

@@ -27,6 +27,33 @@ class PgmqWorkerTests(unittest.TestCase):
         self.assertEqual(msg_id, 42)
         cur.execute.assert_called_once()
 
+    def test_sweep_skips_when_run_already_queued(self):
+        from pgmq_worker import sweep_stalled_endpoint_fix_ai_jobs
+
+        conn = MagicMock()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchall.return_value = [("run-a",)]
+        with patch("pgmq_worker.count_endpoint_fix_ai_jobs_for_run", return_value=2):
+            count = sweep_stalled_endpoint_fix_ai_jobs(lambda: conn)
+        self.assertEqual(count, 0)
+
+    @patch("pgmq_worker.enqueue_endpoint_fix_ai_job", return_value=99)
+    def test_sweep_enqueues_for_stalled_running_runs(self, mock_enqueue):
+        from pgmq_worker import sweep_stalled_endpoint_fix_ai_jobs
+
+        conn = MagicMock()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchall.return_value = [("run-a",), ("run-b",)]
+
+        def factory():
+            return conn
+
+        with patch("pgmq_worker.count_endpoint_fix_ai_jobs_for_run", return_value=0):
+            count = sweep_stalled_endpoint_fix_ai_jobs(factory)
+        self.assertEqual(count, 2)
+        self.assertEqual(mock_enqueue.call_count, 2)
+        conn.commit.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

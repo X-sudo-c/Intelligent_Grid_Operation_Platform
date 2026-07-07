@@ -1,9 +1,34 @@
 import type { GiopStagingAsset, GiopTraceResponse, GiopGraphChunkResponse, GiopTopologyPayload } from '../api/giop-api';
 import type { GiopGraphQueryKey } from './giopGraphTypes';
 import type { PortalGraphResponse } from './giopGraphTypes';
+import { normalizeMapCoordinates } from './giopMapCoordinates';
 import { voltageEdgeColor } from './giopSldTheme';
 
 export const MAX_GRAPH_NODES = 2000;
+
+/** Resolve map coordinates for a portal graph node (chunk lon/lat or trace edge endpoints). */
+export function resolvePortalGraphNodeCoordinates(
+  graph: PortalGraphResponse | null | undefined,
+  mrid: string,
+): [number, number] | null {
+  if (!graph) return null;
+  const node = graph.nodes.find((entry) => entry.id === mrid);
+  const props = (node?.properties ?? {}) as Record<string, unknown>;
+  const fromNode = normalizeMapCoordinates([props.lon, props.lat]);
+  if (fromNode) return fromNode;
+  for (const edge of graph.edges) {
+    const edgeProps = (edge.properties ?? {}) as Record<string, unknown>;
+    if (edge.source === mrid) {
+      const coords = normalizeMapCoordinates([edgeProps.source_lon, edgeProps.source_lat]);
+      if (coords) return coords;
+    }
+    if (edge.target === mrid) {
+      const coords = normalizeMapCoordinates([edgeProps.target_lon, edgeProps.target_lat]);
+      if (coords) return coords;
+    }
+  }
+  return null;
+}
 
 type RiskBand = 'critical' | 'high' | 'medium' | 'low';
 
@@ -78,6 +103,10 @@ export function traceToPortalGraph(
       edge_color: voltageEdgeColor(edge.voltage),
       is_privilege_escalation: false,
       is_topology_gap: false,
+      source_lon: edge.source_lon,
+      source_lat: edge.source_lat,
+      target_lon: edge.target_lon,
+      target_lat: edge.target_lat,
     },
   }));
 
@@ -299,10 +328,24 @@ export function chunkToPortalGraph(
   };
 
   const graph = traceToPortalGraph(pseudoTrace, stagingAssets, 'viewport_subgraph');
+  const lonLatByMrid = new Map(chunk.nodes.map((node) => [node.mrid, [node.lon, node.lat] as const]));
+  const nodesWithCoords = graph.nodes.map((node) => {
+    const lonLat = lonLatByMrid.get(node.id);
+    if (!lonLat) return node;
+    return {
+      ...node,
+      properties: {
+        ...(node.properties ?? {}),
+        lon: lonLat[0],
+        lat: lonLat[1],
+      },
+    };
+  });
   const backendLabel =
     chunk.backend === 'memgraph' ? ' · Memgraph' : chunk.backend === 'postgres' ? ' · Postgres' : '';
   return {
     ...graph,
+    nodes: nodesWithCoords,
     metrics: {
       ...graph.metrics,
       query_title: 'Map viewport',

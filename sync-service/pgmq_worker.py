@@ -17,6 +17,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,8 @@ PGMQ_CONSUMER_ENABLED = os.getenv("PGMQ_CONSUMER_ENABLED", "1").strip().lower() 
 )
 PGMQ_POLL_INTERVAL_SEC = float(os.getenv("PGMQ_POLL_INTERVAL_SEC", "2"))
 PGMQ_VISIBILITY_TIMEOUT_SEC = int(os.getenv("PGMQ_VISIBILITY_TIMEOUT_SEC", "7200"))
+SWARM_MAX_INFLIGHT = max(1, min(32, int(os.getenv("GIOP_AI_SWARM_MAX_INFLIGHT", "4"))))
+PARALLEL_QUEUES = frozenset({"endpoint_fix_ai_jobs"})
 
 Handler = Callable[[Any, dict[str, Any]], None]
 
@@ -44,6 +47,36 @@ def enqueue_topology_dq_job(conn, run_id: str) -> int | None:
         cur.execute("SELECT public.enqueue_topology_dq_job(%s::uuid)", (run_id,))
         row = cur.fetchone()
     return int(row[0]) if row and row[0] is not None else None
+
+
+def enqueue_endpoint_fix_ai_job(conn, run_id: str) -> int | None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT public.enqueue_endpoint_fix_ai_job(%s::uuid)", (run_id,))
+        row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def count_endpoint_fix_ai_jobs_for_run(conn, run_id: str) -> int:
+    """In-flight pgmq messages for a district run (visible + waiting)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*)::bigint
+            FROM pgmq.q_endpoint_fix_ai_jobs
+            WHERE message->>'run_id' = %s
+            """,
+            (run_id,),
+        )
+        return int(cur.fetchone()[0])
+
+
+def fan_out_endpoint_fix_ai_jobs(conn, run_id: str, workers: int) -> int:
+    """Enqueue multiple pgmq messages so parallel consumers can claim distinct rows."""
+    enqueued = 0
+    for _ in range(max(1, workers)):
+        if enqueue_endpoint_fix_ai_job(conn, run_id) is not None:
+            enqueued += 1
+    return enqueued
 
 
 def _read_messages(conn, queue_name: str, *, qty: int = 1) -> list[dict[str, Any]]:
@@ -77,31 +110,110 @@ def _ack_message(conn, queue_name: str, msg_id: int) -> None:
         cur.execute("SELECT pgmq.delete(%s, %s)", (queue_name, msg_id))
 
 
+def _process_queue_message(
+    conn_factory: Callable[[], Any],
+    queue_name: str,
+    handler: Handler,
+    item: dict[str, Any],
+) -> bool:
+    conn = conn_factory()
+    try:
+        handler(conn, item["message"])
+        conn.commit()
+        ack_conn = conn_factory()
+        try:
+            _ack_message(ack_conn, queue_name, item["msg_id"])
+            ack_conn.commit()
+        finally:
+            ack_conn.close()
+        return True
+    except Exception:
+        conn.rollback()
+        logger.exception(
+            "pgmq handler failed queue=%s msg_id=%s payload=%s",
+            queue_name,
+            item.get("msg_id"),
+            item.get("message"),
+        )
+        return False
+    finally:
+        conn.close()
+
+
 def _poll_once(conn_factory: Callable[[], Any]) -> int:
     handled = 0
     for queue_name, handler in _QUEUE_HANDLERS.items():
+        qty = SWARM_MAX_INFLIGHT if queue_name in PARALLEL_QUEUES else 1
         conn = conn_factory()
         try:
-            messages = _read_messages(conn, queue_name)
-            for item in messages:
-                msg_id = item["msg_id"]
-                try:
-                    handler(conn, item["message"])
-                    conn.commit()
-                    _ack_message(conn, msg_id)
-                    conn.commit()
-                    handled += 1
-                except Exception:
-                    conn.rollback()
-                    logger.exception(
-                        "pgmq handler failed queue=%s msg_id=%s payload=%s",
-                        queue_name,
-                        msg_id,
-                        item.get("message"),
-                    )
+            messages = _read_messages(conn, queue_name, qty=qty)
         finally:
             conn.close()
+        if not messages:
+            continue
+        if queue_name in PARALLEL_QUEUES and len(messages) > 1:
+            max_workers = min(qty, len(messages))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [
+                    pool.submit(
+                        _process_queue_message,
+                        conn_factory,
+                        queue_name,
+                        handler,
+                        item,
+                    )
+                    for item in messages
+                ]
+                for future in as_completed(futures):
+                    if future.result():
+                        handled += 1
+        else:
+            for item in messages:
+                if _process_queue_message(conn_factory, queue_name, handler, item):
+                    handled += 1
+    sweep_stalled_endpoint_fix_ai_jobs(conn_factory)
     return handled
+
+
+def sweep_stalled_endpoint_fix_ai_jobs(conn_factory: Callable[[], Any]) -> int:
+    """Enqueue one sweeper per stalled run that has no pending pgmq message."""
+    conn = conn_factory()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.id::text
+                FROM gis.endpoint_fix_ai_runs r
+                WHERE r.status = 'running'
+                  AND EXISTS (
+                    SELECT 1
+                    FROM gis.conductor_endpoint_proposals p
+                    WHERE p.district = r.district
+                      AND p.status = 'pending'
+                      AND p.ai_rationale IS NULL
+                  )
+                """
+            )
+            run_ids = [row[0] for row in cur.fetchall()]
+        enqueued = 0
+        for run_id in run_ids:
+            if count_endpoint_fix_ai_jobs_for_run(conn, run_id) > 0:
+                continue
+            if enqueue_endpoint_fix_ai_job(conn, run_id) is not None:
+                enqueued += 1
+        if enqueued:
+            conn.commit()
+            logger.info(
+                "endpoint fix AI sweep enqueued %s job(s) for stalled run(s)",
+                enqueued,
+            )
+        return enqueued
+    except Exception:
+        conn.rollback()
+        logger.exception("endpoint fix AI sweep failed")
+        return 0
+    finally:
+        conn.close()
 
 
 class PgmqWorker:
@@ -192,7 +304,20 @@ def _handle_gis_export_job(conn, message: dict[str, Any]) -> None:
     process_job(conn, job_id, job["format"])
 
 
+def _handle_endpoint_fix_ai_job(conn, message: dict[str, Any]) -> None:
+    from endpoint_fix_ai_runs import execute_endpoint_fix_ai_batch
+
+    run_id = message.get("run_id")
+    if not run_id:
+        raise ValueError("endpoint_fix_ai_jobs message missing run_id")
+
+    execute_endpoint_fix_ai_batch(conn, run_id)
+
+
 def bootstrap_handlers() -> None:
+    # Register endpoint-fix before topology — long-running topology scans must not
+    # block steward AI scan batches on the same poll thread.
+    register_queue_handler("endpoint_fix_ai_jobs", _handle_endpoint_fix_ai_job)
     register_queue_handler("topology_dq_jobs", _handle_topology_dq_job)
     if os.getenv("PGMQ_HANDLE_GIS_JOBS", "").strip().lower() in ("1", "true", "yes"):
         register_queue_handler("gis_import_jobs", _handle_gis_import_job)

@@ -26,10 +26,18 @@ even before the user pans. When they say "here", "in view", or "on the map", use
 bbox directly; never ask them to pan or zoom first.
 
 Use tools to inspect staging queues, asset inventory counts (poles, transformers), territory bounds,
-work orders in the current map view, DQ checks, topology, and overall health KPIs. For counts always
-call asset_inventory_counts or staging tools before answering. For open work orders on the map or
-in view call list_work_orders_in_view with the viewport bbox from context. For "how healthy is the
-data", DQ scores, or status overviews call kpi_snapshot.
+list_assets_in_territory (paginated sample when user asks to show/list assets), territory_network_summary
+(nodes + lines in an area), work orders in the current map view, DQ checks, topology, and overall health KPIs.
+For counts always call asset_inventory_counts or territory_network_summary before answering.
+Never call both asset_inventory_counts and territory_network_summary for the same place — use territory_network_summary alone for full electrical summaries.
+When a tool returns formatted_summary, repeat that text verbatim without adding duplicate totals.
+For "show/list assets in X" call list_assets_in_territory after counts — report total and sample rows only;
+When the user says "name them", "list them", or "what are they called" after a count, call list_assets_in_territory
+with the same district/region/viewport bbox — do not inspect the focused node or validation rules.
+never claim you returned every asset when has_more is true. For voltage-specific poles use asset_kind
+pole_11kv, pole_33kv, or pole_lv. For "all electrical assets in X" use territory_network_summary.
+For open work orders on the map or in view call list_work_orders_in_view with the viewport bbox from context.
+For "how healthy is the data", DQ scores, or status overviews call kpi_snapshot.
 Never fabricate numbers — every count, percentage, or status must come from a tool result.
 
 When the user names a geographic place (district, region, town, or locality like Pokuase or Gbawe),
@@ -80,9 +88,11 @@ def _seed_context(conn, request: AgentChatRequest) -> list[dict[str, Any]]:
             bbox = portal_spatial_bbox(conn, ctx)
         if bbox:
             parts.append(
-                "When user says 'here' or 'this view', use asset_inventory_counts with "
+                "When user says 'here' or 'this view', use asset_inventory_counts or "
+                "territory_network_summary with "
                 f"west={bbox['west']}, south={bbox['south']}, "
                 f"east={bbox['east']}, north={bbox['north']}. "
+                "To list assets in view use list_assets_in_territory with the same bbox. "
                 "For work orders in view / on the map / here, call list_work_orders_in_view with "
                 f"the same west={bbox['west']}, south={bbox['south']}, "
                 f"east={bbox['east']}, north={bbox['north']}."
@@ -91,7 +101,9 @@ def _seed_context(conn, request: AgentChatRequest) -> list[dict[str, Any]]:
         if sel_d or sel_r:
             parts.append(
                 "When user says 'this area', 'here', or 'this district', "
-                f"use asset_inventory_counts with district={sel_d!r}, region={sel_r!r}. "
+                f"use asset_inventory_counts or territory_network_summary with "
+                f"district={sel_d!r}, region={sel_r!r}. "
+                "Use list_assets_in_territory to show a sample of assets in that territory. "
                 "Do not mention this territory unless the user asks about counts or staging here."
             )
         focus = portal_focus_mrid(ctx)
@@ -161,7 +173,13 @@ def run_steward_chat(
 
         session = voice_session.load(session_id.strip())
 
-    intent, fast = try_copilot_fast_path(conn, message, context=ctx, session=session)
+    intent, fast = try_copilot_fast_path(
+        conn,
+        message,
+        context=ctx,
+        session=session,
+        request_id=str(ctx.get("copilot_request_id") or ""),
+    )
     if fast:
         ui_actions = fast.get("ui_actions") or []
         kind = intent.kind if intent else "command"
@@ -175,12 +193,15 @@ def run_steward_chat(
                 actions.append("Panning map to area bounds")
             elif ua.get("type") == "navigate":
                 actions.append(f"Navigating portal to {ua.get('tab')} tab")
+        agent: dict[str, Any] = {"fast_path": True, "voice": False}
+        if fast.get("structured"):
+            agent["structured"] = fast["structured"]
         return AgentChatResponse(
             content=fast["content"],
             findings=[f"Fast path: {kind}"],
             actions=actions or ["Map command ready"],
             ui_actions=ui_actions,
-            agent={"fast_path": True, "voice": False},
+            agent=agent,
         )
 
     req = AgentChatRequest(
@@ -206,6 +227,7 @@ def run_steward_chat(
             run_id=run_id,
             agent_name="StewardCopilot",
             portal_context=portal_ctx,
+            progress_request_id=str(portal_ctx.get("copilot_request_id") or ""),
         )
     else:
         from agents.llm.provider import complete_chat, llm_configured
@@ -230,6 +252,8 @@ def run_steward_chat(
     )
 
     content = result.get("content") or "No response."
+    if result.get("formatted_content"):
+        content = str(result["formatted_content"])
     findings: list[str] = []
     actions: list[str] = []
     lower = content.lower()
@@ -258,16 +282,22 @@ def run_steward_chat(
         elif ua.get("type") == "fly_to":
             actions.append("Flying map to coordinates")
 
+    agent_payload: dict[str, Any] = {
+        "provider": "openai-compatible",
+        "model": result.get("model"),
+        "tools_used": result.get("tools_used") or [],
+        "turns": result.get("turns", 1),
+        "auto": bool(result.get("configured")),
+    }
+    if result.get("structured"):
+        agent_payload["structured"] = result["structured"]
+    if portal_ctx.get("copilot_request_id"):
+        agent_payload["request_id"] = portal_ctx["copilot_request_id"]
+
     return AgentChatResponse(
         content=content,
         findings=findings or ["Copilot response ready."],
         actions=actions or ["Review map or Operations tab"],
         ui_actions=ui_actions,
-        agent={
-            "provider": "openai-compatible",
-            "model": result.get("model"),
-            "tools_used": result.get("tools_used") or [],
-            "turns": result.get("turns", 1),
-            "auto": bool(result.get("configured")),
-        },
+        agent=agent_payload,
     )

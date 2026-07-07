@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from agents.copilot_query import normalize_road_spelling, sanitize_copilot_query
+
 # Common Whisper mishearings for Ghana place / GIS terms.
 _MISHEARING_MAP: dict[str, str] = {
     "a car": "Accra",
@@ -252,7 +254,13 @@ def normalize_transcript(
     if not raw:
         return raw, {"raw": raw, "fixes": []}
 
-    normalized, fixes = _apply_mishearing_map(raw)
+    normalized = sanitize_copilot_query(raw)
+    if normalized != raw:
+        fixes_prefix: list[str] = ["query_sanitized"]
+    else:
+        fixes_prefix = []
+    normalized, fixes = _apply_mishearing_map(normalized)
+    fixes = fixes_prefix + fixes
     normalized = _title_case_places(normalized)
 
     names = boundary_names if boundary_names is not None else _boundary_names_cache

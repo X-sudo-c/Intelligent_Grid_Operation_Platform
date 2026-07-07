@@ -44,6 +44,29 @@ def snap_conductor_endpoints(conn, *, tolerance_m: float | None = None) -> dict[
     return result
 
 
+def infer_conductor_endpoint_ids_tier_a(
+    conn,
+    *,
+    tolerance_m: float = 5.0,
+    district: str | None = None,
+) -> dict[str, Any]:
+    """Infer missing/unresolved endpoint text IDs from nearest pole geometry (Tier A)."""
+    district_arg = (district or "").strip() or None
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT gis.infer_conductor_endpoint_ids_tier_a(%s, %s)",
+            (tolerance_m, district_arg),
+        )
+        row = cur.fetchone()
+        cur.execute("SELECT gis.refresh_conductor_import_status()")
+        refresh = cur.fetchone()
+    conn.commit()
+    result = row[0] if row else {}
+    if refresh and refresh[0]:
+        result["import_status"] = refresh[0]
+    return result
+
+
 def refresh_import_status(conn) -> dict[str, Any]:
     with conn.cursor() as cur:
         cur.execute("SELECT gis.refresh_conductor_import_status()")

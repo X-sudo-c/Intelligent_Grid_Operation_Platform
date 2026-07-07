@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from agents.copilot_query import normalize_road_spelling
 from agents.portal_context import (
     portal_boundary_feeder_id,
     portal_count_scope,
@@ -44,6 +45,9 @@ def _is_viewport_scope(text: str) -> bool:
 _ASSET_ALIASES: dict[str, str] = {
     "pole": "pole",
     "poles": "pole",
+    "pole_11kv": "pole_11kv",
+    "pole_33kv": "pole_33kv",
+    "pole_lv": "pole_lv",
     "transformer": "transformer",
     "transformers": "transformer",
     "node": "node",
@@ -54,9 +58,24 @@ _ASSET_ALIASES: dict[str, str] = {
 }
 
 
+def _voltage_pole_kind_from_text(lower: str) -> str | None:
+    """Detect 11 kV / 33 kV / LV pole counts from natural language."""
+    if not re.search(r"\bpoles?\b", lower):
+        return None
+    if re.search(r"\b(?:11\s*kv|11kv|11\s*kilo(?:volt)?)\b", lower):
+        return "pole_11kv"
+    if re.search(r"\b(?:33\s*kv|33kv|33\s*kilo(?:volt)?)\b", lower):
+        return "pole_33kv"
+    if re.search(r"\b(?:lv|low\s+voltage)\s+poles?\b", lower) or re.search(
+        r"\bpoles?\s+(?:on\s+)?lv\b", lower
+    ):
+        return "pole_lv"
+    return None
+
+
 @dataclass
 class VoiceIntent:
-    kind: str  # count | highlight | pan | zoom_map | trace_feeder | trace_connection_path | trace_downstream_path | work_orders_in_view | inspect_node | pan_work_order
+    kind: str  # count | list_assets | network_summary | highlight | pan | ...
     asset_kind: str | None = None
     tier: str = "master"
     district: str | None = None
@@ -69,6 +88,7 @@ class VoiceIntent:
     resolved_place: dict[str, Any] | None = None
     zoom_close: bool = False
     zoom_delta: float = 0.0
+    also_list_assets: bool = False
 
 
 def _clean_place(raw: str | None) -> str | None:
@@ -83,12 +103,17 @@ def _clean_place(raw: str | None) -> str | None:
         return None
     place = re.sub(r"^(?:me|the|us)\s+", "", place, flags=re.I)
     place = re.sub(r"^(?:the\s+)?map\s+to\s+", "", place, flags=re.I)
+    place = re.sub(r"^(?:are\s+|ar\s+)?e?along\s+", "", place, flags=re.I)
     place = place.strip()
     if not place:
         return None
     if place.endswith(" region"):
         return place[: -len(" region")].strip()
-    return place
+    if place.endswith(" district"):
+        return place[: -len(" district")].strip()
+    place = re.sub(r"^(?:are\s+|ar\s+)?e?along\s+", "", place, flags=re.I).strip()
+    place = normalize_road_spelling(place)
+    return _strip_road_city_qualifier(place)
 
 
 def _place_slots(place: str | None) -> tuple[str | None, str | None]:
@@ -100,9 +125,53 @@ def _place_slots(place: str | None) -> tuple[str | None, str | None]:
     return place, None
 
 
+def _strip_followup_clauses(text: str | None) -> str | None:
+    """Remove trailing 'can you name them' / 'list them' from a place phrase."""
+    if not text:
+        return None
+    cleaned = re.sub(
+        r"\s+(?:,|\band\b)?\s*(?:can you |could you |please )?"
+        r"(?:name|list|show|identify)(?:\s+me)?\s+(?:them|those|the(?:m| poles| assets)?)"
+        r"[\?.!]*$",
+        "",
+        text.strip(),
+        flags=re.I,
+    )
+    cleaned = re.sub(
+        r"\s+(?:,|\band\b)?\s*(?:what are (?:they|their names)(?: called)?)[\?.!]*$",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    return cleaned.strip() or None
+
+
+def _wants_asset_list(lower: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:name|list|show|identify)(?:\s+me)?\s+(?:them|those|the(?:m| poles| assets)?)\b",
+            lower,
+        )
+        or re.search(r"\bwhat are (?:they|their names)(?: called)?\b", lower)
+    )
+
+
+def _strip_road_city_qualifier(place: str) -> str:
+    """'yaa asantewaa road in kumasi' → 'yaa asantewaa road' for geocoding."""
+    m = re.match(
+        r"^(?P<road>.+?\b(?:road|rd|street|st|avenue|ave|highway|lane|dr|drive|boulevard|blvd))"
+        r"\s+in\s+(?P<city>.+)$",
+        place.strip(),
+        flags=re.I,
+    )
+    if m:
+        return m.group("road").strip()
+    return place
+
+
 def _extract_count_place(place_raw: str | None) -> str | None:
     """Pull the locality out of phrases like 'elements are in Accra'."""
-    place = _clean_place(place_raw)
+    place = _clean_place(_strip_followup_clauses(place_raw))
     if not place:
         return None
     trailing = re.search(
@@ -114,13 +183,20 @@ def _extract_count_place(place_raw: str | None) -> str | None:
     if trailing:
         return _clean_place(trailing.group("place"))
     leading = re.search(
+        r"^(?:(?:are|ar)\s+)?(?:e)?along\s+(?P<place>.+)$",
+        place,
+        flags=re.I,
+    )
+    if leading:
+        return _clean_place(leading.group("place"))
+    leading = re.search(
         r"^(?:in|at|for|on)\s+(?P<place>.+)$",
         place,
         flags=re.I,
     )
     if leading:
         return _clean_place(leading.group("place"))
-    return place
+    return _strip_road_city_qualifier(place)
 
 
 def _zoom_step_from_phrase(phrase: str | None) -> float:
@@ -205,7 +281,7 @@ def _count_intent_from_text(lower: str) -> VoiceIntent | None:
         r"(?P<asset>poles?|transformers?|nodes?|captures?|staging(?:\s+(?:elements?|assets?))?)"
         r"(?:\s+(?:are|is))?\s+"
         r")?"
-        r"(?:(?:in|at|for|on)\s+)?"
+        r"(?:(?:in|at|for|on|along|ar\s+ealong|ealong)\s+)?"
         r"(?P<place>[^?.!]+)?[\?.!]*$",
         lower,
         flags=re.I,
@@ -223,7 +299,10 @@ def _count_intent_from_text(lower: str) -> VoiceIntent | None:
         tier = "staging"
 
     asset_kind = _ASSET_ALIASES.get(asset_raw.rstrip("s") if asset_raw else "", None)
-    if asset_raw in ("pole", "poles"):
+    voltage_kind = _voltage_pole_kind_from_text(lower)
+    if voltage_kind:
+        asset_kind = voltage_kind
+    elif asset_raw in ("pole", "poles"):
         asset_kind = "pole"
     elif asset_raw in ("transformer", "transformers"):
         asset_kind = "transformer"
@@ -244,12 +323,160 @@ def _count_intent_from_text(lower: str) -> VoiceIntent | None:
             tier=tier,
             use_viewport=True,
             viewport_explicit=viewport_explicit,
+            also_list_assets=_wants_asset_list(lower),
         )
     district, region = _place_slots(place_raw)
     return VoiceIntent(
         kind="count",
         asset_kind=asset_kind,
         tier=tier,
+        district=district,
+        region=region,
+        also_list_assets=_wants_asset_list(lower),
+    )
+
+
+def _parse_asset_correction_intent(
+    lower: str,
+    session: dict[str, Any],
+) -> VoiceIntent | None:
+    """Re-run the last spatial count with corrected asset kind (e.g. 'I asked about transformers')."""
+    if not session.get("last_kind") == "count":
+        return None
+    if not re.search(
+        r"\b(?:asked|meant|wanted|said|about)\b.*\b(?:transformers?|poles?|nodes?)\b",
+        lower,
+    ) and not re.search(
+        r"\b(?:transformers?|poles?|nodes?)\b.*\b(?:not\s+poles?|not\s+transformers?)\b",
+        lower,
+    ):
+        return None
+    asset_kind = session.get("last_asset_kind") or "pole"
+    if "transformer" in lower:
+        asset_kind = "transformer"
+    elif re.search(r"\bpoles?\b", lower):
+        asset_kind = "pole"
+    elif "node" in lower:
+        asset_kind = "node"
+    territory_bbox = session.get("last_bbox")
+    if isinstance(territory_bbox, dict):
+        territory_bbox = dict(territory_bbox)
+    return VoiceIntent(
+        kind="count",
+        asset_kind=asset_kind,
+        tier=session.get("last_tier") or "master",
+        district=session.get("last_district"),
+        region=session.get("last_region"),
+        use_viewport=bool(session.get("last_use_viewport")),
+        viewport_explicit=bool(session.get("last_use_viewport")),
+        territory_bbox=territory_bbox,
+    )
+
+
+def _parse_list_assets_intent(
+    lower: str,
+    session: dict[str, Any],
+) -> VoiceIntent | None:
+    """List/name assets — direct query or pronoun follow-up after a count."""
+    follow = re.match(
+        r"^(?:can you |could you |please )?(?:name|list|show)(?:\s+me)?\s+"
+        r"(?:them|those|the ones|the poles|the assets)[\?.!]*$",
+        lower,
+        flags=re.I,
+    ) or re.match(
+        r"^(?:what are they called|what are their names)[\?.!]*$",
+        lower,
+        flags=re.I,
+    )
+    direct = re.search(
+        r"\b(?:name|list|show|identify)\s+(?:the\s+)?"
+        r"(?:poles?|assets?|transformers?|nodes?)\b",
+        lower,
+    )
+    if not follow and not direct:
+        return None
+
+    asset_kind = session.get("last_asset_kind") or "pole"
+    if "transformer" in lower:
+        asset_kind = "transformer"
+    elif re.search(r"\bpoles?\b", lower):
+        asset_kind = "pole"
+
+    use_viewport = bool(session.get("last_use_viewport")) or _is_viewport_scope(lower)
+    district = session.get("last_district")
+    region = session.get("last_region")
+    territory_bbox = session.get("last_bbox")
+
+    if follow:
+        if not session.get("last_kind") or not (
+            use_viewport or district or region or territory_bbox
+        ):
+            return None
+    elif direct:
+        place_match = re.search(
+            r"\b(?:in|at|for|on)\s+(?P<place>.+?)(?:[\?.!]|$)",
+            lower,
+        )
+        if place_match:
+            place_raw = _extract_count_place(place_match.group("place"))
+            if place_raw and _is_viewport_scope(place_raw):
+                use_viewport = True
+                district = None
+                region = None
+            elif place_raw:
+                district, region = _place_slots(place_raw)
+                use_viewport = False
+        elif _is_viewport_scope(lower):
+            use_viewport = True
+            district = None
+            region = None
+
+    if not use_viewport and not district and not region and not territory_bbox:
+        return None
+
+    return VoiceIntent(
+        kind="list_assets",
+        asset_kind=asset_kind,
+        tier=session.get("last_tier") or "master",
+        district=district,
+        region=region,
+        use_viewport=use_viewport,
+        viewport_explicit=use_viewport,
+        territory_bbox=territory_bbox if isinstance(territory_bbox, dict) else None,
+    )
+
+
+def _network_summary_intent_from_text(lower: str) -> VoiceIntent | None:
+    """Parse requests for full electrical asset / network summaries in a territory."""
+    if "how many" in lower or re.search(r"\bcount\b", lower):
+        return None
+    patterns = (
+        r"(?:tell me about|what are|what's|whats|give me|show me|summarize|summary of)"
+        r".{0,48}?(?:electrical\s+)?(?:assets?|network)"
+        r".{0,24}?(?:in|at|for|on)\s+(?P<place>.+?)[\?.!]*$",
+        r"(?:electrical\s+)?(?:assets?|network(?:\s+summary)?)"
+        r".{0,12}?(?:in|at|for|on)\s+(?P<place>.+?)[\?.!]*$",
+        r"(?P<place>.+?)\s+(?:electrical\s+)?(?:assets?|network)\s+summary[\?.!]*$",
+    )
+    place_raw: str | None = None
+    for pattern in patterns:
+        match = re.search(pattern, lower, flags=re.I)
+        if match:
+            place_raw = _extract_count_place(match.group("place"))
+            break
+    if not place_raw:
+        return None
+    if _is_viewport_scope(place_raw) or _is_viewport_scope(lower):
+        return VoiceIntent(
+            kind="network_summary",
+            tier="master",
+            use_viewport=True,
+            viewport_explicit=True,
+        )
+    district, region = _place_slots(place_raw)
+    return VoiceIntent(
+        kind="network_summary",
+        tier="master",
         district=district,
         region=region,
     )
@@ -494,9 +721,12 @@ def parse_intent(
     session: dict[str, Any],
     context: dict[str, Any],
 ) -> VoiceIntent | None:
+    from agents.voice_normalize import normalize_transcript
+
     raw = (text or "").strip()
     if not raw:
         return None
+    raw, _ = normalize_transcript(raw)
     lower = raw.lower()
 
     # Follow-up: "and in Kumasi?", "what about Ashanti region?"
@@ -523,6 +753,18 @@ def parse_intent(
     count_intent = _count_intent_from_text(lower)
     if count_intent:
         return count_intent
+
+    list_intent = _parse_list_assets_intent(lower, session)
+    if list_intent:
+        return list_intent
+
+    correction_intent = _parse_asset_correction_intent(lower, session)
+    if correction_intent:
+        return correction_intent
+
+    network_intent = _network_summary_intent_from_text(lower)
+    if network_intent:
+        return network_intent
 
     work_orders_intent = _parse_work_orders_in_view_intent(lower)
     if work_orders_intent:
@@ -657,7 +899,7 @@ def _cached_counts(
         asset_kind=intent.asset_kind,
         district=None if use_bbox else district,
         region=None if use_bbox else region,
-        bbox=bbox if use_bbox else None,
+        bbox=bbox,
     )
     set_json(key, result, ttl_sec=_COUNT_CACHE_TTL_SEC)
     result["cached"] = False
@@ -668,6 +910,12 @@ def _format_count_speech(result: dict[str, Any], intent: VoiceIntent, place_labe
     total = int(result.get("pole_total") or result.get("total") or 0)
     if intent.asset_kind == "pole":
         noun = "pole" if total == 1 else "poles"
+    elif intent.asset_kind == "pole_11kv":
+        noun = "11 kV pole" if total == 1 else "11 kV poles"
+    elif intent.asset_kind == "pole_33kv":
+        noun = "33 kV pole" if total == 1 else "33 kV poles"
+    elif intent.asset_kind == "pole_lv":
+        noun = "LV pole" if total == 1 else "LV poles"
     elif intent.asset_kind == "transformer":
         noun = "transformer" if total == 1 else "transformers"
     elif intent.tier == "staging":
@@ -799,6 +1047,16 @@ def _viewport_bbox(context: dict[str, Any]) -> dict[str, float] | None:
     return portal_viewport_bbox(context)
 
 
+def _buffer_road_bbox(bbox: dict[str, float], *, buffer_deg: float = 0.0015) -> dict[str, float]:
+    """Widen a short OSM road segment bbox for along-road asset counts (~150 m)."""
+    return {
+        "west": float(bbox["west"]) - buffer_deg,
+        "south": float(bbox["south"]) - buffer_deg,
+        "east": float(bbox["east"]) + buffer_deg,
+        "north": float(bbox["north"]) + buffer_deg,
+    }
+
+
 def _count_place_label(
     intent: VoiceIntent,
     context: dict[str, Any],
@@ -807,6 +1065,12 @@ def _count_place_label(
     region: str | None,
     bbox: dict[str, float] | None,
 ) -> str:
+    resolved = intent.resolved_place or {}
+    matched = resolved.get("matched_as")
+    source = str(resolved.get("source") or "")
+    if matched and source in ("osm_road", "osm", "alias_exact", "alias"):
+        label = str(matched)
+        return label.title() if label.islower() else label
     sel_d, sel_r = portal_selected_territory(context)
     raw = (
         intent.district
@@ -878,6 +1142,10 @@ def _apply_resolved_place(
             # "Accra" is a metro label — filter by region ILIKE, not district name.
             resolved_district = None
             resolved_region = meta.get("region") or place
+        elif meta.get("source") == "osm_road":
+            territory_bbox = _buffer_road_bbox(territory_bbox)
+            resolved_district = None
+            resolved_region = None
         else:
             resolved_district = meta.get("district") or resolved_district
             resolved_region = meta.get("region") or resolved_region
@@ -896,12 +1164,195 @@ def _apply_resolved_place(
     ), None
 
 
+def _format_network_summary_speech(summary: dict[str, Any], place_label: str) -> str:
+    structured = summary.get("structured") or {}
+    total = int(structured.get("electrical_assets_total") or summary.get("electrical_assets_total") or 0)
+    nodes = int(structured.get("nodes_total") or (summary.get("nodes") or {}).get("total") or 0)
+    lines = int(structured.get("lines_total") or (summary.get("lines") or {}).get("total") or 0)
+    return (
+        f"{place_label} has about {total:,} electrical assets: "
+        f"{nodes:,} nodes and {lines:,} lines."
+    )
+
+
+def _spatial_query_scope(
+    conn,
+    intent: VoiceIntent,
+    context: dict[str, Any],
+) -> tuple[dict[str, float] | None, str | None, str | None]:
+    bbox, district, region = portal_count_scope(
+        use_viewport=intent.use_viewport,
+        territory_bbox=intent.territory_bbox,
+        district=intent.district,
+        region=intent.region,
+        context=context,
+        allow_selected_territory=intent.viewport_explicit,
+    )
+    if intent.use_viewport and not bbox and not district and not region:
+        bbox = portal_spatial_bbox(conn, context)
+    return bbox, district, region
+
+
+def _list_assets_page(
+    conn,
+    intent: VoiceIntent,
+    *,
+    bbox: dict[str, float] | None,
+    district: str | None,
+    region: str | None,
+    limit: int = 25,
+) -> dict[str, Any]:
+    from agents import spatial
+
+    return spatial.list_assets_in_territory(
+        conn,
+        tier=intent.tier,
+        asset_kind=intent.asset_kind,
+        district=district,
+        region=region,
+        bbox=bbox,
+        limit=limit,
+    )
+
+
+def _format_list_assets_speech(page: dict[str, Any], place_label: str) -> str:
+    assets = page.get("assets") or []
+    total = int(page.get("total") or 0)
+    if total == 0:
+        return f"No matching assets in {place_label}."
+    names: list[str] = []
+    for item in assets[:5]:
+        name = (item.get("name") or "").strip() or str(item.get("mrid") or "asset")
+        names.append(name)
+    joined = ", ".join(names)
+    if total > len(assets):
+        return f"Here are {len(assets)} of {total:,} in {place_label}, including {joined}, and others."
+    if len(names) == 1:
+        return f"There is 1 asset in {place_label}: {joined}."
+    return f"Here are {total:,} assets in {place_label}: {joined}."
+
+
+def _spatial_session_patch(
+    session_patch: dict[str, Any],
+    intent: VoiceIntent,
+    bbox: dict[str, float] | None,
+) -> dict[str, Any]:
+    patch = dict(session_patch)
+    patch["last_use_viewport"] = bool(intent.use_viewport and bbox)
+    if bbox:
+        patch["last_bbox"] = bbox
+    return patch
+
+
+def _is_unresolved_road_place(intent: VoiceIntent) -> bool:
+    place = (intent.district or intent.region or "").strip()
+    if not place or intent.use_viewport or intent.resolved_place:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:road|rd|street|st|avenue|ave|highway|lane|dr|drive|boulevard|blvd)\b",
+            place,
+            flags=re.I,
+        )
+    )
+
+
+def _try_repair_road_intent(
+    conn,
+    intent: VoiceIntent,
+    *,
+    original_query: str,
+    context: dict[str, Any],
+) -> VoiceIntent | None:
+    """Salvage garbled road queries via cleanup rules, map context, then LLM."""
+    from agents.copilot_query import (
+        map_context_city_hint,
+        place_query_with_city,
+        salvage_place_name,
+        try_llm_spatial_intent,
+    )
+
+    place = intent.district or intent.region
+    city_hint = map_context_city_hint(context)
+    candidates: list[str] = []
+
+    salvaged = salvage_place_name(place, original_query)
+    if salvaged:
+        candidates.append(salvaged)
+        if city_hint:
+            candidates.append(place_query_with_city(salvaged, city_hint))
+
+    llm = try_llm_spatial_intent(original_query, context=context)
+    if llm and str(llm.get("intent") or "").lower() == "count":
+        place_name = str(llm.get("place_name") or "").strip()
+        llm_city = str(llm.get("city") or "").strip() or city_hint
+        if place_name:
+            candidates.insert(0, place_name)
+            if llm_city:
+                candidates.insert(0, place_query_with_city(place_name, llm_city))
+        asset_raw = str(llm.get("asset_kind") or "").strip().lower()
+        if asset_raw in ("pole", "poles", "transformer", "transformers", "node", "nodes"):
+            intent = VoiceIntent(
+                kind=intent.kind,
+                asset_kind="pole" if asset_raw.startswith("pole") else asset_raw.rstrip("s"),
+                tier=intent.tier,
+                district=intent.district,
+                region=intent.region,
+                use_viewport=intent.use_viewport,
+                viewport_explicit=intent.viewport_explicit,
+                territory_bbox=intent.territory_bbox,
+                resolved_place=intent.resolved_place,
+                zoom_close=intent.zoom_close,
+                zoom_delta=intent.zoom_delta,
+                also_list_assets=intent.also_list_assets,
+            )
+
+    seen: set[str] = set()
+    for cand in candidates:
+        key = cand.lower()
+        if not cand or key in seen:
+            continue
+        seen.add(key)
+        trial = VoiceIntent(
+            kind=intent.kind,
+            asset_kind=intent.asset_kind,
+            tier=intent.tier,
+            district=cand,
+            region=None,
+            use_viewport=intent.use_viewport,
+            viewport_explicit=intent.viewport_explicit,
+            territory_bbox=intent.territory_bbox,
+            resolved_place=None,
+            zoom_close=intent.zoom_close,
+            zoom_delta=intent.zoom_delta,
+            also_list_assets=intent.also_list_assets,
+        )
+        repaired, clarify = _apply_resolved_place(conn, trial)
+        if clarify or not repaired.resolved_place:
+            continue
+        return repaired
+    return None
+
+
+def _friendly_road_error_label(place: str | None, original_query: str) -> str:
+    from agents.copilot_query import extract_road_name, salvage_place_name
+
+    label = salvage_place_name(place, original_query) or extract_road_name(original_query)
+    if label:
+        return label.title() if label.islower() else label
+    return "that street"
+
+
 def execute_fast_path(
     conn,
     intent: VoiceIntent,
     *,
     context: dict[str, Any],
+    request_id: str | None = None,
 ) -> dict[str, Any] | None:
+    from agents.copilot_progress import push_progress, complete_progress
+
+    push_progress(request_id, "Matching your request")
     from agents.llm.react import _execute_tool
 
     if intent.resolved_place is None:
@@ -919,16 +1370,44 @@ def execute_fast_path(
     }
 
     if intent.kind == "count":
-        bbox, count_district, count_region = portal_count_scope(
-            use_viewport=intent.use_viewport,
-            territory_bbox=intent.territory_bbox,
-            district=intent.district,
-            region=intent.region,
-            context=context,
-            allow_selected_territory=intent.viewport_explicit,
-        )
-        if intent.use_viewport and not bbox and not count_district and not count_region:
-            bbox = portal_spatial_bbox(conn, context)
+        if _is_unresolved_road_place(intent):
+            original_query = str(context.get("_copilot_query") or "")
+            repaired = _try_repair_road_intent(
+                conn,
+                intent,
+                original_query=original_query,
+                context=context,
+            )
+            if repaired:
+                intent = repaired
+            else:
+                place = _friendly_road_error_label(
+                    intent.district or intent.region,
+                    original_query,
+                )
+                asset = intent.asset_kind or "assets"
+                if asset == "transformer":
+                    asset_phrase = "transformers"
+                elif asset in ("pole", "poles"):
+                    asset_phrase = "poles"
+                else:
+                    asset_phrase = asset.replace("_", " ") + "s"
+                speak = (
+                    f"I couldn't locate {place} on the map. "
+                    f"Zoom the map to that street and ask “how many {asset_phrase} in view”, "
+                    "or try a nearby district name."
+                )
+                complete_progress(request_id, "Place not found")
+                return {
+                    "content": speak,
+                    "speak": speak,
+                    "ui_actions": ui_actions,
+                    "session_patch": session_patch,
+                    "fast_path": True,
+                    "data": {"error": "road_not_found", "place": place},
+                }
+
+        bbox, count_district, count_region = _spatial_query_scope(conn, intent, context)
         if not intent.use_viewport and not count_district and not count_region and not bbox:
             return None
 
@@ -947,9 +1426,113 @@ def execute_fast_path(
             bbox=bbox,
         )
         speak = _format_count_speech(result, intent, place_label)
-        content = speak
+        from agents.spatial import format_asset_inventory_text, format_list_assets_text
+
+        if intent.asset_kind in ("pole", "poles", "pole_11kv", "pole_33kv", "pole_lv", "transformer", "transformers"):
+            content = format_asset_inventory_text(
+                result,
+                place_label=place_label,
+                asset_kind=intent.asset_kind,
+            )
+        else:
+            content = speak
         if result.get("cached"):
-            content += " (cached count)"
+            content += "\n\n(cached count)"
+
+        if intent.also_list_assets:
+            push_progress(request_id, "Listing assets")
+            page = _list_assets_page(
+                conn,
+                intent,
+                bbox=bbox,
+                district=count_district,
+                region=count_region,
+                limit=25,
+            )
+            content = f"{content}\n\n{format_list_assets_text(page, place_label=place_label)}"
+            speak = _format_list_assets_speech(page, place_label)
+
+        complete_progress(request_id, "Count ready")
+        return {
+            "content": content,
+            "speak": speak,
+            "ui_actions": ui_actions,
+            "session_patch": _spatial_session_patch(session_patch, intent, bbox),
+            "fast_path": True,
+            "data": result,
+        }
+
+    if intent.kind == "list_assets":
+        bbox, list_district, list_region = _spatial_query_scope(conn, intent, context)
+        if not intent.use_viewport and not list_district and not list_region and not bbox:
+            return {
+                "content": (
+                    "I need an area to list assets — try counting poles in view first, "
+                    "or ask e.g. “list poles in Nima”."
+                ),
+                "speak": "I need an area to list assets. Count poles in view first, then ask me to name them.",
+                "ui_actions": ui_actions,
+                "session_patch": session_patch,
+                "fast_path": True,
+                "data": {},
+            }
+
+        push_progress(request_id, "Listing assets")
+        page = _list_assets_page(
+            conn,
+            intent,
+            bbox=bbox,
+            district=list_district,
+            region=list_region,
+            limit=25,
+        )
+        place_label = _count_place_label(
+            intent,
+            context,
+            district=list_district,
+            region=list_region,
+            bbox=bbox,
+        )
+        from agents.spatial import format_list_assets_text
+
+        content = format_list_assets_text(page, place_label=place_label)
+        speak = _format_list_assets_speech(page, place_label)
+        complete_progress(request_id, "List ready")
+        return {
+            "content": content,
+            "speak": speak,
+            "ui_actions": ui_actions,
+            "session_patch": _spatial_session_patch(
+                {**session_patch, "last_kind": "list_assets"},
+                intent,
+                bbox,
+            ),
+            "fast_path": True,
+            "data": page,
+        }
+
+    if intent.kind == "network_summary":
+        from agents import spatial
+
+        push_progress(request_id, "Resolving territory")
+        bbox, summary_district, summary_region = _spatial_query_scope(conn, intent, context)
+        result = spatial.territory_network_summary(
+            conn,
+            tier=intent.tier,
+            district=summary_district,
+            region=summary_region,
+            bbox=bbox,
+        )
+        place_label = _count_place_label(
+            intent,
+            context,
+            district=summary_district,
+            region=summary_region,
+            bbox=bbox,
+        )
+        content = result.get("formatted_summary") or _format_network_summary_speech(result, place_label)
+        speak = _format_network_summary_speech(result, place_label)
+        complete_progress(request_id, "Summary ready")
         return {
             "content": content,
             "speak": speak,
@@ -957,6 +1540,7 @@ def execute_fast_path(
             "session_patch": session_patch,
             "fast_path": True,
             "data": result,
+            "structured": result.get("structured"),
         }
 
     if intent.kind == "work_orders_in_view":
@@ -1443,6 +2027,7 @@ def try_copilot_fast_path(
     context: dict[str, Any],
     session: dict[str, Any] | None = None,
     normalize: bool = True,
+    request_id: str | None = None,
 ) -> tuple[VoiceIntent | None, dict[str, Any] | None]:
     """
     Match simple map/count commands without the LLM (voice or typed chat).
@@ -1464,10 +2049,11 @@ def try_copilot_fast_path(
     if not intent:
         return None, None
     exec_ctx = dict(context)
+    exec_ctx["_copilot_query"] = message
     if session:
         if session.get("last_mrid"):
             exec_ctx.setdefault("last_mrid", session["last_mrid"])
         if session.get("last_feeder_id"):
             exec_ctx.setdefault("last_feeder_id", session["last_feeder_id"])
-    fast = execute_fast_path(conn, intent, context=exec_ctx)
+    fast = execute_fast_path(conn, intent, context=exec_ctx, request_id=request_id)
     return intent, fast

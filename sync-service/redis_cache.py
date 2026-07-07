@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import gzip
 import hashlib
 import json
 import os
@@ -26,17 +28,28 @@ WEBHOOK_DEDUP_TTL_SEC = int(os.getenv("REDIS_WEBHOOK_DEDUP_TTL_SEC", "86400"))
 IDEMPOTENCY_TTL_SEC = int(os.getenv("REDIS_IDEMPOTENCY_TTL_SEC", "86400"))
 PLACE_GEOCODE_CACHE_TTL_SEC = int(os.getenv("PLACE_GEOCODE_CACHE_TTL_SEC", "86400"))
 PLACE_RESOLVE_CACHE_TTL_SEC = int(os.getenv("PLACE_RESOLVE_CACHE_TTL_SEC", "3600"))
+MAP_SEARCH_CACHE_TTL_SEC = int(os.getenv("MAP_SEARCH_CACHE_TTL_SEC", "300"))
+REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "32"))
+REDIS_HEALTH_CHECK_INTERVAL = int(os.getenv("REDIS_HEALTH_CHECK_INTERVAL", "30"))
+REDIS_DELETE_BATCH_SIZE = int(os.getenv("REDIS_DELETE_BATCH_SIZE", "500"))
+REDIS_SCAN_COUNT = int(os.getenv("REDIS_SCAN_COUNT", "500"))
+REDIS_COMPRESS_MIN_BYTES = int(os.getenv("REDIS_COMPRESS_MIN_BYTES", "8192"))
+REDIS_COMPRESS_LEVEL = int(os.getenv("REDIS_COMPRESS_LEVEL", "6"))
+REDIS_SINGLEFLIGHT_WAIT_SEC = float(os.getenv("REDIS_SINGLEFLIGHT_WAIT_SEC", "45"))
 
 _KEY_PREFIX = "giop:"
 _client: Any = None
+_pool: Any = None
 _client_lock = threading.Lock()
 _last_error: str | None = None
+_singleflight_lock = threading.Lock()
+_singleflight_events: dict[str, threading.Event] = {}
 
 T = TypeVar("T")
 
 
 def _connect() -> Any | None:
-    global _client, _last_error
+    global _client, _pool, _last_error
     if not REDIS_URL:
         return None
     with _client_lock:
@@ -45,12 +58,17 @@ def _connect() -> Any | None:
         try:
             import redis
 
-            client = redis.from_url(
-                REDIS_URL,
-                decode_responses=True,
-                socket_connect_timeout=float(os.getenv("REDIS_CONNECT_TIMEOUT", "2")),
-                socket_timeout=float(os.getenv("REDIS_SOCKET_TIMEOUT", "2")),
-            )
+            if _pool is None:
+                _pool = redis.ConnectionPool.from_url(
+                    REDIS_URL,
+                    decode_responses=True,
+                    max_connections=REDIS_MAX_CONNECTIONS,
+                    socket_connect_timeout=float(os.getenv("REDIS_CONNECT_TIMEOUT", "2")),
+                    socket_timeout=float(os.getenv("REDIS_SOCKET_TIMEOUT", "2")),
+                    health_check_interval=REDIS_HEALTH_CHECK_INTERVAL,
+                    retry_on_timeout=True,
+                )
+            client = redis.Redis(connection_pool=_pool)
             client.ping()
             _client = client
             _last_error = None
@@ -87,13 +105,68 @@ def _reset_client() -> None:
 
 def status() -> dict[str, Any]:
     available = is_available()
-    return {
+    payload: dict[str, Any] = {
         "enabled": is_enabled(),
         "available": available,
         "url": REDIS_URL if is_enabled() else None,
         "cache_ttl_sec": CACHE_TTL_SEC,
+        "max_connections": REDIS_MAX_CONNECTIONS,
+        "delete_batch_size": REDIS_DELETE_BATCH_SIZE,
+        "compress_min_bytes": REDIS_COMPRESS_MIN_BYTES,
+        "singleflight_wait_sec": REDIS_SINGLEFLIGHT_WAIT_SEC,
         "last_error": None if available else _last_error,
     }
+    if available:
+        payload.update(cache_stats())
+    return payload
+
+
+def cache_stats() -> dict[str, Any]:
+    """Lightweight Redis observability for /health/metrics."""
+    client = _connect()
+    if client is None:
+        return {}
+    try:
+        memory = client.info("memory")
+        stats = client.info("stats")
+        return {
+            "keys": int(client.dbsize()),
+            "used_memory_human": memory.get("used_memory_human"),
+            "maxmemory_human": memory.get("maxmemory_human"),
+            "maxmemory_policy": memory.get("maxmemory_policy"),
+            "evicted_keys": int(stats.get("evicted_keys", 0)),
+            "keyspace_hits": int(stats.get("keyspace_hits", 0)),
+            "keyspace_misses": int(stats.get("keyspace_misses", 0)),
+            "pool_max_connections": REDIS_MAX_CONNECTIONS,
+        }
+    except Exception as exc:
+        global _last_error
+        _last_error = str(exc)
+        _reset_client()
+        return {"stats_error": str(exc)}
+
+
+def _decode_cache_raw(raw: str) -> Any:
+    if raw.startswith('{"__giop_enc"'):
+        wrapper = json.loads(raw)
+        if wrapper.get("__giop_enc") == "gzip" and isinstance(wrapper.get("p"), str):
+            decoded = gzip.decompress(base64.b64decode(wrapper["p"]))
+            return json.loads(decoded)
+    return json.loads(raw)
+
+
+def _encode_cache_value(value: Any) -> str:
+    payload = json.dumps(value, separators=(",", ":"), default=str)
+    raw_bytes = payload.encode("utf-8")
+    if len(raw_bytes) < REDIS_COMPRESS_MIN_BYTES:
+        return payload
+    compressed = gzip.compress(raw_bytes, compresslevel=REDIS_COMPRESS_LEVEL)
+    if len(compressed) >= len(raw_bytes):
+        return payload
+    return json.dumps(
+        {"__giop_enc": "gzip", "p": base64.b64encode(compressed).decode("ascii")},
+        separators=(",", ":"),
+    )
 
 
 def get_json(key: str) -> Any | None:
@@ -104,7 +177,7 @@ def get_json(key: str) -> Any | None:
         raw = client.get(key)
         if raw is None:
             return None
-        return json.loads(raw)
+        return _decode_cache_raw(raw)
     except Exception as exc:
         global _last_error
         _last_error = str(exc)
@@ -117,7 +190,7 @@ def set_json(key: str, value: Any, ttl_sec: int | None = None) -> bool:
     if client is None:
         return False
     try:
-        payload = json.dumps(value, separators=(",", ":"), default=str)
+        payload = _encode_cache_value(value)
         client.setex(key, ttl_sec or CACHE_TTL_SEC, payload)
         return True
     except Exception as exc:
@@ -128,13 +201,38 @@ def set_json(key: str, value: Any, ttl_sec: int | None = None) -> bool:
 
 
 def cached_json(key: str, builder: Callable[[], T], ttl_sec: int | None = None) -> T:
-    """Read-through JSON cache; falls back to builder when Redis is unavailable."""
+    """Read-through JSON cache with single-flight coalescing on cache miss."""
     cached = get_json(key)
     if cached is not None:
         return cached
-    result = builder()
-    set_json(key, result, ttl_sec)
-    return result
+
+    with _singleflight_lock:
+        if key in _singleflight_events:
+            event = _singleflight_events[key]
+            is_leader = False
+        else:
+            event = threading.Event()
+            _singleflight_events[key] = event
+            is_leader = True
+
+    if not is_leader:
+        event.wait(timeout=REDIS_SINGLEFLIGHT_WAIT_SEC)
+        cached = get_json(key)
+        if cached is not None:
+            return cached
+        result = builder()
+        set_json(key, result, ttl_sec)
+        return result
+
+    try:
+        result = builder()
+        set_json(key, result, ttl_sec)
+        return result
+    finally:
+        with _singleflight_lock:
+            done = _singleflight_events.pop(key, None)
+        if done is not None:
+            done.set()
 
 
 def delete_key(key: str) -> bool:
@@ -150,14 +248,30 @@ def delete_key(key: str) -> bool:
         return False
 
 
+def _unlink_batch(client: Any, keys: list[str]) -> int:
+    if not keys:
+        return 0
+    pipe = client.pipeline(transaction=False)
+    for key in keys:
+        pipe.unlink(key)
+    return int(sum(pipe.execute()))
+
+
 def delete_pattern(pattern: str) -> int:
+    """Delete keys matching pattern using SCAN + pipelined UNLINK."""
     client = _connect()
     if client is None:
         return 0
     deleted = 0
+    batch: list[str] = []
     try:
-        for key in client.scan_iter(match=pattern, count=200):
-            deleted += int(client.delete(key))
+        for key in client.scan_iter(match=pattern, count=REDIS_SCAN_COUNT):
+            batch.append(key)
+            if len(batch) >= REDIS_DELETE_BATCH_SIZE:
+                deleted += _unlink_batch(client, batch)
+                batch = []
+        if batch:
+            deleted += _unlink_batch(client, batch)
         return deleted
     except Exception as exc:
         global _last_error
@@ -166,63 +280,64 @@ def delete_pattern(pattern: str) -> int:
         return deleted
 
 
+def delete_patterns(patterns: list[str]) -> int:
+    """Invalidate multiple key patterns with one connection and batched UNLINK."""
+    return sum(delete_pattern(pattern) for pattern in patterns)
+
+
 def invalidate_topology_cache() -> int:
     """Map, graph, topology, master assets, schematics."""
-    total = 0
-    for pattern in (
-        f"{_KEY_PREFIX}chunk:*",
-        f"{_KEY_PREFIX}trace:*",
-        f"{_KEY_PREFIX}map:nodes:*",
-        f"{_KEY_PREFIX}h3:cells:*",
-        f"{_KEY_PREFIX}conn:bulk:*",
-        f"{_KEY_PREFIX}conn:node:*",
-        f"{_KEY_PREFIX}topology:*",
-        f"{_KEY_PREFIX}assets:master:*",
-        f"{_KEY_PREFIX}assets:detail:*",
-        f"{_KEY_PREFIX}schematic:*",
-        f"{_KEY_PREFIX}graph:parity",
-        f"{_KEY_PREFIX}gis:import:*",
-        f"{_KEY_PREFIX}reference:layers",
-    ):
-        total += delete_pattern(pattern)
-    return total
+    return delete_patterns(
+        [
+            f"{_KEY_PREFIX}chunk:*",
+            f"{_KEY_PREFIX}trace:*",
+            f"{_KEY_PREFIX}map:nodes:*",
+            f"{_KEY_PREFIX}h3:cells:*",
+            f"{_KEY_PREFIX}conn:bulk:*",
+            f"{_KEY_PREFIX}conn:node:*",
+            f"{_KEY_PREFIX}topology:*",
+            f"{_KEY_PREFIX}assets:master:*",
+            f"{_KEY_PREFIX}assets:detail:*",
+            f"{_KEY_PREFIX}schematic:*",
+            f"{_KEY_PREFIX}graph:parity",
+            f"{_KEY_PREFIX}gis:import:*",
+            f"{_KEY_PREFIX}reference:layers",
+        ]
+    )
 
 
 def invalidate_staging_cache() -> int:
     """Staging asset lists and cell queries that include staging."""
-    total = 0
-    for pattern in (
-        f"{_KEY_PREFIX}assets:staging:*",
-        f"{_KEY_PREFIX}assets:detail:*",
-        f"{_KEY_PREFIX}map:nodes:*",
-        f"{_KEY_PREFIX}h3:cells:*",
-    ):
-        total += delete_pattern(pattern)
-    return total
+    return delete_patterns(
+        [
+            f"{_KEY_PREFIX}assets:staging:*",
+            f"{_KEY_PREFIX}assets:detail:*",
+            f"{_KEY_PREFIX}map:nodes:*",
+            f"{_KEY_PREFIX}h3:cells:*",
+        ]
+    )
 
 
 def invalidate_h3_cache() -> int:
-    total = 0
-    for pattern in (
-        f"{_KEY_PREFIX}h3:coverage:*",
-        f"{_KEY_PREFIX}h3:grid:*",
-        f"{_KEY_PREFIX}h3:assignments:*",
-    ):
-        total += delete_pattern(pattern)
-    return total
+    return delete_patterns(
+        [
+            f"{_KEY_PREFIX}h3:coverage:*",
+            f"{_KEY_PREFIX}h3:grid:*",
+            f"{_KEY_PREFIX}h3:assignments:*",
+        ]
+    )
 
 
 def invalidate_ops_cache() -> int:
     """Dashboard lists: DQ, conflicts, exports, nav badges."""
-    total = 0
-    for pattern in (
-        f"{_KEY_PREFIX}dq:*",
-        f"{_KEY_PREFIX}conflicts:*",
-        f"{_KEY_PREFIX}exports:list:*",
-        f"{_KEY_PREFIX}ops:*",
-    ):
-        total += delete_pattern(pattern)
-    return total
+    return delete_patterns(
+        [
+            f"{_KEY_PREFIX}dq:*",
+            f"{_KEY_PREFIX}conflicts:*",
+            f"{_KEY_PREFIX}exports:list:*",
+            f"{_KEY_PREFIX}ops:*",
+        ]
+    )
 
 
 def invalidate_after_promote() -> None:
@@ -393,6 +508,13 @@ def geocode_places_key(query: str, limit: int) -> str:
     normalized = " ".join((query or "").strip().lower().split())
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
     return f"{_KEY_PREFIX}geocode:{limit}:{digest}"
+
+
+def map_search_key(query: str, limit: int, kinds: str | None) -> str:
+    normalized = " ".join((query or "").strip().lower().split())
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    kind_tag = kinds or "*"
+    return f"{_KEY_PREFIX}map:search:{limit}:{kind_tag}:{digest}"
 
 
 def place_resolve_key(query: str, *, geocode_enabled: bool) -> str:

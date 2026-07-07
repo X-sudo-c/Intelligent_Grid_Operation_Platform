@@ -25,15 +25,21 @@ import {
 import { GisImportEndpointDiagnostics } from './GisImportEndpointDiagnostics';
 import { GisImportPipelineMetrics } from './GisImportPipelineMetrics';
 import { GisImportSnapModal } from './GisImportSnapModal';
+import { GisEndpointFixProposalsPanel } from './GisEndpointFixProposalsPanel';
+import type { GiopEndpointFixDataTier } from '../api/giop-api';
 
 interface GiopImportQueuePanelProps {
   isLightMode: boolean;
   enabled: boolean;
+  dataTier?: GiopEndpointFixDataTier;
+  showImportQueue?: boolean;
 }
 
 const WORKFLOW_STEPS = [
   'Review customer/meter buckets — expected on LV service lines, not pole errors',
   'Fix lookup / GPKG IDs for unresolved source & target buckets',
+  'Generate endpoint fix proposals — geometry → from/to review table',
+  'Approve rows and apply — writes GIS conductor from/to IDs',
   'Run endpoint snap — geometry only, both pole IDs must resolve',
   'Run promote_topology.sh — moves eligible MV/LV segments into master',
   'Master topology scan — measure orphans & dangling after promote',
@@ -41,8 +47,13 @@ const WORKFLOW_STEPS = [
 
 const PAGE_SIZE = 25;
 
-export function GiopImportQueuePanel({ isLightMode, enabled }: GiopImportQueuePanelProps) {
-  const { queueMapViewportCommand, setImportSegmentHighlight } = useGiopMapOverlay();
+export function GiopImportQueuePanel({
+  isLightMode,
+  enabled,
+  dataTier = 'gis',
+  showImportQueue = true,
+}: GiopImportQueuePanelProps) {
+  const { queueMapViewportCommand, setImportSegmentHighlight, networkGeometryMode } = useGiopMapOverlay();
   const [expanded, setExpanded] = useState(false);
   const [summary, setSummary] = useState<GiopUnpromotedSegmentSummary | null>(null);
   const [endpointDiagnostics, setEndpointDiagnostics] = useState<GiopEndpointDiagnostics | null>(null);
@@ -72,7 +83,7 @@ export function GiopImportQueuePanel({ isLightMode, enabled }: GiopImportQueuePa
   const shell = isLightMode ? 'bg-slate-50 border-slate-200' : 'bg-premium-surface/40 border-premium-border/50';
 
   const load = useCallback(async () => {
-    if (!enabled || !expanded) return;
+    if (!enabled || !expanded || !showImportQueue) return;
     setLoading(true);
     try {
       const [sum, page, diagnostics] = await Promise.all([
@@ -96,7 +107,7 @@ export function GiopImportQueuePanel({ isLightMode, enabled }: GiopImportQueuePa
     } finally {
       setLoading(false);
     }
-  }, [enabled, expanded, reasonFilter, pageOffset]);
+  }, [enabled, expanded, reasonFilter, pageOffset, showImportQueue]);
 
   useEffect(() => {
     setPageOffset(0);
@@ -166,6 +177,12 @@ export function GiopImportQueuePanel({ isLightMode, enabled }: GiopImportQueuePa
       };
       setImportSegmentHighlight(highlight);
 
+      if (networkGeometryMode === 'master') {
+        setStatus('Map highlight hidden in Master mode — switch to Both or GIS import to preview.');
+      } else {
+        setStatus('');
+      }
+
       if (payload.bbox) {
         queueMapViewportCommand({
           type: 'fit_bounds',
@@ -188,6 +205,16 @@ export function GiopImportQueuePanel({ isLightMode, enabled }: GiopImportQueuePa
   const estimateSec = snapEligibleEstimateSec(summary?.conductor_segments);
 
   if (!enabled) return null;
+
+  if (!showImportQueue) {
+    return (
+      <GisEndpointFixProposalsPanel
+        isLightMode={isLightMode}
+        enabled={enabled}
+        dataTier={dataTier}
+      />
+    );
+  }
 
   return (
     <>
@@ -239,6 +266,13 @@ export function GiopImportQueuePanel({ isLightMode, enabled }: GiopImportQueuePa
             diagnostics={endpointDiagnostics}
             loading={loading}
             isLightMode={isLightMode}
+          />
+
+          <GisEndpointFixProposalsPanel
+            isLightMode={isLightMode}
+            enabled={enabled}
+            dataTier={dataTier}
+            defaultDistrict={segments[0]?.district ?? ''}
           />
 
           <details className={`rounded-lg border text-xs ${shell}`}>

@@ -10,6 +10,7 @@ const MODES: NetworkGeometryMode[] = ['master', 'gis', 'both'];
 interface GiopNetworkGeometryToggleProps {
   isLightMode: boolean;
   gisOverviewAvailable: boolean;
+  unpromotedGapAvailable?: boolean;
   mode: NetworkGeometryMode;
   onModeChange: (mode: NetworkGeometryMode) => void;
   /** inline = search-bar chip; floating = map corner (side preview only). */
@@ -20,6 +21,7 @@ interface GiopNetworkGeometryToggleProps {
 export function GiopNetworkGeometryToggle({
   isLightMode,
   gisOverviewAvailable,
+  unpromotedGapAvailable = false,
   mode,
   onModeChange,
   variant = 'floating',
@@ -112,6 +114,10 @@ export function GiopNetworkGeometryToggle({
               const item = NETWORK_GEOMETRY_MODE_META[option];
               const disabled = option === 'gis' && !gisOverviewAvailable;
               const selected = mode === option;
+              const hint =
+                option === 'both' && !unpromotedGapAvailable
+                  ? 'Magenta gap tiles loading — run scripts/refresh_map_unpromoted_gap.sh'
+                  : item.hint;
               return (
                 <li key={option}>
                   <button
@@ -119,7 +125,7 @@ export function GiopNetworkGeometryToggle({
                     role="option"
                     aria-selected={selected}
                     disabled={disabled}
-                    title={disabled ? 'GIS overview tiles unavailable' : item.hint}
+                    title={disabled ? 'GIS overview tiles unavailable' : hint}
                     onClick={() => selectMode(option)}
                     className={`flex w-full items-start gap-2.5 rounded-lg px-2 py-2 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                       selected
@@ -143,7 +149,7 @@ export function GiopNetworkGeometryToggle({
                           isLightMode ? 'text-slate-500' : 'text-premium-muted'
                         }`}
                       >
-                        {item.hint}
+                        {hint}
                       </span>
                     </span>
                   </button>

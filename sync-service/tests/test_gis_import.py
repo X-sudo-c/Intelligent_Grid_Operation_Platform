@@ -7,6 +7,7 @@ from gis_import import (
     TOPO_ENDPOINT_TOLERANCE_M,
     UNPROMOTED_REASONS,
     endpoint_diagnostics_summary,
+    infer_conductor_endpoint_ids_tier_a,
     list_unpromoted_segments,
     snap_conductor_endpoints,
     unpromoted_segment_geojson,
@@ -43,6 +44,45 @@ class GisImportTests(unittest.TestCase):
         self.assertEqual(result["segments_snapped"], 12)
         conn.commit.assert_called_once()
         self.assertEqual(cur.execute.call_count, 2)
+
+    def test_infer_conductor_endpoint_ids_tier_a_commits(self):
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        cur.fetchone.side_effect = [
+            (
+                {
+                    "tolerance_m": 5.0,
+                    "segments_updated": 3,
+                    "start_ids_inferred": 2,
+                    "end_ids_inferred": 1,
+                },
+            ),
+            ({"total_unpromoted": 818000},),
+        ]
+
+        result = infer_conductor_endpoint_ids_tier_a(conn, tolerance_m=5.0)
+        self.assertEqual(result["segments_updated"], 3)
+        conn.commit.assert_called_once()
+        self.assertEqual(cur.execute.call_count, 2)
+        first_sql, first_args = cur.execute.call_args_list[0][0]
+        self.assertIn("infer_conductor_endpoint_ids_tier_a", first_sql)
+        self.assertEqual(first_args, (5.0, None))
+
+    def test_infer_conductor_endpoint_ids_tier_a_district_scoped(self):
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        cur.fetchone.side_effect = [
+            ({"segments_updated": 1},),
+            ({"total_unpromoted": 100},),
+        ]
+
+        infer_conductor_endpoint_ids_tier_a(conn, tolerance_m=5.0, district="Mpraeso")
+        first_args = cur.execute.call_args_list[0][0][1]
+        self.assertEqual(first_args, (5.0, "Mpraeso"))
 
     def test_list_unpromoted_segments_invalid_reason(self):
         conn = MagicMock()

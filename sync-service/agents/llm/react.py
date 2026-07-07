@@ -13,9 +13,9 @@ from agents import spatial_tools
 from agents import tools
 from agents.audit import log_agent_step
 from agents.cleanup_agent import generate_cleanup_plan
-from agents.llm.provider import complete_chat, llm_configured
+from agents.llm.provider import LlmProfileName, complete_chat, get_llm_profile
 
-MAX_TOOL_TURNS = int(os.getenv("GIOP_LLM_MAX_TOOL_TURNS", "8"))
+MAX_TOOL_TURNS = get_llm_profile("copilot").max_tool_turns
 
 PORTAL_TABS = frozenset(
     {
@@ -444,8 +444,9 @@ def _tool_schemas() -> list[dict[str, Any]]:
             "function": {
                 "name": "asset_inventory_counts",
                 "description": (
-                    "Count assets on master or staging by kind (pole, transformer, etc.), "
-                    "filtered by district, region, or map bbox. Use for 'how many poles in X'."
+                    "Count point assets on master or staging by kind "
+                    "(pole, pole_11kv, pole_33kv, pole_lv, transformer, connectivity_node), "
+                    "filtered by district, region, or map bbox. Use for 'how many 11kV poles in X'."
                 ),
                 "parameters": {
                     "type": "object",
@@ -453,8 +454,68 @@ def _tool_schemas() -> list[dict[str, Any]]:
                         "tier": {"type": "string", "enum": ["master", "staging"], "default": "master"},
                         "asset_kind": {
                             "type": "string",
-                            "description": "pole, transformer, distribution_transformer, connectivity_node, etc.",
+                            "description": (
+                                "pole, pole_11kv, pole_33kv, pole_lv, transformer, "
+                                "distribution_transformer, connectivity_node, etc."
+                            ),
                         },
+                        "district": {"type": "string"},
+                        "region": {"type": "string"},
+                        "west": {"type": "number"},
+                        "south": {"type": "number"},
+                        "east": {"type": "number"},
+                        "north": {"type": "number"},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_assets_in_territory",
+                "description": (
+                    "List a paginated sample of point assets in a district, region, or bbox. "
+                    "Always returns total count plus up to limit rows (default 25, max 100). "
+                    "Use after asset_inventory_counts when the user asks to show or list assets. "
+                    "Never claim you listed every row when has_more is true."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "tier": {"type": "string", "enum": ["master", "staging"], "default": "master"},
+                        "asset_kind": {
+                            "type": "string",
+                            "description": "Same kinds as asset_inventory_counts.",
+                        },
+                        "district": {"type": "string"},
+                        "region": {"type": "string"},
+                        "west": {"type": "number"},
+                        "south": {"type": "number"},
+                        "east": {"type": "number"},
+                        "north": {"type": "number"},
+                        "limit": {"type": "integer", "description": "Max rows (default 25, max 100)."},
+                        "offset": {"type": "integer", "description": "Pagination offset."},
+                        "include_geom": {
+                            "type": "boolean",
+                            "description": "Include GeoJSON geometry (heavier).",
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "territory_network_summary",
+                "description": (
+                    "Summary of all electrical assets in a territory: connectivity nodes by kind "
+                    "plus ac_line_segments by nominal voltage. Use for 'all electrical assets in X' "
+                    "or combined node+line counts."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "tier": {"type": "string", "enum": ["master", "staging"], "default": "master"},
                         "district": {"type": "string"},
                         "region": {"type": "string"},
                         "west": {"type": "number"},
@@ -534,6 +595,170 @@ def _tool_schemas() -> list[dict[str, Any]]:
                         "radius_meters": {"type": "number", "default": 50},
                     },
                     "required": ["target_mrid"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "preview_geom_snap_candidate",
+                "description": (
+                    "Preview geometry-based endpoint cleanup for one unpromoted GIS conductor segment: "
+                    "text IDs, nearest poles, distances, and Tier A/B/C classification."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "segment_id": {"type": "integer"},
+                        "tolerance_m": {"type": "number", "default": 5.0},
+                        "assisted_m": {"type": "number", "default": 15.0},
+                    },
+                    "required": ["segment_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "scan_district_geom_cleanup",
+                "description": (
+                    "Scan unpromoted GIS conductor segments in an ECG district and classify them "
+                    "by geometry-distance cleanup tier (Tier A auto, Tier B assisted, Tier C manual)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "district": {"type": "string"},
+                        "tolerance_m": {"type": "number", "default": 5.0},
+                        "assisted_m": {"type": "number", "default": 15.0},
+                        "sample_limit": {"type": "integer", "default": 5},
+                    },
+                    "required": ["district"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "propose_district_geom_cleanup",
+                "description": (
+                    "Propose a district-wide GIS geometry cleanup plan (infer IDs → snap → promote). "
+                    "Queues for steward approval; does not mutate data."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "district": {"type": "string"},
+                        "tolerance_m": {"type": "number", "default": 5.0},
+                        "assisted_m": {"type": "number", "default": 15.0},
+                    },
+                    "required": ["district"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "generate_endpoint_fix_proposals",
+                "description": (
+                    "Scan unpromoted GIS conductors in a district and queue steward-reviewed "
+                    "from/to pole ID proposals from geometry (nearest pole). No DB writes until apply."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "district": {"type": "string"},
+                        "tolerance_m": {"type": "number", "default": 5.0},
+                        "assisted_m": {"type": "number", "default": 15.0},
+                        "limit": {"type": "integer", "default": 5000},
+                        "include_tier_b": {"type": "boolean", "default": True},
+                        "replace_pending": {"type": "boolean", "default": False},
+                    },
+                    "required": ["district"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_endpoint_fix_proposals",
+                "description": "List pending/approved GIS endpoint fix proposals for steward review.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "district": {"type": "string"},
+                        "status": {"type": "string", "default": "pending"},
+                        "tier": {"type": "string"},
+                        "limit": {"type": "integer", "default": 25},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "apply_endpoint_fix_proposals",
+                "description": (
+                    "Apply approved endpoint fix proposals — writes from/to IDs on gis.conductor_segments. "
+                    "Does not promote to master."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "district": {"type": "string"},
+                        "proposal_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "operator_id": {"type": "string"},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "ai_scan_endpoint_fix_proposals",
+                "description": (
+                    "Run cleanup LLM steward review on pending endpoint fix proposals. "
+                    "Returns AI thoughts, transcript, and per-row rationale (no DB writes except AI metadata)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "district": {"type": "string"},
+                        "batch_id": {"type": "string"},
+                        "limit": {"type": "integer", "default": 10},
+                        "mode": {
+                            "type": "string",
+                            "enum": ["agent", "batch", "tiered"],
+                            "default": "tiered",
+                        },
+                        "reasoning_depth": {
+                            "type": "string",
+                            "enum": ["quick", "deep"],
+                            "default": "quick",
+                        },
+                    },
+                    "required": ["district"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "execute_geom_cleanup_proposal",
+                "description": (
+                    "Execute an approved district geometry cleanup proposal. "
+                    "Runs Tier A infer, snap, and district-scoped promote."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cleanup_id": {"type": "string"},
+                        "force": {"type": "boolean", "default": False},
+                    },
+                    "required": ["cleanup_id"],
                 },
             },
         },
@@ -704,6 +929,87 @@ def _execute_tool(
         from agents import kpi
 
         return kpi.compute_kpis(conn)
+    if name == "preview_geom_snap_candidate":
+        from geometry_cleanup import preview_geom_snap_candidate
+
+        return preview_geom_snap_candidate(
+            conn,
+            int(arguments["segment_id"]),
+            tolerance_m=float(arguments.get("tolerance_m") or 5.0),
+            assisted_m=float(arguments.get("assisted_m") or 15.0),
+        )
+    if name == "scan_district_geom_cleanup":
+        from geometry_cleanup import scan_district_geom_cleanup
+
+        return scan_district_geom_cleanup(
+            conn,
+            arguments["district"],
+            tolerance_m=float(arguments.get("tolerance_m") or 5.0),
+            assisted_m=float(arguments.get("assisted_m") or 15.0),
+            sample_limit=int(arguments.get("sample_limit") or 5),
+        )
+    if name == "propose_district_geom_cleanup":
+        from geometry_cleanup import propose_district_geom_cleanup
+
+        return propose_district_geom_cleanup(
+            conn,
+            arguments["district"],
+            tolerance_m=float(arguments.get("tolerance_m") or 5.0),
+            assisted_m=float(arguments.get("assisted_m") or 15.0),
+            run_id=run_id,
+            operator_id=agent_name,
+        )
+    if name == "execute_geom_cleanup_proposal":
+        from geometry_cleanup import execute_geom_cleanup_proposal
+
+        return execute_geom_cleanup_proposal(
+            conn,
+            arguments["cleanup_id"],
+            operator_id=agent_name,
+            force=bool(arguments.get("force", False)),
+        )
+    if name == "generate_endpoint_fix_proposals":
+        from endpoint_proposals import generate_endpoint_fix_proposals
+
+        return generate_endpoint_fix_proposals(
+            conn,
+            arguments["district"],
+            tolerance_m=float(arguments.get("tolerance_m") or 5.0),
+            assisted_m=float(arguments.get("assisted_m") or 15.0),
+            limit=int(arguments.get("limit") or 5000),
+            include_tier_b=bool(arguments.get("include_tier_b", True)),
+            replace_pending=bool(arguments.get("replace_pending", False)),
+        )
+    if name == "list_endpoint_fix_proposals":
+        from endpoint_proposals import list_endpoint_fix_proposals
+
+        return list_endpoint_fix_proposals(
+            conn,
+            district=arguments.get("district"),
+            status=arguments.get("status") or "pending",
+            tier=arguments.get("tier"),
+            limit=int(arguments.get("limit") or 25),
+        )
+    if name == "apply_endpoint_fix_proposals":
+        from endpoint_proposals import apply_endpoint_fix_proposals
+
+        return apply_endpoint_fix_proposals(
+            conn,
+            proposal_ids=arguments.get("proposal_ids"),
+            district=arguments.get("district"),
+            operator_id=arguments.get("operator_id") or agent_name,
+        )
+    if name == "ai_scan_endpoint_fix_proposals":
+        from endpoint_proposals_ai import ai_scan_endpoint_fix_proposals
+
+        return ai_scan_endpoint_fix_proposals(
+            conn,
+            arguments["district"],
+            batch_id=arguments.get("batch_id"),
+            limit=int(arguments.get("limit") or 10),
+            mode=str(arguments.get("mode") or "tiered"),
+            reasoning_depth=str(arguments.get("reasoning_depth") or "quick"),
+        )
     if name == "topology_batch_scan":
         return tools.tool_topology_batch_scan(conn, requested_by=agent_name)
     if name == "resolve_place":
@@ -723,6 +1029,32 @@ def _execute_tool(
             conn,
             tier=arguments.get("tier") or "master",
             asset_kind=arguments.get("asset_kind"),
+            district=arguments.get("district"),
+            region=arguments.get("region"),
+            west=arguments.get("west"),
+            south=arguments.get("south"),
+            east=arguments.get("east"),
+            north=arguments.get("north"),
+        )
+    if name == "list_assets_in_territory":
+        return spatial_tools.tool_list_assets_in_territory(
+            conn,
+            tier=arguments.get("tier") or "master",
+            asset_kind=arguments.get("asset_kind"),
+            district=arguments.get("district"),
+            region=arguments.get("region"),
+            west=arguments.get("west"),
+            south=arguments.get("south"),
+            east=arguments.get("east"),
+            north=arguments.get("north"),
+            limit=int(arguments.get("limit") or 25),
+            offset=int(arguments.get("offset") or 0),
+            include_geom=bool(arguments.get("include_geom")),
+        )
+    if name == "territory_network_summary":
+        return spatial_tools.tool_territory_network_summary(
+            conn,
+            tier=arguments.get("tier") or "master",
             district=arguments.get("district"),
             region=arguments.get("region"),
             west=arguments.get("west"),
@@ -866,24 +1198,43 @@ def run_tool_loop(
     *,
     run_id: str | None = None,
     agent_name: str = "StewardAssistant",
-    max_turns: int = MAX_TOOL_TURNS,
+    max_turns: int | None = None,
     tool_filter: Callable[[str], bool] | None = None,
     portal_context: dict[str, Any] | None = None,
+    llm_profile: LlmProfileName = "copilot",
+    model: str | None = None,
+    progress_request_id: str | None = None,
 ) -> dict[str, Any]:
     """Multi-turn OpenAI-compatible tool loop until final assistant message."""
+    from agents.copilot_progress import push_progress, tool_progress
+
+    cfg = get_llm_profile(llm_profile)
+    if max_turns is None:
+        max_turns = cfg.max_tool_turns
+
     schemas = _tool_schemas()
     if tool_filter:
         schemas = [s for s in schemas if tool_filter(s["function"]["name"])]
 
     tools_used: list[str] = []
     ui_actions: list[dict[str, Any]] = []
-    model = os.getenv("GIOP_LLM_MODEL") or "gpt-4o-mini"
+    model = model or cfg.model
     last_content = ""
     turn = 0
     had_tool_calls = False
+    last_formatted_content: str | None = None
+    last_structured: dict[str, Any] | None = None
+
+    push_progress(progress_request_id, "Planning next steps")
 
     for turn in range(max_turns):
-        result = complete_chat(messages, tools=schemas if schemas else None, model=model)
+        push_progress(progress_request_id, "Thinking")
+        result = complete_chat(
+            messages,
+            tools=schemas if schemas else None,
+            model=model,
+            profile=llm_profile,
+        )
         model = result.get("model") or model
         raw = result.get("raw") or {}
         tool_calls = raw.get("tool_calls") or []
@@ -905,6 +1256,7 @@ def run_tool_loop(
             fn = tc.get("function") or {}
             tool_name = fn.get("name") or ""
             tools_used.append(tool_name)
+            tool_progress(progress_request_id, tool_name)
             try:
                 args = json.loads(fn.get("arguments") or "{}")
             except json.JSONDecodeError:
@@ -929,6 +1281,10 @@ def run_tool_loop(
                 output = {"error": f"{type(exc).__name__}: {exc}"}
             if isinstance(output, dict) and output.get("ui_action"):
                 ui_actions.append(output["ui_action"])
+            if isinstance(output, dict) and output.get("formatted_summary"):
+                last_formatted_content = str(output["formatted_summary"])
+            if isinstance(output, dict) and output.get("structured"):
+                last_structured = output["structured"]
             log_agent_step(
                 conn,
                 run_id=run_id,
@@ -953,9 +1309,46 @@ def run_tool_loop(
 
     return {
         "content": last_content,
+        "formatted_content": last_formatted_content,
+        "structured": last_structured,
         "model": model,
         "tools_used": tools_used,
         "ui_actions": ui_actions,
-        "configured": llm_configured(),
+        "configured": cfg.configured,
+        "llm_profile": llm_profile,
         "turns": turn + 1 if had_tool_calls else 1,
+        "transcript": _messages_to_transcript(messages),
     }
+
+
+def _messages_to_transcript(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Human-readable trace of assistant reasoning + tool calls for steward UI."""
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role == "system":
+            continue
+        if role == "assistant":
+            entry: dict[str, Any] = {"role": "assistant"}
+            content = (msg.get("content") or "").strip()
+            if content:
+                entry["content"] = content
+            tool_calls = msg.get("tool_calls") or []
+            if tool_calls:
+                entry["tool_calls"] = [
+                    {
+                        "name": (tc.get("function") or {}).get("name"),
+                        "arguments": (tc.get("function") or {}).get("arguments"),
+                    }
+                    for tc in tool_calls
+                ]
+            if content or tool_calls:
+                out.append(entry)
+        elif role == "tool":
+            snippet = (msg.get("content") or "")[:2000]
+            out.append({"role": "tool", "content": snippet})
+        elif role == "user":
+            content = (msg.get("content") or "").strip()
+            if content:
+                out.append({"role": "user", "content": content[:4000]})
+    return out

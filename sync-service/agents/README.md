@@ -22,7 +22,9 @@ All mutating operations pass through `policy.py`. LLM agents recommend actions; 
 
 ## ReAct tool loop
 
-Steward chat and agent validation cycles use `run_tool_loop()` which calls DQ/topology tools (`list_exceptions`, `detect_cycles`, `propose_cleanup`, etc.) until the model returns a final answer. Configure `GIOP_LLM_MAX_TOOL_TURNS` (default 8).
+Steward chat uses `GIOP_LLM_*`. The **data cleaning agent** (Run agent cycle on Data Quality) uses `GIOP_CLEANUP_LLM_*` when set, otherwise falls back to `GIOP_LLM_*`.
+
+Configure `GIOP_LLM_MAX_TOOL_TURNS` (default 8) for copilot; `GIOP_CLEANUP_LLM_MAX_TOOL_TURNS` for the agent cycle.
 
 ## API (sync-service)
 
@@ -38,6 +40,8 @@ Steward chat and agent validation cycles use `run_tool_loop()` which calls DQ/to
 - `GET /api/v1/portal/ai/voice/status` — STT/TTS availability
 - `GET /api/v1/spatial/territory?district=` — ECG district/region bbox
 - `GET /api/v1/spatial/inventory?tier=master&asset_kind=pole&district=` — asset counts
+- `GET /api/v1/spatial/assets?district=&asset_kind=pole_11kv&limit=25` — paginated asset list
+- `GET /api/v1/spatial/network-summary?district=` — nodes + lines summary
 - `GET /api/v1/approvals/pending`
 - `POST /api/v1/approvals/{id}/approve|reject` — approve does **not** write master by default (`execute: false`)
 - `POST /api/v1/proposals/generate/{exception_id}` — dry-run + queue proposal
@@ -58,7 +62,41 @@ SUPABASE_DB_URI=postgresql://...
 
 Without LLM keys, the assistant uses deterministic fallback text.
 
-## Qwen (DashScope)
+### Separate cleanup agent LLM
+
+```bash
+# Map copilot (default)
+GIOP_LLM_API_KEY=sk-...
+GIOP_LLM_BASE_URL=https://api.openai.com/v1
+GIOP_LLM_MODEL=gpt-4o-mini
+
+# Data cleaning agent cycle — optional second provider
+GIOP_CLEANUP_LLM_API_KEY=sk-ws-...
+GIOP_CLEANUP_LLM_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+GIOP_CLEANUP_LLM_MODEL=qwen-plus
+GIOP_CLEANUP_LLM_WORKSPACE_ID=ws-...
+GIOP_CLEANUP_LLM_TEMPERATURE=0.1
+GIOP_CLEANUP_LLM_TIMEOUT_SEC=120
+```
+
+### DeepSeek — cleanup agent
+
+```bash
+# Map copilot stays on OpenAI (or your existing GIOP_LLM_*)
+GIOP_CLEANUP_LLM_API_KEY=sk-...
+GIOP_CLEANUP_LLM_BASE_URL=https://api.deepseek.com/v1
+GIOP_CLEANUP_LLM_MODEL=deepseek-v4-pro
+GIOP_CLEANUP_LLM_TEMPERATURE=0.1
+GIOP_CLEANUP_LLM_TIMEOUT_SEC=120
+```
+
+Use `deepseek-v4-flash` for lower cost on large tool loops. Smoke test:
+
+```bash
+cd sync-service && GIOP_CLEANUP_LLM_API_KEY=sk-... python scripts/test_cleanup_llm.py
+```
+
+## Qwen (DashScope) — copilot or cleanup
 
 ```bash
 GIOP_LLM_API_KEY=sk-ws-...          # or sk-... from Model Studio

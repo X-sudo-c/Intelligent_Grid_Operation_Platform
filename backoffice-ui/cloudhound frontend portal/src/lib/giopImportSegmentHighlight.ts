@@ -1,5 +1,5 @@
 import type { MapBboxContext } from './giopCopilotTypes';
-import { GIOP_MAP_LABEL_FONT_REGULAR } from './giopMapLayers';
+import { GIOP_MAP_LABEL_FONT_REGULAR, GIS_IMPORT_MAGENTA } from './giopMapLayers';
 
 export interface ImportSegmentHighlightGeoJson {
   line: GeoJSON.FeatureCollection;
@@ -19,11 +19,11 @@ export const IMPORT_SEGMENT_ENDPOINT_SOURCE = 'import-segment-endpoints';
 export const IMPORT_SEGMENT_ENDPOINT_LAYER = 'import-segment-endpoints-layer';
 export const IMPORT_SEGMENT_LABEL_LAYER = 'import-segment-endpoint-labels';
 
-export function importSegmentLinePaint(isLightMode: boolean) {
+export function importSegmentLinePaint(_isLightMode: boolean) {
   return {
-    'line-color': isLightMode ? '#c026d3' : '#e879f9',
-    'line-width': ['interpolate', ['linear'], ['zoom'], 14, 4, 16, 6, 18, 8],
-    'line-opacity': 0.95,
+    'line-color': GIS_IMPORT_MAGENTA,
+    'line-width': ['interpolate', ['linear'], ['zoom'], 14, 5, 16, 7, 18, 9],
+    'line-opacity': 1,
   };
 }
 

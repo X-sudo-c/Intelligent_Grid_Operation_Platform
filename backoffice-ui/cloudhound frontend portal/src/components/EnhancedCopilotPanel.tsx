@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Mic, MicOff, Send, Sparkles, X, Bot, User } from 'lucide-react';
-import { portalAiVoiceAudioTurn, portalAiVoiceTurn } from '../api/giop-api';
+import { portalAiVoiceAudioTurn, portalAiVoiceTurn, newCopilotRequestId } from '../api/giop-api';
 import { useGiopVoiceMode } from '../context/GiopVoiceModeContext';
 import { useGiopMapOverlay } from '../context/GiopMapOverlayContext';
 import { playCopilotSpeech, stopCopilotSpeech } from '../lib/giopVoicePlayback';
@@ -14,6 +14,8 @@ import {
   type GiopCopilotPortalContext,
   type GiopCopilotUiAction,
 } from '../lib/giopCopilotTypes';
+import type { CopilotStructuredContent } from '../lib/giopCopilotMessageContent';
+import { CopilotMessageBody } from './CopilotMessageContent';
 import { GiopVoiceDock } from './GiopVoiceDock';
 import { slideUp, staggerContainer, fadeUpItem } from '../lib/motion';
 
@@ -25,6 +27,15 @@ interface EnhancedCopilotPanelProps {
 
 function newId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function parseStructured(agent?: Record<string, unknown>): CopilotStructuredContent | undefined {
+  const raw = agent?.structured;
+  if (!raw || typeof raw !== 'object') return undefined;
+  if ((raw as { type?: string }).type === 'network_summary') {
+    return raw as CopilotStructuredContent;
+  }
+  return undefined;
 }
 
 /**
@@ -73,7 +84,7 @@ export function EnhancedCopilotPanel({
         findings?: string[];
         actions?: string[];
         ui_actions?: Array<Record<string, unknown>>;
-        agent?: Record<string, unknown> & { speak?: string; session_id?: string };
+        agent?: Record<string, unknown> & { speak?: string; session_id?: string; structured?: Record<string, unknown> };
       },
       pendingId: string,
     ) => {
@@ -81,12 +92,14 @@ export function EnhancedCopilotPanel({
       if (resp.agent?.session_id) {
         voiceSessionIdRef.current = String(resp.agent.session_id);
       }
-      // Surface what the assistant actually did (map moves, tab switches) so
-      // UI actions never happen silently.
+      const structured = parseStructured(resp.agent);
       const actionLines = [
         ...(resp.actions ?? []),
         ...uiActions.map(describeCopilotUiAction),
-      ];
+      ].filter((line) => line !== 'Spoken reply ready');
+      const findings = (resp.findings ?? []).filter(
+        (line) => !line.startsWith('Voice fast path:') && !line.startsWith('Fast path:'),
+      );
       setMessages((prev) =>
         prev
           .filter((m) => m.id !== pendingId)
@@ -94,9 +107,10 @@ export function EnhancedCopilotPanel({
             id: newId(),
             role: 'assistant',
             content: resp.content,
-            findings: resp.findings,
-            actions: actionLines,
+            findings: findings.length > 0 ? findings : undefined,
+            actions: actionLines.length > 0 ? actionLines : undefined,
             uiActions,
+            structured,
           }),
       );
       for (const action of uiActions) {
@@ -110,6 +124,7 @@ export function EnhancedCopilotPanel({
     async (blob: Blob, meta?: { rearmMic?: () => void }) => {
       if (busy) return;
       setBusy(true);
+      const requestId = newCopilotRequestId();
       const pendingId = newId();
       setMessages((prev) => [
         ...prev,
@@ -118,6 +133,8 @@ export function EnhancedCopilotPanel({
           role: 'assistant',
           content: 'Processing…',
           pending: true,
+          pendingQuery: 'Voice command',
+          requestId,
         },
       ]);
       try {
@@ -125,7 +142,10 @@ export function EnhancedCopilotPanel({
           audio: blob,
           sessionId: voiceSessionIdRef.current,
           mrid: portalContext.focus_mrid ?? undefined,
-          context: copilotContextForVoice() as Record<string, unknown>,
+          context: {
+            ...copilotContextForVoice(),
+            copilot_request_id: requestId,
+          } as Record<string, unknown>,
         });
         const transcript = String(resp.agent?.transcript ?? '').trim();
         if (transcript) {
@@ -137,6 +157,8 @@ export function EnhancedCopilotPanel({
               role: 'assistant',
               content: 'Thinking…',
               pending: true,
+              pendingQuery: transcript,
+              requestId: String(resp.agent?.request_id ?? requestId),
             },
           ]);
         }
@@ -169,6 +191,7 @@ export function EnhancedCopilotPanel({
       setInput('');
       setBusy(true);
       const userMsg: GiopCopilotMessage = { id: newId(), role: 'user', content: trimmed };
+      const requestId = newCopilotRequestId();
       const pendingId = newId();
       setMessages((prev) => [
         ...prev,
@@ -178,6 +201,8 @@ export function EnhancedCopilotPanel({
           role: 'assistant',
           content: 'Thinking…',
           pending: true,
+          pendingQuery: trimmed,
+          requestId,
         },
       ]);
       try {
@@ -200,14 +225,15 @@ export function EnhancedCopilotPanel({
           return;
         }
 
-        // All turns use voice-turn: transcript normalization, fast-path map
-        // commands (highlight/pan/count), then steward chat fallback — no LLM
-        // required for simple commands even when typed.
         const resp = await portalAiVoiceTurn({
           text: trimmed,
           sessionId: voiceSessionIdRef.current,
+          requestId,
           mrid: portalContext.focus_mrid ?? undefined,
-          context: copilotContextForVoice() as Record<string, unknown>,
+          context: {
+            ...copilotContextForVoice(),
+            copilot_request_id: requestId,
+          } as Record<string, unknown>,
         });
         await applyResponse(resp, pendingId);
         if (opts?.voice) {
@@ -455,7 +481,11 @@ export function EnhancedCopilotPanel({
                           </div>
                         ) : (
                           <div className="space-y-2">
-                            <p>{m.content}</p>
+                            <CopilotMessageBody
+                              content={m.content}
+                              structured={m.structured}
+                              isLightMode={isLightMode}
+                            />
                             {m.findings && m.findings.length > 0 && (
                               <motion.ul
                                 initial="hidden"

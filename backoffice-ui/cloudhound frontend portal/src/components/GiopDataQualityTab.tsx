@@ -1150,7 +1150,12 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-3 pb-4 pt-2 space-y-2">
-      <GiopImportQueuePanel isLightMode={isLightMode} enabled={dqTier === 'master'} />
+      <GiopImportQueuePanel
+        isLightMode={isLightMode}
+        enabled
+        dataTier={dqTier === 'staging' ? 'staging' : 'gis'}
+        showImportQueue={dqTier === 'master'}
+      />
 
       {(kpis || approvals.length > 0 || approvedProposals.length > 0 || validationBusy) && (
         <details
@@ -1172,12 +1177,23 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
               <p className={`text-xs ${muted}`}>
                 Engine: {agentsStatus.engine}
                 {' · '}
-                LLM:{' '}
+                Copilot:{' '}
                 {agentsStatus.llm_configured
                   ? agentsStatus.llm_reachable === false
-                    ? `configured but unreachable (${agentsStatus.llm_model})`
-                    : `connected (${agentsStatus.llm_model})`
-                  : 'rules-only (no API key)'}
+                    ? `unreachable (${agentsStatus.llm_model})`
+                    : agentsStatus.llm_model ?? 'connected'
+                  : 'rules-only'}
+                {agentsStatus.cleanup_llm_distinct ? (
+                  <>
+                    {' · '}
+                    Cleanup agent:{' '}
+                    {agentsStatus.cleanup_llm_configured
+                      ? agentsStatus.cleanup_llm_reachable === false
+                        ? `unreachable (${agentsStatus.cleanup_llm_model})`
+                        : agentsStatus.cleanup_llm_model ?? 'connected'
+                      : 'rules-only'}
+                  </>
+                ) : null}
                 {agentsStatus.llm_configured && agentsStatus.llm_tool_count
                   ? ` · ${agentsStatus.llm_tool_count} tools`
                   : ''}

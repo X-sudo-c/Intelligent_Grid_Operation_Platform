@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react';
 import maplibregl from '../lib/maplibreSetup';
-import { MARTIN_URL, getAssetLocation, probeGisOverviewAvailable, getReferenceMapConfig } from '../api/giop-api';
+import { MARTIN_URL, getAssetLocation, isUuidMrid, probeGisOverviewAvailable, probeUnpromotedGapAvailable, getReferenceMapConfig } from '../api/giop-api';
 import type { GiopReferenceMapLayerConfig } from '../api/giop-api';
 import type { GiopStagingAsset, GiopFieldTechnician, GiopWorkOrder, GiopTopologyPayload } from '../api/giop-api';
 import type { MapBbox } from '../hooks/useGiopGraphChunk';
@@ -10,6 +10,7 @@ import {
   buildGiopLegendGroups,
   buildGiopMapStyle,
   createDefaultGiopLegendVisibility,
+  syncNetworkGeometryModeOnMap,
   pinTransformerLayersAboveNodes,
   applyStagingMapLayersPaint,
   stagingPointCirclePaint,
@@ -27,6 +28,7 @@ import {
   martinLayerPath,
   MIN_MAP_ZOOM,
   NODE_DETAIL_ZOOM,
+  readNetworkGeometryMode,
   fitMapBounds,
   flyToLatLon,
   flyToNodeFocus,
@@ -322,6 +324,7 @@ export function GiopMapView({
   const [gisOverviewAvailable, setGisOverviewAvailable] = useState<boolean>(
     () => cachedGisOverviewAvailable ?? true,
   );
+  const [unpromotedGapAvailable, setUnpromotedGapAvailable] = useState(false);
   const [referenceMapConfig, setReferenceMapConfig] = useState<GiopReferenceMapLayerConfig[]>([]);
   const [zoomHintVisible, setZoomHintVisible] = useState(false);
   const hideZoomHintTimerRef = useRef<number | undefined>(undefined);
@@ -446,6 +449,9 @@ export function GiopMapView({
     void getReferenceMapConfig()
       .then(setReferenceMapConfig)
       .catch(() => setReferenceMapConfig([]));
+    void probeUnpromotedGapAvailable(MARTIN_URL, controller.signal)
+      .then(setUnpromotedGapAvailable)
+      .catch(() => setUnpromotedGapAvailable(false));
     return () => {
       controller.abort();
       window.clearTimeout(timer);
@@ -457,6 +463,22 @@ export function GiopMapView({
       setNetworkGeometryMode('master');
     }
   }, [gisOverviewAvailable, networkGeometryMode, setNetworkGeometryMode]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+
+    const apply = () => {
+      syncNetworkGeometryModeOnMap(map, networkGeometryMode, {
+        gisOverviewAvailable,
+        light: isLightModeRef.current,
+        martinUrl: MARTIN_URL,
+      });
+    };
+
+    if (map.isStyleLoaded()) apply();
+    else whenMapCanAddLayers(map, apply);
+  }, [mapReady, networkGeometryMode, gisOverviewAvailable, isLightMode, mapZoom]);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
@@ -562,6 +584,10 @@ export function GiopMapView({
         applyGiopLegendVisibility(
           map,
           createDefaultGiopLegendVisibility(legendGroups),
+          {
+            geometryMode: readNetworkGeometryMode(),
+            gisOverviewAvailable: includeGisOverview,
+          },
         );
         bindMartinClicks();
         detachHover = attachGiopMapHover(map, host, () => isLightModeRef.current);
@@ -1240,17 +1266,19 @@ export function GiopMapView({
     }
   }, [feederHighlight, isLightMode, mapBusy]);
 
-  // GIS import queue: highlight conductor line + labelled endpoints.
+  // GIS import queue: highlight conductor line + labelled endpoints (hidden in Master-only mode).
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
 
-    const line = importSegmentHighlight?.geojson.line ?? EMPTY_FC;
-    const endpoints = importSegmentHighlight?.geojson.endpoints ?? EMPTY_FC;
+    const activeHighlight =
+      importSegmentHighlight && networkGeometryMode !== 'master' ? importSegmentHighlight : null;
+    const line = activeHighlight?.geojson.line ?? EMPTY_FC;
+    const endpoints = activeHighlight?.geojson.endpoints ?? EMPTY_FC;
 
     const applyImportHighlight = () => {
       safeMapMutate(map, () => {
-        if (!importSegmentHighlight) {
+        if (!activeHighlight) {
           for (const layerId of [
             IMPORT_SEGMENT_LABEL_LAYER,
             IMPORT_SEGMENT_ENDPOINT_LAYER,
@@ -1333,7 +1361,7 @@ export function GiopMapView({
     } else {
       whenMapCanAddLayers(map, applyImportHighlight);
     }
-  }, [importSegmentHighlight, isLightMode, mapReady]);
+  }, [importSegmentHighlight, isLightMode, mapReady, networkGeometryMode]);
 
   // FR-005 topology repair preview (before/after segment snap).
   useEffect(() => {
@@ -1796,6 +1824,14 @@ export function GiopMapView({
       };
     }
 
+    if (!focusMrid || !isUuidMrid(focusMrid)) {
+      return () => {
+        cancelled = true;
+        cancelPendingApply?.();
+        teardown();
+      };
+    }
+
     void getAssetLocation(focusMrid)
       .then((loc) => {
         if (cancelled || loc.longitude == null || loc.latitude == null) return;
@@ -2113,6 +2149,7 @@ export function GiopMapView({
         <GiopNetworkGeometryToggle
           isLightMode={isLightMode}
           gisOverviewAvailable={gisOverviewAvailable}
+          unpromotedGapAvailable={unpromotedGapAvailable}
           mode={networkGeometryMode}
           onModeChange={setNetworkGeometryMode}
         />

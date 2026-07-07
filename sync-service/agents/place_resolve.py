@@ -42,6 +42,75 @@ _CITY_LOCALITY_NAMES = frozenset(
     }
 )
 
+_ROAD_QUERY_RE = re.compile(
+    r"\b(?:road|rd|street|st|avenue|ave|highway|lane|dr|drive|boulevard|blvd)\b",
+    re.I,
+)
+
+_ROAD_IN_CITY_RE = re.compile(
+    r"^(?P<road>.+?\b(?:road|rd|street|st|avenue|ave|highway|lane|dr|drive|boulevard|blvd))"
+    r"\s+in\s+(?P<city>.+)$",
+    re.I,
+)
+
+_ROAD_ABBREV_STOPWORDS = frozenset(
+    {"in", "at", "on", "to", "of", "or", "an", "as", "by", "up", "no", "so", "we", "he"}
+)
+
+
+def _split_road_city_hint(query: str) -> tuple[str, str | None]:
+    """Split 'yaa asantewaa road in kumasi' into road + city for geocoding."""
+    m = _ROAD_IN_CITY_RE.match(query.strip())
+    if not m:
+        return query, None
+    return m.group("road").strip(), m.group("city").strip()
+
+
+def _normalize_road_query_for_geocode(query: str) -> list[str]:
+    """Build OSM-friendly road name variants from spoken lowercase text."""
+    road, _city = _split_road_city_hint(query)
+    q = re.sub(r"^along\s+", "", road.strip(), flags=re.I)
+    if not q:
+        return []
+    words = q.split()
+    titled: list[str] = []
+    for word in words:
+        low = word.lower()
+        if len(word) == 2 and word.isalpha() and low not in _ROAD_ABBREV_STOPWORDS:
+            titled.extend([word[0].upper(), word[1].upper()])
+        elif len(word) == 1 and word.isalpha():
+            titled.append(word.upper())
+        else:
+            titled.append(word.capitalize())
+    spaced_abbrev = " ".join(titled)
+    title_case = " ".join(word.capitalize() for word in words)
+    seen: set[str] = set()
+    out: list[str] = []
+    for base in (q, title_case, spaced_abbrev):
+        key = base.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(base)
+    return out
+
+
+def _road_geocode_variants(query: str) -> list[str]:
+    road, city = _split_road_city_hint(query)
+    city_title = " ".join(part.capitalize() for part in city.split()) if city else None
+    variants: list[str] = []
+    seen: set[str] = set()
+    for base in _normalize_road_query_for_geocode(road):
+        suffixes = ["", ", Ghana", ", Accra, Ghana", ", Kumasi, Ghana", ", Greater Accra, Ghana"]
+        if city_title:
+            suffixes = [f", {city_title}, Ghana", f", {city_title}"] + suffixes
+        for suffix in suffixes:
+            item = f"{base}{suffix}" if suffix else base
+            key = item.lower()
+            if key not in seen:
+                seen.add(key)
+                variants.append(item)
+    return variants
+
 
 def _district_row_to_result(
     row: tuple[Any, ...],
@@ -490,6 +559,15 @@ def _resolve_place_uncached(
     hit = _lookup_district_exact(conn, q)
     if hit:
         return hit
+
+    if geocode and _ROAD_QUERY_RE.search(q):
+        for variant in _road_geocode_variants(q):
+            hit = _resolve_osm(conn, variant)
+            if hit:
+                hit["query"] = q
+                hit["matched_as"] = q
+                hit["source"] = "osm_road"
+                return hit
 
     # Geocode localities before fuzzy district match (Roman Ridge, East Legon, romanridge).
     if geocode:

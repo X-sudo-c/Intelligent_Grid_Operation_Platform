@@ -55,6 +55,22 @@ postgres:
         validation: text
         installation_type: text
         length_m: float4
+    map_unpromoted_conductor_segments:
+      schema: public
+      table: map_unpromoted_conductor_segments
+      srid: 4326
+      geometry_column: geom
+      geometry_type: LINESTRING
+      bounds: [-3.5, 4.5, 1.5, 8.5]
+      minzoom: 11
+      maxzoom: 16
+      properties:
+        id: int8
+        source_layer: text
+        nominal_voltage: text
+        district: text
+        installation_type: text
+        length_m: float4
     ug_cable_33kv:
       schema: gis
       table: ug_cable_33kv

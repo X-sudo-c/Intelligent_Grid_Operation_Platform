@@ -1261,6 +1261,42 @@ class ApprovalAgentTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_cleanup_profile_falls_back_to_copilot(self):
+        from agents.llm.provider import cleanup_llm_uses_distinct_provider, get_llm_profile
+
+        with patch.dict(
+            os.environ,
+            {
+                "GIOP_LLM_API_KEY": "copilot-key",
+                "GIOP_LLM_MODEL": "gpt-4o-mini",
+                "GIOP_LLM_BASE_URL": "https://api.openai.com/v1",
+            },
+            clear=False,
+        ):
+            cleanup = get_llm_profile("cleanup")
+            self.assertEqual(cleanup.api_key, "copilot-key")
+            self.assertEqual(cleanup.model, "gpt-4o-mini")
+            self.assertFalse(cleanup_llm_uses_distinct_provider())
+
+    def test_cleanup_profile_uses_distinct_settings(self):
+        from agents.llm.provider import cleanup_llm_uses_distinct_provider, get_llm_profile
+
+        with patch.dict(
+            os.environ,
+            {
+                "GIOP_LLM_API_KEY": "copilot-key",
+                "GIOP_LLM_MODEL": "gpt-4o-mini",
+                "GIOP_CLEANUP_LLM_API_KEY": "cleanup-key",
+                "GIOP_CLEANUP_LLM_MODEL": "qwen-plus",
+                "GIOP_CLEANUP_LLM_BASE_URL": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            },
+            clear=False,
+        ):
+            cleanup = get_llm_profile("cleanup")
+            self.assertEqual(cleanup.api_key, "cleanup-key")
+            self.assertEqual(cleanup.model, "qwen-plus")
+            self.assertTrue(cleanup_llm_uses_distinct_provider())
+
     def test_workspace_header_when_configured(self):
         from agents.llm import provider
 

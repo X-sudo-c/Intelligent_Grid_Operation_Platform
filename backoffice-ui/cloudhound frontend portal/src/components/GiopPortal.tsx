@@ -30,7 +30,7 @@ import { useGiopTopology } from '../hooks/useGiopTopology';
 import { useGiopTopologySeed } from '../hooks/useGiopTopologySeed';
 import { useGiopRealtime } from '../hooks/useGiopRealtime';
 import { useGiopFieldTechnicians } from '../hooks/useGiopFieldTechnicians';
-import { DEFAULT_START_MRID, getAssetLocation, getSpatialTerritoryGeojson, getStagingAssets, listWorkOrders, type GiopStagingAsset, type GiopWorkOrder } from '../api/giop-api';
+import { DEFAULT_START_MRID, getAssetLocation, getSpatialTerritoryGeojson, getStagingAssets, isUuidMrid, listWorkOrders, type GiopStagingAsset, type GiopWorkOrder } from '../api/giop-api';
 import {
   readGiopRouteFromLocation,
   subscribeToGiopRouteChanges,
@@ -40,6 +40,7 @@ import {
 import type { GiopGraphQueryKey } from '../lib/giopGraphTypes';
 import { GIOP_GRAPH_QUERY_OPTIONS } from '../lib/giopGraphTypes';
 import type { PortalGraphResponse } from '../lib/giopGraphTypes';
+import { resolvePortalGraphNodeCoordinates } from '../lib/giopGraphAdapter';
 import { normalizeMapCoordinates, extractStagingGeomCoordinates } from '../lib/giopMapCoordinates';
 import type { GiopMapFlyRequest } from '../lib/giopMapFlyRequest';
 import { resolveTopologyStartMrid, isStagingOnlySeed } from '../lib/resolveTopologyStartMrid';
@@ -279,6 +280,10 @@ function GiopPortalInner() {
       return;
     }
     if (isStagingOnlySeed(mrid, stagingSeedRows)) {
+      setBoundaryFeederId(null);
+      return;
+    }
+    if (!isUuidMrid(mrid)) {
       setBoundaryFeederId(null);
       return;
     }
@@ -829,8 +834,31 @@ function GiopPortalInner() {
         { tab: route.tab, startMrid, graphQuery, focusMrid: mrid },
         true,
       );
+      if (route.tab === 'combined') {
+        clearMapIdentifyFocus();
+        const coordinates =
+          resolvePortalGraphNodeCoordinates(graph, mrid) ??
+          extractStagingGeomCoordinates(staging.find((a) => a.mrid === mrid)?.geom) ??
+          null;
+        void focusOnMap(mrid, {
+          name: label,
+          source: 'graph',
+          navigateTab: false,
+          sidePanel: false,
+          coordinates,
+        });
+      }
     },
-    [graphQuery, route.tab, setSelection, startMrid],
+    [
+      clearMapIdentifyFocus,
+      focusOnMap,
+      graph,
+      graphQuery,
+      route.tab,
+      setSelection,
+      staging,
+      startMrid,
+    ],
   );
 
   const handleOperationsMapNodeClick = useCallback(
