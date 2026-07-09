@@ -33,9 +33,19 @@ TOPOLOGY_SCAN_PHASES: tuple[tuple[str, str, float], ...] = (
 )
 
 TOPOLOGY_SCAN_DEFAULT_ESTIMATE_SEC = int(
-    os.getenv("TOPOLOGY_SCAN_DEFAULT_ESTIMATE_SEC", "420")
+    # After 00105 + national geom skip, national scans should finish in minutes.
+    os.getenv("TOPOLOGY_SCAN_DEFAULT_ESTIMATE_SEC", "180")
 )
-TOPOLOGY_SCAN_STALE_SEC = int(os.getenv("TOPOLOGY_SCAN_STALE_SEC", "900"))
+# Fail a run that has not published progress for this long (geometric SQL can
+# legitimately take a while — keep above typical phase duration, below lock TTL).
+TOPOLOGY_SCAN_STALE_SEC = int(os.getenv("TOPOLOGY_SCAN_STALE_SEC", "1800"))
+# Cap historical ETA so a previous multi-hour run does not advertise "~7m".
+TOPOLOGY_SCAN_ESTIMATE_MAX_SEC = int(os.getenv("TOPOLOGY_SCAN_ESTIMATE_MAX_SEC", "3600"))
+# National / large-clip orphan INSERT cap. Full found count is still reported;
+# only queue inserts are limited so Scan → queue cannot flood ~500k+ rows.
+# District-scale clips (span ≤ TOPO_CROSSING_MAX_SPAN_DEG) are uncapped.
+# Set to 0 to disable the cap entirely.
+TOPOLOGY_ORPHAN_INSERT_CAP = int(os.getenv("TOPOLOGY_ORPHAN_INSERT_CAP", "10000"))
 
 
 class TopologyScanInProgressError(Exception):
@@ -44,6 +54,14 @@ class TopologyScanInProgressError(Exception):
     def __init__(self, run_id: str) -> None:
         self.run_id = run_id
         super().__init__(f"Topology scan already running ({run_id})")
+
+
+class TopologyScanCancelledError(Exception):
+    """Raised when an operator cancels an in-flight master topology scan."""
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        super().__init__(f"Topology scan cancelled ({run_id})")
 
 _STAGING_ACTIVE_SQL = "io.validation NOT IN ('REJECTED', 'APPROVED')"
 
@@ -60,10 +78,38 @@ def _bbox_clause(alias: str, clip: dict[str, float] | None) -> tuple[str, list[A
 _CONNECTED_NODE_MRIDS_TABLE = "public.connected_node_mrids"
 
 
-def refresh_connected_node_mrids(conn) -> dict[str, Any]:
-    """Refresh cached line-endpoint node set (call before orphan scan / after promote)."""
+# Skip connected-node MV rebuild when fresher than this (seconds). Full rebuild
+# on ~1M lines can take minutes; orphan detection only needs a recent cache.
+CONNECTED_NODE_MRIDS_MAX_AGE_SEC = int(
+    os.getenv("CONNECTED_NODE_MRIDS_MAX_AGE_SEC", "21600")
+)
+
+
+def refresh_connected_node_mrids(
+    conn,
+    *,
+    max_age_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Refresh cached line-endpoint node set (call before orphan scan / after promote).
+
+    Pass ``max_age_seconds=0`` to force a rebuild. Topology scans use the env
+    default (6h) so repeated Scan → queue does not re-scan every line endpoint.
+    """
+    age = CONNECTED_NODE_MRIDS_MAX_AGE_SEC if max_age_seconds is None else max_age_seconds
     with conn.cursor() as cur:
-        cur.execute("SELECT public.refresh_connected_node_mrids()")
+        try:
+            cur.execute(
+                "SELECT public.refresh_connected_node_mrids(%s)",
+                (int(age),),
+            )
+        except Exception:
+            # Pre-00105 databases only expose the zero-arg overload.
+            # UndefinedFunction aborts the transaction — must clear before retry.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            cur.execute("SELECT public.refresh_connected_node_mrids()")
         row = cur.fetchone()
     payload = row[0] if row else {}
     return payload if isinstance(payload, dict) else {}
@@ -114,23 +160,17 @@ def live_master_topology_counts(conn, *, clip: dict[str, float] | None = None) -
         )
         orphan_nodes = int(cur.fetchone()[0])
 
+        # Hash anti-joins beat per-row EXISTS on ~1M lines (see EXPLAIN costs).
         cur.execute(
             f"""
             SELECT COUNT(*)
             FROM public.ac_line_segments als
             JOIN public.identified_objects io ON io.mrid = als.mrid
+            LEFT JOIN public.connectivity_nodes src ON src.mrid = als.source_node_id
+            LEFT JOIN public.connectivity_nodes tgt ON tgt.mrid = als.target_node_id
             WHERE io.validation = 'APPROVED'
             {line_bbox}
-              AND (
-                NOT EXISTS (
-                  SELECT 1 FROM public.connectivity_nodes cn
-                  WHERE cn.mrid = als.source_node_id
-                )
-                OR NOT EXISTS (
-                  SELECT 1 FROM public.connectivity_nodes cn
-                  WHERE cn.mrid = als.target_node_id
-                )
-              )
+              AND (src.mrid IS NULL OR tgt.mrid IS NULL)
             """,
             line_params,
         )
@@ -141,19 +181,15 @@ def live_master_topology_counts(conn, *, clip: dict[str, float] | None = None) -
             SELECT COUNT(*)
             FROM public.ac_line_segments als
             JOIN public.identified_objects io ON io.mrid = als.mrid
+            JOIN public.connectivity_nodes src ON src.mrid = als.source_node_id
+            JOIN public.connectivity_nodes tgt ON tgt.mrid = als.target_node_id
+            LEFT JOIN public.identified_objects sio ON sio.mrid = als.source_node_id
+            LEFT JOIN public.identified_objects tio ON tio.mrid = als.target_node_id
             WHERE io.validation = 'APPROVED'
             {line_bbox}
               AND (
-                NOT EXISTS (
-                  SELECT 1 FROM public.connectivity_nodes cn
-                  JOIN public.identified_objects nio ON nio.mrid = cn.mrid
-                  WHERE cn.mrid = als.source_node_id AND nio.validation = 'APPROVED'
-                )
-                OR NOT EXISTS (
-                  SELECT 1 FROM public.connectivity_nodes cn
-                  JOIN public.identified_objects nio ON nio.mrid = cn.mrid
-                  WHERE cn.mrid = als.target_node_id AND nio.validation = 'APPROVED'
-                )
+                sio.validation IS DISTINCT FROM 'APPROVED'
+                OR tio.validation IS DISTINCT FROM 'APPROVED'
               )
             """,
             line_params,
@@ -518,7 +554,12 @@ def validate_export_topology(conn, clip: dict[str, float] | None) -> None:
 
 
 def _auto_clear_orphans(conn, *, clip: dict[str, float] | None) -> int:
-    node_bbox, node_params = _bbox_clause("cn", clip)
+    """Resolve orphan exceptions that are now connected.
+
+    Exception-table driven (no geom bbox join) — national clips must stay fast.
+    ``clip`` is accepted for API compatibility but intentionally unused here.
+    """
+    _ = clip
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -527,27 +568,27 @@ def _auto_clear_orphans(conn, *, clip: dict[str, float] | None) -> int:
                 resolved_at = NOW(),
                 resolved_by = 'topology_scan',
                 resolution_note = 'Auto-cleared: node now has connected line segment'
-            FROM public.connectivity_nodes cn
             WHERE e.rule_code = 'ASSET_ORPHAN_NODE'
               AND e.status = 'OPEN'
-              AND e.record_mrid = cn.mrid
-              {node_bbox}
               AND EXISTS (
                 SELECT 1 FROM {_CONNECTED_NODE_MRIDS_TABLE} c
-                WHERE c.mrid = cn.mrid
+                WHERE c.mrid = e.record_mrid
               )
-            """,
-            node_params,
+            """
         )
-        cleared = cur.rowcount
-    return cleared
+        return int(cur.rowcount or 0)
 
 
 def _auto_clear_dangling(conn, *, clip: dict[str, float] | None) -> int:
-    line_bbox, line_params = _bbox_clause("als", clip)
+    """Resolve dangling/unapproved-endpoint exceptions that are now healthy.
+
+    Driven from OPEN exceptions only — never scans every approved line.
+    ``clip`` is accepted for API compatibility but intentionally unused here.
+    """
+    _ = clip
     with conn.cursor() as cur:
         cur.execute(
-            f"""
+            """
             UPDATE public.data_quality_exceptions e
             SET status = 'RESOLVED',
                 resolved_at = NOW(),
@@ -560,7 +601,6 @@ def _auto_clear_dangling(conn, *, clip: dict[str, float] | None) -> int:
                   )
               AND e.status = 'OPEN'
               AND e.record_mrid = als.mrid
-              {line_bbox}
               AND EXISTS (
                 SELECT 1 FROM public.connectivity_nodes s
                 WHERE s.mrid = als.source_node_id
@@ -577,213 +617,207 @@ def _auto_clear_dangling(conn, *, clip: dict[str, float] | None) -> int:
                 SELECT 1 FROM public.identified_objects tio
                 WHERE tio.mrid = als.target_node_id AND tio.validation = 'APPROVED'
               )
-            """,
-            line_params,
+            """
         )
-        return cur.rowcount
+        return int(cur.rowcount or 0)
 
 
-def _bulk_upsert_orphans(conn, *, clip: dict[str, float] | None) -> tuple[int, int]:
+def _orphan_insert_limit(clip: dict[str, float] | None) -> int | None:
+    """Return INSERT row cap for orphan upsert, or None for unlimited.
+
+    National / multi-district clips can find hundreds of thousands of orphans;
+    inserting all of them locks ``data_quality_exceptions`` for a long time and
+    floods the steward queue. District clips stay uncapped so local cleanup
+    can still queue every orphan in the clip.
+    """
+    if TOPOLOGY_ORPHAN_INSERT_CAP <= 0:
+        return None
+    from geometric_topology import _should_run_line_crossings
+
+    if clip is not None and _should_run_line_crossings(clip):
+        return None
+    return TOPOLOGY_ORPHAN_INSERT_CAP
+
+
+def _bulk_upsert_orphans(
+    conn, *, clip: dict[str, float] | None
+) -> tuple[int, int, bool]:
+    """Insert OPEN orphan exceptions for approved nodes with no incident line.
+
+    Returns ``(found, inserted, capped)``. ``found`` is always the full orphan
+    count; ``inserted`` may be limited on national/large clips.
+    """
     node_bbox, node_params = _bbox_clause("cn", clip)
-    orphan_from = f"""
-            FROM public.connectivity_nodes cn
-            JOIN public.identified_objects io ON io.mrid = cn.mrid
-            LEFT JOIN {_CONNECTED_NODE_MRIDS_TABLE} c ON c.mrid = cn.mrid
-            WHERE io.validation = 'APPROVED'
-              AND c.mrid IS NULL
-            {node_bbox}
-    """
-    orphan_insert_from = f"""
-            FROM public.connectivity_nodes cn
-            JOIN public.identified_objects io ON io.mrid = cn.mrid
-            JOIN public.data_quality_rules r ON r.rule_code = 'ASSET_ORPHAN_NODE'
-              AND r.enabled = TRUE
-            LEFT JOIN {_CONNECTED_NODE_MRIDS_TABLE} c ON c.mrid = cn.mrid
-            WHERE io.validation = 'APPROVED'
-              AND c.mrid IS NULL
-            {node_bbox}
-    """
+    insert_limit = _orphan_insert_limit(clip)
+    capped = insert_limit is not None
+    # Stable order so repeated capped scans refill the same steward batch first.
+    limit_sql = "ORDER BY o.mrid LIMIT %s" if capped else ""
+    params: list[Any] = list(node_params)
+    if capped:
+        params.append(int(insert_limit))
+
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            SELECT COUNT(*)
-            {orphan_from}
-            """,
-            node_params,
-        )
-        found = int(cur.fetchone()[0])
-
-        cur.execute(
-            f"""
-            INSERT INTO public.data_quality_exceptions (
-              record_type, record_mrid, rule_code, severity, error_message, details
+            WITH orphans AS (
+              SELECT cn.mrid
+              FROM public.connectivity_nodes cn
+              JOIN public.identified_objects io ON io.mrid = cn.mrid
+              LEFT JOIN {_CONNECTED_NODE_MRIDS_TABLE} c ON c.mrid = cn.mrid
+              WHERE io.validation = 'APPROVED'
+                AND c.mrid IS NULL
+              {node_bbox}
+            ),
+            to_insert AS (
+              SELECT o.mrid
+              FROM orphans o
+              {limit_sql}
+            ),
+            inserted AS (
+              INSERT INTO public.data_quality_exceptions (
+                record_type, record_mrid, rule_code, severity, error_message, details
+              )
+              SELECT
+                'connectivity_node',
+                t.mrid,
+                'ASSET_ORPHAN_NODE',
+                r.severity,
+                'Master node has no connected line segment.',
+                jsonb_build_object('line_count', 0)
+              FROM to_insert t
+              JOIN public.data_quality_rules r ON r.rule_code = 'ASSET_ORPHAN_NODE'
+                AND r.enabled = TRUE
+              ON CONFLICT (record_mrid, rule_code) WHERE status = 'OPEN'
+              DO NOTHING
+              RETURNING 1
             )
             SELECT
-              'connectivity_node',
-              cn.mrid,
-              'ASSET_ORPHAN_NODE',
-              r.severity,
-              'Master node has no connected line segment.',
-              jsonb_build_object('line_count', 0)
-            {orphan_insert_from}
-            ON CONFLICT (record_mrid, rule_code) WHERE status = 'OPEN'
-            DO NOTHING
+              (SELECT COUNT(*) FROM orphans)::bigint AS found,
+              (SELECT COUNT(*) FROM inserted)::bigint AS inserted
             """,
-            node_params,
+            params,
         )
-        inserted = cur.rowcount
-    return found, inserted
+        row = cur.fetchone()
+    found = int(row[0] or 0) if row else 0
+    inserted = int(row[1] or 0) if row else 0
+    # Cap only "bites" when more orphans exist than we queued.
+    return found, inserted, bool(capped and found > inserted)
 
 
 def _bulk_upsert_dangling(conn, *, clip: dict[str, float] | None) -> tuple[int, int]:
+    """Insert OPEN dangling-endpoint exceptions (hash anti-join, single pass)."""
     line_bbox, line_params = _bbox_clause("als", clip)
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            SELECT COUNT(*)
-            FROM public.ac_line_segments als
-            JOIN public.identified_objects io ON io.mrid = als.mrid
-            WHERE io.validation = 'APPROVED'
-            {line_bbox}
-              AND (
-                NOT EXISTS (
-                  SELECT 1 FROM public.connectivity_nodes cn WHERE cn.mrid = als.source_node_id
-                )
-                OR NOT EXISTS (
-                  SELECT 1 FROM public.connectivity_nodes cn WHERE cn.mrid = als.target_node_id
-                )
+            WITH dangling AS (
+              SELECT
+                als.mrid,
+                als.source_node_id,
+                als.target_node_id,
+                (src.mrid IS NULL) AS missing_source,
+                (tgt.mrid IS NULL) AS missing_target
+              FROM public.ac_line_segments als
+              JOIN public.identified_objects io ON io.mrid = als.mrid
+              LEFT JOIN public.connectivity_nodes src ON src.mrid = als.source_node_id
+              LEFT JOIN public.connectivity_nodes tgt ON tgt.mrid = als.target_node_id
+              WHERE io.validation = 'APPROVED'
+              {line_bbox}
+                AND (src.mrid IS NULL OR tgt.mrid IS NULL)
+            ),
+            inserted AS (
+              INSERT INTO public.data_quality_exceptions (
+                record_type, record_mrid, rule_code, severity, error_message, details
               )
-            """,
-            line_params,
-        )
-        found = int(cur.fetchone()[0])
-
-        cur.execute(
-            f"""
-            INSERT INTO public.data_quality_exceptions (
-              record_type, record_mrid, rule_code, severity, error_message, details
+              SELECT
+                'ac_line_segments',
+                d.mrid,
+                'TOPO_DANGLING_LINE_ENDPOINT',
+                r.severity,
+                'Line segment references a missing connectivity node endpoint.',
+                jsonb_build_object(
+                  'source_node_mrid', d.source_node_id::text,
+                  'target_node_mrid', d.target_node_id::text,
+                  'missing_source', d.missing_source,
+                  'missing_target', d.missing_target
+                )
+              FROM dangling d
+              JOIN public.data_quality_rules r ON r.rule_code = 'TOPO_DANGLING_LINE_ENDPOINT'
+                AND r.enabled = TRUE
+              ON CONFLICT (record_mrid, rule_code) WHERE status = 'OPEN'
+              DO NOTHING
+              RETURNING 1
             )
             SELECT
-              'ac_line_segments',
-              als.mrid,
-              'TOPO_DANGLING_LINE_ENDPOINT',
-              r.severity,
-              'Line segment references a missing connectivity node endpoint.',
-              jsonb_build_object(
-                'source_node_mrid', als.source_node_id::text,
-                'target_node_mrid', als.target_node_id::text,
-                'missing_source', NOT EXISTS (
-                  SELECT 1 FROM public.connectivity_nodes cn WHERE cn.mrid = als.source_node_id
-                ),
-                'missing_target', NOT EXISTS (
-                  SELECT 1 FROM public.connectivity_nodes cn WHERE cn.mrid = als.target_node_id
-                )
-              )
-            FROM public.ac_line_segments als
-            JOIN public.identified_objects io ON io.mrid = als.mrid
-            JOIN public.data_quality_rules r ON r.rule_code = 'TOPO_DANGLING_LINE_ENDPOINT'
-            WHERE io.validation = 'APPROVED'
-              AND r.enabled = TRUE
-            {line_bbox}
-              AND (
-                NOT EXISTS (
-                  SELECT 1 FROM public.connectivity_nodes cn WHERE cn.mrid = als.source_node_id
-                )
-                OR NOT EXISTS (
-                  SELECT 1 FROM public.connectivity_nodes cn WHERE cn.mrid = als.target_node_id
-                )
-              )
-            ON CONFLICT (record_mrid, rule_code) WHERE status = 'OPEN'
-            DO NOTHING
+              (SELECT COUNT(*) FROM dangling)::bigint AS found,
+              (SELECT COUNT(*) FROM inserted)::bigint AS inserted
             """,
             line_params,
         )
-        inserted = cur.rowcount
+        row = cur.fetchone()
+    found = int(row[0] or 0) if row else 0
+    inserted = int(row[1] or 0) if row else 0
     return found, inserted
 
 
 def _bulk_upsert_unapproved_endpoints(conn, *, clip: dict[str, float] | None) -> tuple[int, int]:
+    """Insert OPEN unapproved-endpoint exceptions (hash joins, single pass)."""
     line_bbox, line_params = _bbox_clause("als", clip)
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            SELECT COUNT(*)
-            FROM public.ac_line_segments als
-            JOIN public.identified_objects io ON io.mrid = als.mrid
-            WHERE io.validation = 'APPROVED'
-            {line_bbox}
-              AND EXISTS (
-                SELECT 1 FROM public.connectivity_nodes cn WHERE cn.mrid = als.source_node_id
-              )
-              AND EXISTS (
-                SELECT 1 FROM public.connectivity_nodes cn WHERE cn.mrid = als.target_node_id
-              )
-              AND (
-                NOT EXISTS (
-                  SELECT 1 FROM public.identified_objects nio
-                  WHERE nio.mrid = als.source_node_id AND nio.validation = 'APPROVED'
+            WITH bad AS (
+              SELECT
+                als.mrid,
+                als.source_node_id,
+                als.target_node_id,
+                (sio.validation = 'APPROVED') AS source_approved,
+                (tio.validation = 'APPROVED') AS target_approved
+              FROM public.ac_line_segments als
+              JOIN public.identified_objects io ON io.mrid = als.mrid
+              JOIN public.connectivity_nodes src ON src.mrid = als.source_node_id
+              JOIN public.connectivity_nodes tgt ON tgt.mrid = als.target_node_id
+              LEFT JOIN public.identified_objects sio ON sio.mrid = als.source_node_id
+              LEFT JOIN public.identified_objects tio ON tio.mrid = als.target_node_id
+              WHERE io.validation = 'APPROVED'
+              {line_bbox}
+                AND (
+                  sio.validation IS DISTINCT FROM 'APPROVED'
+                  OR tio.validation IS DISTINCT FROM 'APPROVED'
                 )
-                OR NOT EXISTS (
-                  SELECT 1 FROM public.identified_objects nio
-                  WHERE nio.mrid = als.target_node_id AND nio.validation = 'APPROVED'
-                )
+            ),
+            inserted AS (
+              INSERT INTO public.data_quality_exceptions (
+                record_type, record_mrid, rule_code, severity, error_message, details
               )
-            """,
-            line_params,
-        )
-        found = int(cur.fetchone()[0])
-
-        cur.execute(
-            f"""
-            INSERT INTO public.data_quality_exceptions (
-              record_type, record_mrid, rule_code, severity, error_message, details
+              SELECT
+                'ac_line_segments',
+                b.mrid,
+                'TOPO_LINE_ENDPOINT_NOT_APPROVED',
+                r.severity,
+                'Line segment has an endpoint node that is not APPROVED master.',
+                jsonb_build_object(
+                  'source_node_mrid', b.source_node_id::text,
+                  'target_node_mrid', b.target_node_id::text,
+                  'source_approved', COALESCE(b.source_approved, FALSE),
+                  'target_approved', COALESCE(b.target_approved, FALSE)
+                )
+              FROM bad b
+              JOIN public.data_quality_rules r ON r.rule_code = 'TOPO_LINE_ENDPOINT_NOT_APPROVED'
+                AND r.enabled = TRUE
+              ON CONFLICT (record_mrid, rule_code) WHERE status = 'OPEN'
+              DO NOTHING
+              RETURNING 1
             )
             SELECT
-              'ac_line_segments',
-              als.mrid,
-              'TOPO_LINE_ENDPOINT_NOT_APPROVED',
-              r.severity,
-              'Line segment has an endpoint node that is not APPROVED master.',
-              jsonb_build_object(
-                'source_node_mrid', als.source_node_id::text,
-                'target_node_mrid', als.target_node_id::text,
-                'source_approved', EXISTS (
-                  SELECT 1 FROM public.identified_objects nio
-                  WHERE nio.mrid = als.source_node_id AND nio.validation = 'APPROVED'
-                ),
-                'target_approved', EXISTS (
-                  SELECT 1 FROM public.identified_objects nio
-                  WHERE nio.mrid = als.target_node_id AND nio.validation = 'APPROVED'
-                )
-              )
-            FROM public.ac_line_segments als
-            JOIN public.identified_objects io ON io.mrid = als.mrid
-            JOIN public.data_quality_rules r ON r.rule_code = 'TOPO_LINE_ENDPOINT_NOT_APPROVED'
-            WHERE io.validation = 'APPROVED'
-              AND r.enabled = TRUE
-            {line_bbox}
-              AND EXISTS (
-                SELECT 1 FROM public.connectivity_nodes cn WHERE cn.mrid = als.source_node_id
-              )
-              AND EXISTS (
-                SELECT 1 FROM public.connectivity_nodes cn WHERE cn.mrid = als.target_node_id
-              )
-              AND (
-                NOT EXISTS (
-                  SELECT 1 FROM public.identified_objects nio
-                  WHERE nio.mrid = als.source_node_id AND nio.validation = 'APPROVED'
-                )
-                OR NOT EXISTS (
-                  SELECT 1 FROM public.identified_objects nio
-                  WHERE nio.mrid = als.target_node_id AND nio.validation = 'APPROVED'
-                )
-              )
-            ON CONFLICT (record_mrid, rule_code) WHERE status = 'OPEN'
-            DO NOTHING
+              (SELECT COUNT(*) FROM bad)::bigint AS found,
+              (SELECT COUNT(*) FROM inserted)::bigint AS inserted
             """,
             line_params,
         )
-        inserted = cur.rowcount
+        row = cur.fetchone()
+    found = int(row[0] or 0) if row else 0
+    inserted = int(row[1] or 0) if row else 0
     return found, inserted
 
 
@@ -830,6 +864,34 @@ def create_topology_batch_run(
     return run_id
 
 
+def request_topology_scan_cancel(run_id: str) -> None:
+    """Signal the worker to stop; survives until the run finishes or TTL expires."""
+    from redis_cache import (
+        TOPOLOGY_SCAN_CANCEL_TTL_SEC,
+        set_json,
+        topology_scan_cancel_key,
+    )
+
+    set_json(
+        topology_scan_cancel_key(run_id),
+        {"cancelled": True},
+        TOPOLOGY_SCAN_CANCEL_TTL_SEC,
+    )
+
+
+def topology_scan_cancel_requested(run_id: str) -> bool:
+    from redis_cache import get_json, topology_scan_cancel_key
+
+    raw = get_json(topology_scan_cancel_key(run_id))
+    return isinstance(raw, dict) and bool(raw.get("cancelled"))
+
+
+def clear_topology_scan_cancel(run_id: str) -> None:
+    from redis_cache import delete_key, topology_scan_cancel_key
+
+    delete_key(topology_scan_cancel_key(run_id))
+
+
 def fail_stale_topology_batch_run(
     conn,
     run_id: str,
@@ -844,6 +906,7 @@ def fail_stale_topology_batch_run(
         topology_scan_active_key,
     )
 
+    request_topology_scan_cancel(run_id)
     started_at = _run_started_at(conn, run_id)
     with conn.cursor() as cur:
         cur.execute(
@@ -857,6 +920,7 @@ def fail_stale_topology_batch_run(
     conn.commit()
     force_release_lock(TOPOLOGY_SCAN_LOCK_NAME)
     delete_key(topology_scan_active_key())
+    # Bypass cancel guard so the failed status is visible to the UI.
     _publish_scan_progress(
         run_id,
         status="failed",
@@ -864,6 +928,7 @@ def fail_stale_topology_batch_run(
         completed_phases=[],
         started_at=started_at,
         error_message=error_message[:2000],
+        force=True,
     )
 
 
@@ -887,47 +952,49 @@ def find_active_topology_batch_run(conn) -> dict[str, Any] | None:
     if not row:
         return None
     run_id = row[0]
-    if row[1] == "running" and not lock_held(TOPOLOGY_SCAN_LOCK_NAME):
-        fail_stale_topology_batch_run(
-            conn,
-            run_id,
-            error_message="Topology scan worker stopped (lock expired). Re-run the scan.",
-        )
-        return None
-    cached = _read_scan_progress(run_id)
     started_at = row[2].isoformat() if row[2] else None
-    if row[1] == "running" and cached:
-        updated_at = cached.get("updated_at") or started_at
-        if updated_at:
-            try:
-                from datetime import datetime, timezone
-
-                last_touch = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-                stale_for = (datetime.now(timezone.utc) - last_touch).total_seconds()
-                if stale_for > TOPOLOGY_SCAN_STALE_SEC:
-                    fail_stale_topology_batch_run(
-                        conn,
-                        run_id,
-                        error_message=(
-                            "Topology scan stopped responding "
-                            f"(no progress for {int(stale_for // 60)} min). Re-run the scan."
-                        ),
-                    )
-                    return None
-            except Exception:
-                pass
+    cached = _read_scan_progress(run_id)
+    if row[1] == "running":
+        if cached:
+            cached = _maybe_fail_stale_progress(
+                conn, run_id, cached, started_at=started_at
+            )
+            if cached is None or cached.get("status") != "running":
+                return None
+        elif not lock_held(TOPOLOGY_SCAN_LOCK_NAME):
+            fail_stale_topology_batch_run(
+                conn,
+                run_id,
+                error_message="Topology scan worker stopped (lock expired). Re-run the scan.",
+            )
+            return None
     if cached:
         cached.setdefault("run_id", run_id)
         cached.setdefault("started_at", started_at)
         cached.setdefault("status", row[1])
+        estimate = cached.get("estimate_seconds")
+        if estimate is None:
+            estimate = estimate_topology_scan_seconds(conn)
+            cached["estimate_seconds"] = estimate
+        cached["eta_seconds"] = _eta_seconds_remaining(
+            estimate_seconds=int(estimate) if estimate is not None else None,
+            started_at=cached.get("started_at") or started_at,
+            status=str(cached.get("status") or row[1]),
+        )
         return cached
+    estimate_seconds = estimate_topology_scan_seconds(conn)
     return {
         "run_id": run_id,
         "status": row[1],
         "current_phase": "auto_clear",
         "completed_phases": [],
         "started_at": started_at,
-        "estimate_seconds": estimate_topology_scan_seconds(conn),
+        "estimate_seconds": estimate_seconds,
+        "eta_seconds": _eta_seconds_remaining(
+            estimate_seconds=estimate_seconds,
+            started_at=started_at,
+            status=row[1],
+        ),
     }
 
 
@@ -952,7 +1019,78 @@ def estimate_topology_scan_seconds(conn, *, default: int | None = None) -> int:
     if not durations:
         return fallback
     avg = sum(durations) / len(durations)
-    return int(max(60, min(1800, round(avg))))
+    return int(max(60, min(TOPOLOGY_SCAN_ESTIMATE_MAX_SEC, round(avg))))
+
+
+def _elapsed_seconds_since(started_at: str | None) -> float | None:
+    if not started_at:
+        return None
+    try:
+        return max(0.0, (datetime_now_iso_ms() - iso_to_ms(started_at)) / 1000.0)
+    except Exception:
+        return None
+
+
+def _eta_seconds_remaining(
+    *,
+    estimate_seconds: int | None,
+    started_at: str | None,
+    status: str,
+) -> int | None:
+    """Remaining ETA from wall clock — never reuse a frozen Redis eta_seconds."""
+    if status != "running" or estimate_seconds is None:
+        return None
+    elapsed = _elapsed_seconds_since(started_at)
+    if elapsed is None:
+        return int(estimate_seconds)
+    remaining = int(estimate_seconds - elapsed)
+    # Once past the estimate, stop advertising a fake countdown.
+    return remaining if remaining > 0 else 0
+
+
+def _maybe_fail_stale_progress(
+    conn,
+    run_id: str,
+    cached: dict[str, Any],
+    *,
+    started_at: str | None,
+) -> dict[str, Any] | None:
+    """Mark zombie scans failed when Redis progress stops updating."""
+    from redis_cache import TOPOLOGY_SCAN_LOCK_NAME, lock_held
+
+    if cached.get("status") != "running":
+        return cached
+    if not lock_held(TOPOLOGY_SCAN_LOCK_NAME):
+        fail_stale_topology_batch_run(
+            conn,
+            run_id,
+            error_message="Topology scan worker stopped (lock expired). Re-run the scan.",
+        )
+        return _read_scan_progress(run_id)
+
+    updated_at = cached.get("updated_at") or started_at
+    if not updated_at:
+        return cached
+    try:
+        from datetime import datetime, timezone
+
+        last_touch = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+        stale_for = (datetime.now(timezone.utc) - last_touch).total_seconds()
+    except Exception:
+        return cached
+
+    if stale_for <= TOPOLOGY_SCAN_STALE_SEC:
+        return cached
+
+    fail_stale_topology_batch_run(
+        conn,
+        run_id,
+        error_message=(
+            "Topology scan stopped responding "
+            f"(no progress for {int(stale_for // 60)} min). Re-run the scan."
+        ),
+    )
+    return _read_scan_progress(run_id)
 
 
 def topology_scan_progress_pct(completed_phases: list[str]) -> int:
@@ -965,6 +1103,23 @@ def topology_scan_progress_pct(completed_phases: list[str]) -> int:
 def get_topology_batch_progress(conn, run_id: str) -> dict[str, Any] | None:
     cached = _read_scan_progress(run_id)
     if cached:
+        started_at = cached.get("started_at") or _run_started_at(conn, run_id)
+        if cached.get("status") == "running":
+            refreshed = _maybe_fail_stale_progress(
+                conn, run_id, cached, started_at=started_at
+            )
+            if refreshed is None:
+                return None
+            cached = refreshed
+        estimate = cached.get("estimate_seconds")
+        if estimate is None:
+            estimate = estimate_topology_scan_seconds(conn)
+            cached["estimate_seconds"] = estimate
+        cached["eta_seconds"] = _eta_seconds_remaining(
+            estimate_seconds=int(estimate) if estimate is not None else None,
+            started_at=cached.get("started_at") or started_at,
+            status=str(cached.get("status") or "running"),
+        )
         return cached
 
     with conn.cursor() as cur:
@@ -1003,7 +1158,11 @@ def get_topology_batch_progress(conn, run_id: str) -> dict[str, Any] | None:
         "auto_cleared": int(row[8] or 0),
     }
     if status == "running":
-        payload["eta_seconds"] = estimate_seconds
+        payload["eta_seconds"] = _eta_seconds_remaining(
+            estimate_seconds=estimate_seconds,
+            started_at=started_at,
+            status=status,
+        )
     return payload
 
 
@@ -1039,6 +1198,8 @@ def _publish_scan_progress(
     orphans_found: int | None = None,
     dangling_found: int | None = None,
     auto_cleared: int | None = None,
+    geometric_step: str | None = None,
+    force: bool = False,
 ) -> None:
     from redis_cache import (
         TOPOLOGY_SCAN_LOCK_TTL_SEC,
@@ -1047,6 +1208,14 @@ def _publish_scan_progress(
         topology_scan_active_key,
         topology_scan_progress_key,
     )
+
+    # After cancel, ignore further "running" heartbeats from the worker.
+    if (
+        not force
+        and status == "running"
+        and topology_scan_cancel_requested(run_id)
+    ):
+        raise TopologyScanCancelledError(run_id)
 
     progress_pct = 100 if status == "completed" else topology_scan_progress_pct(completed_phases)
     from datetime import datetime, timezone
@@ -1068,27 +1237,31 @@ def _publish_scan_progress(
         payload["error_message"] = error_message
     if estimate_seconds is not None:
         payload["estimate_seconds"] = estimate_seconds
-        if status == "running" and started_at:
-            try:
-                elapsed = max(
-                    0,
-                    (datetime_now_iso_ms() - iso_to_ms(started_at)) / 1000,
-                )
-                payload["eta_seconds"] = max(0, int(estimate_seconds - elapsed))
-            except Exception:
-                payload["eta_seconds"] = estimate_seconds
+        eta = _eta_seconds_remaining(
+            estimate_seconds=estimate_seconds,
+            started_at=started_at,
+            status=status,
+        )
+        if eta is not None:
+            payload["eta_seconds"] = eta
     if orphans_found is not None:
         payload["orphans_found"] = orphans_found
     if dangling_found is not None:
         payload["dangling_found"] = dangling_found
     if auto_cleared is not None:
         payload["auto_cleared"] = auto_cleared
+    if geometric_step:
+        payload["geometric_step"] = geometric_step
 
     set_json(topology_scan_progress_key(run_id), payload, TOPOLOGY_SCAN_LOCK_TTL_SEC)
     if status == "running":
         set_json(topology_scan_active_key(), {"run_id": run_id}, TOPOLOGY_SCAN_LOCK_TTL_SEC)
     else:
         delete_key(topology_scan_active_key())
+        # Keep the cancel flag after failure so a late worker heartbeat cannot
+        # resurrect the run as "running". Cleared only on successful completion.
+        if status == "completed":
+            clear_topology_scan_cancel(run_id)
 
 
 def datetime_now_iso_ms() -> float:
@@ -1163,6 +1336,8 @@ def execute_topology_batch_scan(
     completed: list[str] = []
 
     def _phase(phase_id: str, *, orphans: int | None = None, dangling: int | None = None, cleared: int | None = None) -> None:
+        if topology_scan_cancel_requested(run_id):
+            raise TopologyScanCancelledError(run_id)
         _publish_scan_progress(
             run_id,
             status="running",
@@ -1182,21 +1357,32 @@ def execute_topology_batch_scan(
                 raise TopologyScanInProgressError(active["run_id"])
 
         try:
-            approved_nodes = _count_approved_master_nodes(conn, clip=clip)
+            if topology_scan_cancel_requested(run_id):
+                raise TopologyScanCancelledError(run_id)
+
+            # Refresh connected-node cache first so auto-clear + orphan upsert
+            # share one fresh MV (age-aware; skips rebuild within 6h by default).
+            from geometric_topology import bulk_upsert_geometric_topology
 
             _phase("auto_clear")
+            refresh_connected_node_mrids(conn)
+            if topology_scan_cancel_requested(run_id):
+                raise TopologyScanCancelledError(run_id)
+            # Stage 1 must finish in seconds: exception-table clears only.
+            # Never run geometric auto-clear or geom-bbox joins here.
             cleared_orphans = _auto_clear_orphans(conn, clip=clip)
+            _phase("auto_clear", cleared=cleared_orphans)
             cleared_dangling = _auto_clear_dangling(conn, clip=clip)
-            from geometric_topology import auto_clear_geometric_topology, bulk_upsert_geometric_topology
-
-            cleared_geom = auto_clear_geometric_topology(conn, clip=clip, tier="master")
-            auto_cleared = cleared_orphans + cleared_dangling + cleared_geom
+            auto_cleared = cleared_orphans + cleared_dangling
             completed.append("auto_clear")
             _phase("auto_clear", cleared=auto_cleared)
 
-            refresh_connected_node_mrids(conn)
             _phase("orphans", cleared=auto_cleared)
-            orphans_found, orphans_inserted = _bulk_upsert_orphans(conn, clip=clip)
+            if topology_scan_cancel_requested(run_id):
+                raise TopologyScanCancelledError(run_id)
+            orphans_found, orphans_inserted, orphans_capped = _bulk_upsert_orphans(
+                conn, clip=clip
+            )
             completed.append("orphans")
             _phase("orphans", orphans=orphans_found, cleared=auto_cleared)
 
@@ -1210,10 +1396,34 @@ def execute_topology_batch_scan(
             completed.append("endpoints")
 
             _phase("geometric", orphans=orphans_found, dangling=dangling_found, cleared=auto_cleared)
-            geom_results = bulk_upsert_geometric_topology(conn, clip=clip, tier="master")
+
+            def _geom_heartbeat(step: str) -> None:
+                # Refresh Redis progress so the UI ETA / stale detector stay alive
+                # while long geometric SQL statements run.
+                _publish_scan_progress(
+                    run_id,
+                    status="running",
+                    current_phase="geometric",
+                    completed_phases=list(completed),
+                    started_at=started_at,
+                    estimate_seconds=estimate_seconds,
+                    orphans_found=orphans_found,
+                    dangling_found=dangling_found,
+                    auto_cleared=auto_cleared,
+                    geometric_step=step,
+                )
+
+            geom_results = bulk_upsert_geometric_topology(
+                conn,
+                clip=clip,
+                tier="master",
+                heartbeat=_geom_heartbeat,
+                include_live_counts=False,
+            )
             completed.append("geometric")
 
             _phase("snapshot", orphans=orphans_found, dangling=dangling_found, cleared=auto_cleared)
+            approved_nodes = _count_approved_master_nodes(conn, clip=clip)
             live = _live_summary_from_scan_results(
                 approved_nodes=approved_nodes,
                 orphans_found=orphans_found,
@@ -1230,6 +1440,10 @@ def execute_topology_batch_scan(
                 "export_blocked": gate,
                 "clip": clip,
                 "geom_topology": geom_results,
+                "orphans_capped": orphans_capped,
+                "orphan_insert_cap": (
+                    TOPOLOGY_ORPHAN_INSERT_CAP if orphans_capped else None
+                ),
             }
 
             with conn.cursor() as cur:
@@ -1245,6 +1459,7 @@ def execute_topology_batch_scan(
                         summary_snapshot = %s::jsonb,
                         completed_at = NOW()
                     WHERE id = %s::uuid
+                      AND status = 'running'
                     """,
                     (
                         orphans_found,
@@ -1256,6 +1471,8 @@ def execute_topology_batch_scan(
                         run_id,
                     ),
                 )
+                if cur.rowcount == 0:
+                    raise TopologyScanCancelledError(run_id)
 
             completed.append("snapshot")
             from datetime import datetime, timezone
@@ -1284,6 +1501,7 @@ def execute_topology_batch_scan(
                 after_state={
                     "orphans_found": orphans_found,
                     "orphans_inserted": orphans_inserted,
+                    "orphans_capped": orphans_capped,
                     "dangling_found": dangling_found,
                     "unapproved_endpoints_found": unapproved_found,
                     "geom_topology": geom_results,
@@ -1297,6 +1515,7 @@ def execute_topology_batch_scan(
                 "status": "completed",
                 "orphans_found": orphans_found,
                 "orphans_inserted": orphans_inserted,
+                "orphans_capped": orphans_capped,
                 "dangling_found": dangling_found,
                 "dangling_inserted": dangling_inserted,
                 "unapproved_endpoints_found": unapproved_found,
@@ -1306,6 +1525,18 @@ def execute_topology_batch_scan(
                 "live": live,
                 "exception_queue": queue,
                 "export_gate": gate,
+            }
+        except TopologyScanCancelledError:
+            conn.rollback()
+            fail_stale_topology_batch_run(
+                conn,
+                run_id,
+                error_message="Topology scan cancelled by operator. Re-run the scan.",
+            )
+            return {
+                "run_id": run_id,
+                "status": "failed",
+                "error_message": "Topology scan cancelled by operator. Re-run the scan.",
             }
         except Exception as exc:
             conn.rollback()
@@ -1321,13 +1552,14 @@ def execute_topology_batch_scan(
                 completed_at=completed_at,
                 error_message=str(exc)[:2000],
                 estimate_seconds=estimate_seconds,
+                force=True,
             )
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     UPDATE public.data_quality_batch_runs
                     SET status = 'failed', error_message = %s, completed_at = NOW()
-                    WHERE id = %s::uuid
+                    WHERE id = %s::uuid AND status = 'running'
                     """,
                     (str(exc)[:2000], run_id),
                 )

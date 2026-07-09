@@ -3,6 +3,7 @@
  */
 
 import type { TerritoryGeoJson } from '../lib/giopTerritoryHighlight';
+import { readSwCache, writeSwCache } from '../lib/giopSwCache';
 
 const SYNC_BASE = import.meta.env.VITE_SYNC_URL || '/api/v1';
 const OCR_BASE = import.meta.env.VITE_OCR_URL || '/ocr-api/api/v1';
@@ -453,6 +454,8 @@ export interface GiopMapSearchResult {
   id: string;
   title: string;
   subtitle?: string | null;
+  /** Present on `/map/places-index` rows (`district` | `region`). */
+  place_type?: string | null;
   longitude?: number | null;
   latitude?: number | null;
   bbox?: {
@@ -483,8 +486,47 @@ export async function searchMap(options: {
 
 /** One-time district/region index for client-side map spotlight search. */
 export async function getMapPlacesIndex(): Promise<GiopMapSearchResult[]> {
-  const data = await fetchJson<{ places: GiopMapSearchResult[] }>(`${SYNC_BASE}/map/places-index`);
-  return data.places ?? [];
+  const cacheKey = 'map-places-index';
+  const cached = readSwCache<GiopMapSearchResult[]>(cacheKey);
+  try {
+    const data = await fetchJson<{ places: GiopMapSearchResult[] }>(
+      `${SYNC_BASE}/map/places-index`,
+    );
+    const places = data.places ?? [];
+    writeSwCache(cacheKey, places);
+    return places;
+  } catch (err) {
+    if (cached && cached.length > 0) return cached;
+    throw err;
+  }
+}
+
+/** Google-style place autocomplete (aliases + districts + OSM fallback). */
+export async function getMapAutocomplete(options: {
+  q: string;
+  limit?: number;
+  bbox?: { west: number; south: number; east: number; north: number } | null;
+}): Promise<GiopMapSearchResult[]> {
+  const query = new URLSearchParams();
+  query.set('q', options.q.trim());
+  if (options.limit != null) query.set('limit', String(options.limit));
+  const bbox = options.bbox;
+  if (
+    bbox &&
+    Number.isFinite(bbox.west) &&
+    Number.isFinite(bbox.south) &&
+    Number.isFinite(bbox.east) &&
+    Number.isFinite(bbox.north)
+  ) {
+    query.set('west', String(bbox.west));
+    query.set('south', String(bbox.south));
+    query.set('east', String(bbox.east));
+    query.set('north', String(bbox.north));
+  }
+  const data = await fetchJson<{ results: GiopMapSearchResult[] }>(
+    `${SYNC_BASE}/map/autocomplete?${query}`,
+  );
+  return data.results ?? [];
 }
 
 /** OSM geocoding for towns/suburbs on the basemap (e.g. Gbawe) not in ECG districts. */
@@ -718,6 +760,18 @@ export interface GiopHealthMetrics {
   error_rate_pct: number;
   latency_p50_ms: number;
   latency_p95_ms: number;
+  latency_p95_interactive_ms?: number;
+  latency_p95_copilot_ms?: number;
+  latency_p95_map_ms?: number;
+  latency_p95_api_ms?: number;
+  latency_p95_health_ms?: number;
+  slowest_routes?: Array<{
+    route: string;
+    category: string;
+    count: number;
+    latency_p50_ms: number;
+    latency_p95_ms: number;
+  }>;
   last_kafka_ingest_at?: number | null;
 }
 
@@ -955,6 +1009,7 @@ export interface GiopTopologyScanProgress {
   orphans_found?: number;
   dangling_found?: number;
   auto_cleared?: number;
+  geometric_step?: string;
 }
 
 export async function getActiveTopologyScan(): Promise<{
@@ -966,6 +1021,16 @@ export async function getActiveTopologyScan(): Promise<{
 
 export async function getTopologyDqRunProgress(runId: string): Promise<GiopTopologyScanProgress> {
   return fetchJson(`${SYNC_BASE}/dq/topology/runs/${encodeURIComponent(runId)}/progress`);
+}
+
+export async function cancelTopologyDqScan(runId: string): Promise<{
+  run_id: string;
+  status: string;
+  message?: string;
+}> {
+  return fetchJson(`${SYNC_BASE}/dq/topology/runs/${encodeURIComponent(runId)}/cancel`, {
+    method: 'POST',
+  });
 }
 
 export interface GiopTopologyDqRun {
@@ -1152,10 +1217,14 @@ export interface GiopEndpointFixProposal {
   current_to?: string | null;
   proposed_from: string;
   proposed_to: string;
+  proposed_from_kind?: string | null;
+  proposed_to_kind?: string | null;
   start_dist_m?: number | null;
   end_dist_m?: number | null;
   start_nearest_pole?: string | null;
   end_nearest_pole?: string | null;
+  start_nearest_kind?: string | null;
+  end_nearest_kind?: string | null;
   tier: GiopEndpointFixTier;
   rationale?: string | null;
   status: GiopEndpointFixStatus;
@@ -1222,6 +1291,38 @@ export async function listGisEndpointFixProposals(options?: {
   q.set('limit', String(options?.limit ?? 50));
   q.set('offset', String(options?.offset ?? 0));
   return fetchJson(`${SYNC_BASE}/gis/endpoint-fix-proposals?${q}`);
+}
+
+export interface GiopEndpointFixMapPreviewGeoJson {
+  line: GeoJSON.FeatureCollection;
+  endpoints: GeoJSON.FeatureCollection;
+  proposed_assets?: GeoJSON.FeatureCollection;
+  suggested_links?: GeoJSON.FeatureCollection;
+}
+
+export interface GiopEndpointFixMapPreview {
+  proposal_id: string;
+  segment_id: number;
+  label: string;
+  proposed_from: string;
+  proposed_to: string;
+  proposed_from_kind?: string | null;
+  proposed_to_kind?: string | null;
+  geojson: GiopEndpointFixMapPreviewGeoJson;
+  bbox?: {
+    west: number;
+    south: number;
+    east: number;
+    north: number;
+  } | null;
+}
+
+export async function getGisEndpointFixProposalMapPreview(
+  proposalId: string,
+): Promise<GiopEndpointFixMapPreview> {
+  return fetchJson(
+    `${SYNC_BASE}/gis/endpoint-fix-proposals/${encodeURIComponent(proposalId)}/map-preview`,
+  );
 }
 
 export async function reviewGisEndpointFixProposals(payload: {
@@ -2286,10 +2387,24 @@ export async function probeGisOverviewAvailable(
 }
 
 export async function getReferenceMapConfig(): Promise<GiopReferenceMapLayerConfig[]> {
-  const data = await fetchJson<{ layers: GiopReferenceMapLayerConfig[] }>(
-    `${SYNC_BASE}/reference-layers/map-config`,
-  );
-  return data.layers ?? [];
+  const cacheKey = 'reference-map-config';
+  const cached = readSwCache<GiopReferenceMapLayerConfig[]>(cacheKey);
+  try {
+    const data = await fetchJson<{ layers: GiopReferenceMapLayerConfig[] }>(
+      `${SYNC_BASE}/reference-layers/map-config`,
+    );
+    const layers = data.layers ?? [];
+    writeSwCache(cacheKey, layers);
+    return layers;
+  } catch (err) {
+    if (cached && cached.length > 0) return cached;
+    throw err;
+  }
+}
+
+/** Prefer fresh config; fall back to session cache immediately for map mount. */
+export function getReferenceMapConfigCached(): GiopReferenceMapLayerConfig[] | null {
+  return readSwCache<GiopReferenceMapLayerConfig[]>('reference-map-config');
 }
 
 export async function getReferenceLayerGeojson(

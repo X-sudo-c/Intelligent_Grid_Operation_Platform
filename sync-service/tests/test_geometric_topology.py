@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 from geometric_topology import (
     TOPO_ENDPOINT_TOLERANCE_M,
+    _should_run_line_crossings,
     _tier_scope,
     auto_clear_geometric_topology,
     bulk_upsert_geometric_topology,
@@ -26,18 +27,18 @@ class GeometricTopologyTests(unittest.TestCase):
         self.assertIn("staging.ac_line_segments", scope["als"])
         self.assertIn("REJECTED", scope["line_active"])
 
-    def test_live_counts_master(self):
+    def test_live_counts_master_skips_national(self):
         conn = MagicMock()
         cur = MagicMock()
         conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
         conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-        cur.fetchone.side_effect = [(3,), (2,), (0,)]
 
         counts = geometric_topology_live_counts(conn, tier="master")
-        self.assertEqual(counts["geom_endpoint_mismatch"], 3)
-        self.assertEqual(counts["geom_dangling_endpoints"], 2)
+        self.assertEqual(counts["geom_endpoint_mismatch"], 0)
+        self.assertEqual(counts["geom_dangling_endpoints"], 0)
         self.assertEqual(counts["line_crossings_without_node"], 0)
-        self.assertEqual(cur.execute.call_count, 2)
+        # SET LOCAL only — national/no-clip skips geography COUNTs
+        self.assertEqual(cur.execute.call_count, 1)
 
     def test_live_counts_with_clip_runs_crossing_query(self):
         conn = MagicMock()
@@ -49,7 +50,8 @@ class GeometricTopologyTests(unittest.TestCase):
         clip = {"west": -1.0, "south": 5.0, "east": 0.0, "north": 6.0}
         counts = geometric_topology_live_counts(conn, clip=clip, tier="master")
         self.assertEqual(counts["line_crossings_without_node"], 1)
-        self.assertEqual(cur.execute.call_count, 3)
+        # SET LOCAL + mismatch + dangling + crossing
+        self.assertEqual(cur.execute.call_count, 4)
 
     def test_bulk_upsert_skips_crossing_without_clip(self):
         conn = MagicMock()
@@ -61,8 +63,38 @@ class GeometricTopologyTests(unittest.TestCase):
 
         result = bulk_upsert_geometric_topology(conn, clip=None, tier="master")
         self.assertEqual(result["crossing_inserted"], 0)
+        self.assertTrue(result["geom_mismatch_skipped"])
         self.assertIn("live", result)
-        self.assertGreaterEqual(cur.execute.call_count, 2)
+        # SET LOCAL (upsert) + SET LOCAL (live) — both skip national geography.
+        self.assertEqual(cur.execute.call_count, 2)
+
+    def test_national_clip_skips_line_crossings(self):
+        ghana = {"west": -3.5, "south": 4.5, "east": 1.5, "north": 8.5}
+        self.assertFalse(_should_run_line_crossings(ghana))
+        self.assertTrue(
+            _should_run_line_crossings(
+                {"west": -0.5, "south": 5.5, "east": 0.0, "north": 6.0}
+            )
+        )
+
+    def test_bulk_upsert_skips_crossing_on_national_clip(self):
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        cur.rowcount = 2
+
+        ghana = {"west": -3.5, "south": 4.5, "east": 1.5, "north": 8.5}
+        result = bulk_upsert_geometric_topology(
+            conn, clip=ghana, tier="master", include_live_counts=False
+        )
+        self.assertTrue(result["crossing_skipped"])
+        self.assertTrue(result["geom_dangling_skipped"])
+        self.assertTrue(result["geom_mismatch_skipped"])
+        self.assertEqual(result["crossing_inserted"], 0)
+        self.assertEqual(result["geom_mismatch_inserted"], 0)
+        # SET LOCAL only — all geometric upserts skipped on national clip
+        self.assertEqual(cur.execute.call_count, 1)
 
     def test_auto_clear_returns_rowcount_sum(self):
         conn = MagicMock()

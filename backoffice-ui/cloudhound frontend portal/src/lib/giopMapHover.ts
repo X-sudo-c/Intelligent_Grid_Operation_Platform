@@ -151,6 +151,7 @@ export function attachGiopMapHover(
   map: MaplibreMap,
   host: HTMLElement,
   isLight: () => boolean,
+  isMeasureActive?: () => boolean,
 ): () => void {
   const tip = document.createElement('div');
   tip.className = 'giop-map-hover-tip giop-map-hover-tip--hidden';
@@ -159,10 +160,17 @@ export function attachGiopMapHover(
 
   const hide = () => {
     tip.classList.add('giop-map-hover-tip--hidden');
-    map.getCanvas().style.cursor = '';
+    if (!isMeasureActive?.()) {
+      map.getCanvas().style.cursor = '';
+    }
   };
 
   const onMove = (e: MapMouseEvent) => {
+    if (isMeasureActive?.()) {
+      tip.classList.add('giop-map-hover-tip--hidden');
+      map.getCanvas().style.cursor = 'crosshair';
+      return;
+    }
     // Skip expensive hit-tests while the user is panning/zooming — avoids jank and stuck drags.
     if (map.isMoving()) {
       hide();
@@ -197,6 +205,8 @@ export function attachGiopMapHover(
     map.off('mouseleave', hide);
     map.off('dragstart', hide);
     tip.remove();
-    map.getCanvas().style.cursor = '';
+    if (!isMeasureActive?.()) {
+      map.getCanvas().style.cursor = '';
+    }
   };
 }

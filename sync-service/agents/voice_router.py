@@ -16,9 +16,6 @@ from agents.portal_context import (
     portal_viewport_bbox,
     portal_viewport_center,
 )
-from redis_cache import get_json, set_json
-
-_COUNT_CACHE_TTL_SEC = int(__import__("os").getenv("VOICE_COUNT_CACHE_TTL_SEC", "900"))
 
 _STOP_PHRASES = (
     "on the map",
@@ -89,6 +86,8 @@ class VoiceIntent:
     zoom_close: bool = False
     zoom_delta: float = 0.0
     also_list_assets: bool = False
+    """When listing assets, pin them on the map only if the user asked to highlight."""
+    highlight_on_map: bool = False
 
 
 def _clean_place(raw: str | None) -> str | None:
@@ -126,15 +125,19 @@ def _place_slots(place: str | None) -> tuple[str | None, str | None]:
 
 
 def _strip_followup_clauses(text: str | None) -> str | None:
-    """Remove trailing 'can you name them' / 'list them' from a place phrase."""
+    """Remove trailing 'can you name them' / 'show me the transformers' from a place phrase."""
     if not text:
         return None
+    cleaned = text.strip()
+    # "… and that it should show me the transformers" / "… and show me the transformers"
     cleaned = re.sub(
-        r"\s+(?:,|\band\b)?\s*(?:can you |could you |please )?"
-        r"(?:name|list|show|identify)(?:\s+me)?\s+(?:them|those|the(?:m| poles| assets)?)"
+        r"\s+(?:,|\band\b)?\s*(?:that\s+it\s+should\s+)?"
+        r"(?:can you |could you |please )?"
+        r"(?:name|list|show|identify|display)(?:\s+me)?\s+"
+        r"(?:them|those|the(?:m)?(?:\s+(?:poles?|assets?|transformers?|nodes?))?)"
         r"[\?.!]*$",
         "",
-        text.strip(),
+        cleaned,
         flags=re.I,
     )
     cleaned = re.sub(
@@ -146,10 +149,30 @@ def _strip_followup_clauses(text: str | None) -> str | None:
     return cleaned.strip() or None
 
 
+def _wants_map_highlight(lower: str) -> bool:
+    """True when the user explicitly wants listed assets pinned on the map."""
+    return bool(
+        re.search(
+            r"\b(?:highlight|pin|plot|mark)(?:\s+them|\s+those|\s+the\s+(?:assets?|transformers?|poles?|nodes?))?"
+            r"(?:\s+on\s+(?:the\s+)?map)?\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:show|display)(?:\s+them|\s+those)?\s+on\s+(?:the\s+)?map\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:yes|yeah|yep|sure|please|ok|okay)\b.*\b(?:highlight|pin|plot|on\s+(?:the\s+)?map)\b",
+            lower,
+        )
+    )
+
+
 def _wants_asset_list(lower: str) -> bool:
     return bool(
         re.search(
-            r"\b(?:name|list|show|identify)(?:\s+me)?\s+(?:them|those|the(?:m| poles| assets)?)\b",
+            r"\b(?:name|list|show|identify|display)(?:\s+me)?\s+"
+            r"(?:them|those|the(?:m)?(?:\s+(?:poles?|assets?|transformers?|nodes?))?)\b",
             lower,
         )
         or re.search(r"\bwhat are (?:they|their names)(?: called)?\b", lower)
@@ -324,6 +347,7 @@ def _count_intent_from_text(lower: str) -> VoiceIntent | None:
             use_viewport=True,
             viewport_explicit=viewport_explicit,
             also_list_assets=_wants_asset_list(lower),
+            highlight_on_map=_wants_map_highlight(lower),
         )
     district, region = _place_slots(place_raw)
     return VoiceIntent(
@@ -333,6 +357,7 @@ def _count_intent_from_text(lower: str) -> VoiceIntent | None:
         district=district,
         region=region,
         also_list_assets=_wants_asset_list(lower),
+        highlight_on_map=_wants_map_highlight(lower),
     )
 
 
@@ -377,7 +402,18 @@ def _parse_list_assets_intent(
     lower: str,
     session: dict[str, Any],
 ) -> VoiceIntent | None:
-    """List/name assets — direct query or pronoun follow-up after a count."""
+    """List/name assets — direct query, highlight confirmation, or pronoun follow-up."""
+    highlight_confirm = re.match(
+        r"^(?:yes|yeah|yep|sure|please|ok|okay)(?:[,.]?\s+(?:please|sure|thanks)?)?"
+        r"(?:\s*[,.]?\s*(?:highlight|pin|plot|show)(?:\s+them)?(?:\s+on\s+(?:the\s+)?map)?)?"
+        r"[\?.!]*$",
+        lower,
+        flags=re.I,
+    ) or re.match(
+        r"^(?:highlight|pin|plot)(?:\s+them|\s+those)?(?:\s+on\s+(?:the\s+)?map)?[\?.!]*$",
+        lower,
+        flags=re.I,
+    )
     follow = re.match(
         r"^(?:can you |could you |please )?(?:name|list|show)(?:\s+me)?\s+"
         r"(?:them|those|the ones|the poles|the assets)[\?.!]*$",
@@ -389,11 +425,11 @@ def _parse_list_assets_intent(
         flags=re.I,
     )
     direct = re.search(
-        r"\b(?:name|list|show|identify)\s+(?:the\s+)?"
+        r"\b(?:name|list|show|identify|display)(?:\s+me)?\s+(?:the\s+)?"
         r"(?:poles?|assets?|transformers?|nodes?)\b",
         lower,
     )
-    if not follow and not direct:
+    if not highlight_confirm and not follow and not direct:
         return None
 
     asset_kind = session.get("last_asset_kind") or "pole"
@@ -406,6 +442,24 @@ def _parse_list_assets_intent(
     district = session.get("last_district")
     region = session.get("last_region")
     territory_bbox = session.get("last_bbox")
+    highlight_on_map = _wants_map_highlight(lower) or bool(highlight_confirm)
+
+    if highlight_confirm:
+        if not session.get("last_kind") or not (
+            use_viewport or district or region or territory_bbox
+        ):
+            return None
+        return VoiceIntent(
+            kind="list_assets",
+            asset_kind=asset_kind,
+            tier=session.get("last_tier") or "master",
+            district=district,
+            region=region,
+            use_viewport=use_viewport,
+            viewport_explicit=use_viewport,
+            territory_bbox=territory_bbox if isinstance(territory_bbox, dict) else None,
+            highlight_on_map=True,
+        )
 
     if follow:
         if not session.get("last_kind") or not (
@@ -443,6 +497,7 @@ def _parse_list_assets_intent(
         use_viewport=use_viewport,
         viewport_explicit=use_viewport,
         territory_bbox=territory_bbox if isinstance(territory_bbox, dict) else None,
+        highlight_on_map=highlight_on_map,
     )
 
 
@@ -826,7 +881,17 @@ def parse_intent(
         lower,
         flags=re.I,
     )
-    if highlight and not re.search(r"\bwork\s*orders?\b", lower) and _parse_trace_feeder_intent(raw, lower) is None:
+    if (
+        highlight
+        and not re.search(r"\bwork\s*orders?\b", lower)
+        and _parse_trace_feeder_intent(raw, lower) is None
+        # "show me the transformers in X" is list_assets, not territory highlight.
+        and not re.match(
+            r"^(?:the\s+)?(?:poles?|assets?|transformers?|nodes?)\b",
+            (highlight.group("place") or "").strip(),
+            flags=re.I,
+        )
+    ):
         place = _clean_place(highlight.group("place"))
         district, region = _place_slots(place)
         return VoiceIntent(kind="highlight", district=district, region=region)
@@ -855,26 +920,6 @@ def parse_intent(
     return None
 
 
-def _count_cache_key(
-    intent: VoiceIntent,
-    bbox: dict[str, float] | None,
-    *,
-    district: str | None = None,
-    region: str | None = None,
-) -> str:
-    parts = [
-        intent.tier,
-        intent.asset_kind or "all",
-        district or intent.district or "",
-        region or intent.region or "",
-    ]
-    if bbox:
-        parts.append(
-            f"{bbox['west']:.4f}:{bbox['south']:.4f}:{bbox['east']:.4f}:{bbox['north']:.4f}"
-        )
-    return "giop:voice:count:" + ":".join(parts)
-
-
 def _cached_counts(
     conn,
     intent: VoiceIntent,
@@ -883,17 +928,10 @@ def _cached_counts(
     district: str | None = None,
     region: str | None = None,
 ) -> dict[str, Any]:
-    from agents import spatial
-
-    key = _count_cache_key(intent, bbox, district=district, region=region)
-    cached = get_json(key)
-    if isinstance(cached, dict) and "total" in cached:
-        cached = dict(cached)
-        cached["cached"] = True
-        return cached
+    from agents.spatial_cache import cached_asset_inventory_counts
 
     use_bbox = bbox is not None and not district and not region
-    result = spatial.asset_inventory_counts(
+    return cached_asset_inventory_counts(
         conn,
         tier=intent.tier,
         asset_kind=intent.asset_kind,
@@ -901,9 +939,6 @@ def _cached_counts(
         region=None if use_bbox else region,
         bbox=bbox,
     )
-    set_json(key, result, ttl_sec=_COUNT_CACHE_TTL_SEC)
-    result["cached"] = False
-    return result
 
 
 def _format_count_speech(result: dict[str, Any], intent: VoiceIntent, place_label: str) -> str:
@@ -1161,6 +1196,8 @@ def _apply_resolved_place(
         territory_bbox=territory_bbox,
         resolved_place=meta,
         zoom_close=intent.zoom_close,
+        also_list_assets=intent.also_list_assets,
+        highlight_on_map=intent.highlight_on_map,
     ), None
 
 
@@ -1215,7 +1252,27 @@ def _list_assets_page(
     )
 
 
-def _format_list_assets_speech(page: dict[str, Any], place_label: str) -> str:
+def _list_assets_map_ui(
+    page: dict[str, Any],
+    *,
+    place_label: str,
+) -> list[dict[str, Any]]:
+    """Highlight listed assets on the map (orange pins) and frame them."""
+    from agents.spatial import assets_to_map_highlight_ui
+
+    kind = (page.get("asset_kind_filter") or "asset").replace("_", " ")
+    total = int(page.get("total") or 0)
+    label = f"{total:,} {kind}s in {place_label}" if total else place_label
+    ui = assets_to_map_highlight_ui(page, label=label, tab="map")
+    return [ui] if ui else []
+
+
+def _format_list_assets_speech(
+    page: dict[str, Any],
+    place_label: str,
+    *,
+    highlighted: bool = False,
+) -> str:
     assets = page.get("assets") or []
     total = int(page.get("total") or 0)
     if total == 0:
@@ -1223,13 +1280,31 @@ def _format_list_assets_speech(page: dict[str, Any], place_label: str) -> str:
     names: list[str] = []
     for item in assets[:5]:
         name = (item.get("name") or "").strip() or str(item.get("mrid") or "asset")
-        names.append(name)
+        rated = item.get("rated_power_kva")
+        if rated is not None:
+            names.append(f"{name} ({float(rated):g} kVA)")
+        else:
+            names.append(name)
     joined = ", ".join(names)
-    if total > len(assets):
-        return f"Here are {len(assets)} of {total:,} in {place_label}, including {joined}, and others."
-    if len(names) == 1:
-        return f"There is 1 asset in {place_label}: {joined}."
-    return f"Here are {total:,} assets in {place_label}: {joined}."
+    shown = len(assets)
+    if highlighted:
+        if total > shown:
+            return (
+                f"I've highlighted {shown} of {total:,} on the map in {place_label}, "
+                f"including {joined}, and others."
+            )
+        if len(names) == 1:
+            return f"I've highlighted 1 asset in {place_label} on the map: {joined}."
+        return f"I've highlighted {total:,} assets in {place_label} on the map: {joined}."
+    if total > shown:
+        base = (
+            f"Here are {shown} of {total:,} in {place_label}, including {joined}, and others."
+        )
+    elif len(names) == 1:
+        base = f"There is 1 asset in {place_label}: {joined}."
+    else:
+        base = f"Here are {total:,} assets in {place_label}: {joined}."
+    return f"{base} Want me to highlight them on the map?"
 
 
 def _spatial_session_patch(
@@ -1305,6 +1380,7 @@ def _try_repair_road_intent(
                 zoom_close=intent.zoom_close,
                 zoom_delta=intent.zoom_delta,
                 also_list_assets=intent.also_list_assets,
+                highlight_on_map=intent.highlight_on_map,
             )
 
     seen: set[str] = set()
@@ -1326,6 +1402,7 @@ def _try_repair_road_intent(
             zoom_close=intent.zoom_close,
             zoom_delta=intent.zoom_delta,
             also_list_assets=intent.also_list_assets,
+            highlight_on_map=intent.highlight_on_map,
         )
         repaired, clarify = _apply_resolved_place(conn, trial)
         if clarify or not repaired.resolved_place:
@@ -1341,6 +1418,40 @@ def _friendly_road_error_label(place: str | None, original_query: str) -> str:
     if label:
         return label.title() if label.islower() else label
     return "that street"
+
+
+def _territory_map_ui_actions(
+    intent: VoiceIntent,
+    *,
+    bbox: dict[str, float] | None,
+) -> list[dict[str, Any]]:
+    """Pan/highlight the map for count/list answers so 'show me' is visible."""
+    from agents.place_resolve import place_viewport_ui_action
+
+    actions: list[dict[str, Any]] = []
+    if intent.resolved_place:
+        ui = place_viewport_ui_action(
+            intent.resolved_place,
+            mode="pan",
+            tab="map",
+        )
+        if ui:
+            actions.append(ui)
+            return actions
+    if bbox and all(bbox.get(k) is not None for k in ("west", "south", "east", "north")):
+        actions.append(
+            {
+                "type": "fit_bounds",
+                "tab": "map",
+                "bbox": {
+                    "west": float(bbox["west"]),
+                    "south": float(bbox["south"]),
+                    "east": float(bbox["east"]),
+                    "north": float(bbox["north"]),
+                },
+            }
+        )
+    return actions
 
 
 def execute_fast_path(
@@ -1450,7 +1561,20 @@ def execute_fast_path(
                 limit=25,
             )
             content = f"{content}\n\n{format_list_assets_text(page, place_label=place_label)}"
-            speak = _format_list_assets_speech(page, place_label)
+            if intent.highlight_on_map:
+                ui_actions.extend(_list_assets_map_ui(page, place_label=place_label))
+                speak = _format_list_assets_speech(
+                    page, place_label, highlighted=True
+                )
+            else:
+                speak = _format_list_assets_speech(
+                    page, place_label, highlighted=False
+                )
+                content = (
+                    f"{content}\n\nWant me to highlight them on the map?"
+                )
+        elif not intent.use_viewport:
+            ui_actions.extend(_territory_map_ui_actions(intent, bbox=bbox))
 
         complete_progress(request_id, "Count ready")
         return {
@@ -1496,7 +1620,14 @@ def execute_fast_path(
         from agents.spatial import format_list_assets_text
 
         content = format_list_assets_text(page, place_label=place_label)
-        speak = _format_list_assets_speech(page, place_label)
+        if intent.highlight_on_map:
+            ui_actions.extend(_list_assets_map_ui(page, place_label=place_label))
+            speak = _format_list_assets_speech(page, place_label, highlighted=True)
+        else:
+            speak = _format_list_assets_speech(page, place_label, highlighted=False)
+            content = f"{content}\n\nWant me to highlight them on the map?"
+        if not ui_actions and not intent.use_viewport and intent.highlight_on_map:
+            ui_actions.extend(_territory_map_ui_actions(intent, bbox=bbox))
         complete_progress(request_id, "List ready")
         return {
             "content": content,

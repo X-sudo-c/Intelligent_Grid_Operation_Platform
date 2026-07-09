@@ -1,7 +1,8 @@
-import { ExternalLink, X } from 'lucide-react';
+import { ExternalLink, PanelRightClose, PanelRightOpen, X } from 'lucide-react';
 import { GiopMapView } from './GiopMapView';
 import type { GiopStagingAsset, GiopTopologyPayload } from '../api/giop-api';
 import type { GiopMapFlyRequest } from '../lib/giopMapFlyRequest';
+import type { SideMapDockMode } from '../lib/giopSideMapDock';
 
 interface GiopSideMapPanelProps {
   mrid: string | null;
@@ -18,6 +19,9 @@ interface GiopSideMapPanelProps {
   onNodeClick: (mrid: string, coordinates?: [number, number]) => void;
   /** Data Quality desk: map stays open; hide the close control. */
   persistent?: boolean;
+  /** Docked in the workspace rail, or floating over the page. */
+  dockMode?: SideMapDockMode;
+  onDockModeChange?: (mode: SideMapDockMode) => void;
 }
 
 export function GiopSideMapPanel({
@@ -26,7 +30,7 @@ export function GiopSideMapPanel({
   coordinates,
   isLightMode,
   stagingAssets,
-  startMrid,
+  startMrid: _startMrid,
   mapRefreshToken,
   flyRequest = null,
   impactOverlay,
@@ -34,7 +38,10 @@ export function GiopSideMapPanel({
   onOpenFullMap,
   onNodeClick,
   persistent = false,
+  dockMode = 'docked',
+  onDockModeChange,
 }: GiopSideMapPanelProps) {
+  const floating = dockMode === 'floating';
   const border = isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/75 bg-premium-sidebar';
   const muted = isLightMode ? 'text-slate-500' : 'text-premium-muted';
   const btn = isLightMode
@@ -42,17 +49,41 @@ export function GiopSideMapPanel({
     : 'text-premium-muted hover:text-premium-text hover:bg-premium-hover';
 
   return (
-    <div className={`h-full flex flex-col border-l ${border}`}>
-      <div className={`shrink-0 px-3 py-2 flex items-center justify-between gap-2 border-b ${isLightMode ? 'border-slate-200' : 'border-premium-border/80'}`}>
+    <div className={`h-full flex flex-col ${floating ? '' : `border-l ${border}`}`}>
+      <div
+        data-giop-float-drag={floating ? '' : undefined}
+        className={`shrink-0 px-3 py-2 flex items-center justify-between gap-2 border-b ${
+          isLightMode ? 'border-slate-200' : 'border-premium-border/80'
+        } ${floating ? 'cursor-grab active:cursor-grabbing select-none' : ''}`}
+      >
         <div className="min-w-0">
           <p className={`text-xs font-medium ${isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'}`}>
             Map preview
+            {floating && (
+              <span className={`ml-1.5 font-normal ${muted}`}>· floating</span>
+            )}
           </p>
           <p className={`text-xs truncate ${muted}`} title={name ?? mrid ?? undefined}>
             {name || (mrid ? `${mrid.slice(0, 8)}…` : 'Select an asset')}
           </p>
         </div>
-        <div className="flex items-center gap-1 shrink-0">
+        <div className="flex items-center gap-1 shrink-0" data-giop-no-drag>
+          {onDockModeChange && (
+            <button
+              type="button"
+              onClick={() => onDockModeChange(floating ? 'docked' : 'floating')}
+              className={`inline-flex items-center gap-1 px-2 py-1 text-xs rounded transition ${btn}`}
+              title={floating ? 'Dock map to the right' : 'Undock map (float over page)'}
+              aria-label={floating ? 'Dock map' : 'Undock map'}
+            >
+              {floating ? (
+                <PanelRightOpen className="h-3.5 w-3.5" />
+              ) : (
+                <PanelRightClose className="h-3.5 w-3.5" />
+              )}
+              {floating ? 'Dock' : 'Undock'}
+            </button>
+          )}
           <button
             type="button"
             onClick={onOpenFullMap}

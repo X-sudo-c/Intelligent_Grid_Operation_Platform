@@ -58,6 +58,7 @@ from graph_sync import apply_webhook_event, graph_parity_report, reconcile_memgr
 from redis_cache import (
     GRAPH_CHUNK_CACHE_TTL_SEC,
     MAP_SEARCH_CACHE_TTL_SEC,
+    AUTOCOMPLETE_QUERY_TTL_SEC,
     OPS_CACHE_TTL_SEC,
     TOPOLOGY_SNAPSHOT_CACHE_TTL_SEC,
     REFERENCE_LAYERS_CACHE_TTL_SEC,
@@ -84,6 +85,8 @@ from redis_cache import (
     graph_chunk_key,
     graph_parity_key,
     reference_layers_key,
+    reference_map_config_key,
+    invalidate_reference_map_config_cache,
     h3_assignments_geojson_key,
     h3_cells_key,
     h3_coverage_key,
@@ -91,12 +94,14 @@ from redis_cache import (
     idempotency_key,
     invalidate_after_promote,
     invalidate_after_staging_write,
+    invalidate_gis_import_cache,
     invalidate_h3_cache,
     invalidate_ops_cache,
     invalidate_topology_cache,
     lock,
     map_nodes_key,
     map_search_key,
+    autocomplete_query_key,
     nav_badges_key,
     node_connections_key,
     repair_lock_key,
@@ -145,6 +150,7 @@ from topology_dq import (
     create_topology_batch_run,
     estimate_topology_scan_seconds,
     execute_topology_batch_scan,
+    fail_stale_topology_batch_run,
     find_active_topology_batch_run,
     get_topology_batch_progress,
     latest_staging_topology_live,
@@ -172,6 +178,7 @@ from geometry_cleanup import (
 from endpoint_proposals import (
     apply_endpoint_fix_proposals,
     bulk_review_endpoint_fix_proposals,
+    endpoint_fix_proposal_map_preview,
     endpoint_fix_proposal_summary,
     generate_endpoint_fix_proposals,
     list_endpoint_fix_proposals,
@@ -265,6 +272,7 @@ from reference_render import (
 )
 from work_orders import create_work_order, get_work_order, list_work_orders, patch_work_order
 from map_search import SEARCH_KINDS, list_places_index, search_map
+from map_autocomplete import autocomplete_places
 from geocode import geocode_map_places
 from migration_engine import (
     list_failed as list_migration_failed,
@@ -273,7 +281,7 @@ from migration_engine import (
     parse_geopackage,
     run_migration,
 )
-from metrics import record_request, snapshot as metrics_snapshot
+from metrics import normalize_route, record_request, snapshot as metrics_snapshot
 from ops_badges import collect_badge_counts
 from agents.models import RunMode, RunType, ValidationRunRequest
 from agents.orchestrator import run_agent_validation_cycle, run_validation_cycle
@@ -342,6 +350,7 @@ def _push_rejection_notification(
 async def metrics_middleware(request: Request, call_next):
     start = time.perf_counter()
     is_error = False
+    route = normalize_route(request.method, request.url.path)
     try:
         response = await call_next(request)
         is_error = response.status_code >= 500
@@ -351,7 +360,7 @@ async def metrics_middleware(request: Request, call_next):
         raise
     finally:
         duration_ms = (time.perf_counter() - start) * 1000
-        record_request(duration_ms, is_error=is_error)
+        record_request(duration_ms, is_error=is_error, route=route)
 
 graph_driver = GraphDatabase.driver(
     GRAPH_URI,
@@ -3157,6 +3166,68 @@ async def api_map_geocode(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.get("/api/v1/map/autocomplete")
+async def api_map_autocomplete(
+    q: str = Query(..., min_length=2, max_length=120),
+    limit: int = Query(default=8, ge=1, le=20),
+    west: float | None = Query(default=None),
+    south: float | None = Query(default=None),
+    east: float | None = Query(default=None),
+    north: float | None = Query(default=None),
+):
+    """
+    Google-style place autocomplete: OSM map_places index + aliases + districts
+    with fuzzy matching and optional viewport bias. Falls back to OSM geocode when
+    the local index misses.
+    """
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+
+    bbox_ok = None not in (west, south, east, north)
+    w = west if bbox_ok else None
+    s = south if bbox_ok else None
+    e = east if bbox_ok else None
+    n = north if bbox_ok else None
+    cache_key = autocomplete_query_key(q, limit, west=w, south=s, east=e, north=n)
+
+    def _fetch() -> dict[str, Any]:
+        conn = pooled_connect(SUPABASE_DB_URI)
+        try:
+            local = autocomplete_places(
+                conn,
+                query=q,
+                limit=limit,
+                west=w,
+                south=s,
+                east=e,
+                north=n,
+            )
+        finally:
+            conn.close()
+
+        results = list(local)
+        if len(results) < limit:
+            try:
+                osm = geocode_map_places(q, limit=max(4, limit - len(results)))
+            except Exception:
+                osm = []
+            seen = {str(item.get("title") or "").strip().lower() for item in results}
+            for hit in osm:
+                title = str(hit.get("title") or "").strip().lower()
+                if not title or title in seen:
+                    continue
+                seen.add(title)
+                results.append(hit)
+                if len(results) >= limit:
+                    break
+        return {"query": q, "results": results[:limit]}
+
+    try:
+        return cached_json(cache_key, _fetch, ttl_sec=AUTOCOMPLETE_QUERY_TTL_SEC)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/api/v1/map/places-index")
 async def api_map_places_index():
     """District/region centroids and bboxes — fetched once; map search runs client-side."""
@@ -3836,6 +3907,40 @@ async def get_active_topology_dq_run():
         conn.close()
 
 
+@app.post("/api/v1/dq/topology/runs/{run_id}/cancel")
+async def cancel_topology_dq_run(run_id: str):
+    """Mark a stuck/in-flight master scan failed and release the scan lock.
+
+    Does not cancel an in-flight Postgres statement by itself — restart the
+    sync-service / pgmq worker (or terminate the backend PID) if SQL is still running.
+    """
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT status FROM public.data_quality_batch_runs
+                WHERE id = %s::uuid AND scan_type = 'topology_master'
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if row[0] != "running":
+            return {"run_id": run_id, "status": row[0], "message": "Run is not active"}
+        fail_stale_topology_batch_run(
+            conn,
+            run_id,
+            error_message="Topology scan cancelled by operator. Re-run the scan.",
+        )
+        return {"run_id": run_id, "status": "failed", "message": "Scan cancelled"}
+    finally:
+        conn.close()
+
+
 @app.get("/api/v1/dq/topology/runs/{run_id}/progress")
 async def get_topology_dq_run_progress(run_id: str):
     if not SUPABASE_DB_URI:
@@ -4004,7 +4109,9 @@ async def post_gis_snap_conductors(payload: GisSnapConductorsPayload | None = No
     body = payload or GisSnapConductorsPayload()
     conn = pooled_connect(SUPABASE_DB_URI)
     try:
-        return snap_conductor_endpoints(conn, tolerance_m=body.tolerance_m)
+        result = snap_conductor_endpoints(conn, tolerance_m=body.tolerance_m)
+        invalidate_gis_import_cache()
+        return result
     except Exception as exc:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -4025,11 +4132,13 @@ async def post_gis_infer_endpoint_ids(payload: GisInferEndpointsPayload | None =
     body = payload or GisInferEndpointsPayload()
     conn = pooled_connect(SUPABASE_DB_URI)
     try:
-        return infer_conductor_endpoint_ids_tier_a(
+        result = infer_conductor_endpoint_ids_tier_a(
             conn,
             tolerance_m=body.tolerance_m,
             district=body.district,
         )
+        invalidate_gis_import_cache()
+        return result
     except Exception as exc:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -4229,6 +4338,22 @@ async def get_gis_endpoint_fix_proposals(
             limit=limit,
             offset=offset,
         )
+    finally:
+        conn.close()
+
+
+@app.get("/api/v1/gis/endpoint-fix-proposals/{proposal_id}/map-preview")
+async def get_gis_endpoint_fix_proposal_map_preview(proposal_id: str):
+    """Segment line + suggested links to proposed endpoint assets (poles, DT, PT)."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    conn = pooled_connect(SUPABASE_DB_URI)
+    try:
+        return endpoint_fix_proposal_map_preview(conn, proposal_id)
+    except ValueError as exc:
+        if str(exc) == "proposal_not_found":
+            raise HTTPException(status_code=404, detail="Proposal not found") from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         conn.close()
 
@@ -5794,6 +5919,7 @@ async def api_list_reference_layers(refresh: bool = Query(default=False)):
     try:
         if refresh:
             delete_pattern(reference_layers_key())
+            invalidate_reference_map_config_cache()
             return _fetch()
         return cached_json(reference_layers_key(), _fetch, REFERENCE_LAYERS_CACHE_TTL_SEC)
     except Exception as exc:
@@ -5805,12 +5931,19 @@ async def api_reference_map_config():
     if not SUPABASE_DB_URI:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
     martin_url = os.getenv("MARTIN_URL", "http://127.0.0.1:3001")
-    conn = pooled_connect(SUPABASE_DB_URI)
+    cache_key = reference_map_config_key(martin_url)
+
+    def _fetch() -> dict[str, Any]:
+        conn = pooled_connect(SUPABASE_DB_URI)
+        try:
+            return {"layers": build_map_config(conn, martin_url=martin_url)}
+        finally:
+            conn.close()
+
     try:
-        config = build_map_config(conn, martin_url=martin_url)
-    finally:
-        conn.close()
-    return {"layers": config}
+        return cached_json(cache_key, _fetch, REFERENCE_LAYERS_CACHE_TTL_SEC)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/reference-layers/{slug}/geojson")
@@ -6911,7 +7044,7 @@ async def api_list_regulatory_reports():
 
 @app.on_event("startup")
 def warm_voice_pipeline() -> None:
-    """Preload Whisper + boundary vocabulary off the request path."""
+    """Preload Whisper + agent reference caches off the request path."""
 
     def _warm() -> None:
         try:
@@ -6930,6 +7063,13 @@ def warm_voice_pipeline() -> None:
     threading.Thread(target=_warm, name="voice-warmup", daemon=True).start()
 
     if SUPABASE_DB_URI:
+        try:
+            from agent_warm_cache import start_warm_agent_caches
+
+            start_warm_agent_caches(lambda: pooled_connect(SUPABASE_DB_URI))
+        except Exception:
+            logging.getLogger(__name__).warning("agent cache warmup failed", exc_info=True)
+
         try:
             from pgmq_worker import bootstrap_handlers, start_pgmq_worker
 

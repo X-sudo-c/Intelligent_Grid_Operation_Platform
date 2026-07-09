@@ -25,19 +25,22 @@ AI_SCAN_MAX_OUTPUT_TOKENS = max(4096, min(65536, int(os.getenv("GIOP_ENDPOINT_AI
 AI_SCAN_SYSTEM = """You are the GIOP geometry steward agent reviewing GIS conductor endpoint fix proposals.
 
 Context:
-- Raw GPKG lines have originating_node_id / end_node_id text fields (pole unique IDs).
-- Geometry-based proposals matched line endpoints to nearest overhead support-structure poles.
+- Raw GPKG lines have originating_node_id / end_node_id text fields (pole/transformer unique IDs).
+- Geometry-based proposals matched line endpoints to nearest resolvable assets (poles, DT, PT).
+- Asset kinds: pole_11kv, pole_33kv, pole_lv, distribution_transformer (DT), power_transformer (PT).
 - Tier A = both ends within ~5m. Tier B = assisted match within ~15m — review carefully.
+- LV service tails may legitimately end at a DT; MV spans should end at poles unless geometry clearly hits a PT.
 
 Your job:
-1. Reason about whether each proposal makes topological sense (geometry vs typo vs wrong pole).
-2. Call preview_geom_snap_candidate(segment_id) when you need per-segment pole distances and tiers.
-3. Think step by step — stewards will read your reasoning in the UI.
+1. Reason about whether each proposal makes topological sense (geometry vs typo vs wrong asset type).
+2. Call preview_geom_snap_candidate(segment_id) when you need per-segment asset distances, kinds, and tiers.
+3. Disagree when the nearest asset type is wrong (e.g. line clearly on transformer but proposal is a distant pole).
+4. Think step by step — stewards will read your reasoning in the UI.
 
 Rules:
 - Do NOT approve or write to the database.
-- If geometry proposal looks correct, agree=true and confidence=high for tier_a with small distances.
-- Flag typos when current_from/to is close to proposed pole ID (spelling/format).
+- If geometry proposal looks correct for the asset kind, agree=true and confidence=high for tier_a with small distances.
+- Flag typos when current_from/to is close to proposed ID (spelling/format).
 - Only suggest different proposed_from/proposed_to when you disagree with geometry match.
 
 Finish with a fenced JSON block:
@@ -62,6 +65,7 @@ Include a review entry for every proposal id listed in the user message."""
 AI_SCAN_SYSTEM_COMPACT = """You are the GIOP geometry steward reviewing GIS endpoint fix proposals in a LARGE batch.
 
 Rules:
+- Consider proposed asset kind (pole vs DT vs PT) — disagree if type mismatches line role.
 - Tier A + small distances → agree=true, confidence=high.
 - Tier B within 15m → agree=true unless distance >12m then confidence=medium.
 - Keep each rationale under 12 words. Overall thoughts max 2 sentences.
@@ -169,14 +173,50 @@ def _proposal_brief(p: dict[str, Any]) -> dict[str, Any]:
         "current_to": p.get("current_to"),
         "proposed_from": p.get("proposed_from"),
         "proposed_to": p.get("proposed_to"),
+        "proposed_from_kind": p.get("proposed_from_kind"),
+        "proposed_to_kind": p.get("proposed_to_kind"),
         "start_dist_m": p.get("start_dist_m"),
         "end_dist_m": p.get("end_dist_m"),
         "start_nearest_pole": p.get("start_nearest_pole"),
         "end_nearest_pole": p.get("end_nearest_pole"),
+        "start_nearest_kind": p.get("start_nearest_kind"),
+        "end_nearest_kind": p.get("end_nearest_kind"),
     }
     if p.get("segment_mrid"):
         brief["segment_mrid"] = p["segment_mrid"]
     return brief
+
+
+def _normalize_thoughts(content: str, payload: dict[str, Any] | None) -> str | None:
+    """Steward-facing summary — never return the full reviews JSON blob."""
+    if payload:
+        thoughts = payload.get("thoughts")
+        if isinstance(thoughts, str) and thoughts.strip():
+            return thoughts.strip()
+        reviews = payload.get("reviews")
+        if isinstance(reviews, list) and reviews:
+            agrees = sum(1 for r in reviews if isinstance(r, dict) and r.get("agree"))
+            return (
+                f"Reviewed {len(reviews)} proposals — {agrees} agree, "
+                f"{len(reviews) - agrees} flagged for review."
+            )
+    prose = re.sub(r"```json\s*\{.*?\}\s*```", "", content, flags=re.DOTALL | re.IGNORECASE).strip()
+    prose = re.sub(r"```\s*\{.*?\}\s*```", "", prose, flags=re.DOTALL).strip()
+    if prose and not prose.lstrip().startswith("{"):
+        return prose[:2000]
+    return None
+
+
+def _assistant_transcript_content(content: str, payload: dict[str, Any] | None) -> str:
+    summary = _normalize_thoughts(content, payload)
+    if summary:
+        return summary
+    if payload and payload.get("reviews"):
+        return "Structured review complete — see per-row AI rationale in the table."
+    trimmed = content.strip()
+    if trimmed.startswith("{"):
+        return "Structured review complete — see per-row AI rationale in the table."
+    return trimmed[:2000] if trimmed else "Review complete."
 
 
 def _insert_scan_row(
@@ -337,21 +377,18 @@ def _run_batch_llm_review(
         max_tokens=max_tokens,
     )
     content = result.get("content") or ""
-    transcript = [
-        {"role": "user", "content": user_msg[:500] + "…"},
-        {"role": "assistant", "content": content},
-    ]
     payload = _extract_json_payload(content)
     reviews = (payload or {}).get("reviews") or []
-    thoughts = (payload or {}).get("thoughts") if payload else None
-    if not thoughts:
-        thoughts = content[:2000] if not content.lstrip().startswith("```") else None
+    thoughts = _normalize_thoughts(content, payload)
     if not thoughts and payload is None and content:
         thoughts = "LLM response could not be parsed — try Deep reasoning or fewer rows."
     return {
         "model": result.get("model"),
         "content": content,
-        "transcript": transcript,
+        "transcript": [
+            {"role": "user", "content": f"Review {len(briefs)} proposals in {district}."},
+            {"role": "assistant", "content": _assistant_transcript_content(content, payload)},
+        ],
         "reviews": reviews,
         "thoughts": thoughts,
     }
@@ -392,10 +429,21 @@ def _run_agent_llm_review(
     content = react.get("content") or ""
     payload = _extract_json_payload(content)
     reviews = (payload or {}).get("reviews") or []
-    thoughts = (payload or {}).get("thoughts") or content[:4000]
+    thoughts = _normalize_thoughts(content, payload)
+    transcript = react.get("transcript") or []
+    if transcript:
+        sanitized: list[dict[str, Any]] = []
+        for entry in transcript:
+            if not isinstance(entry, dict):
+                continue
+            row = dict(entry)
+            if row.get("role") == "assistant" and row.get("content"):
+                row["content"] = _assistant_transcript_content(str(row["content"]), payload)
+            sanitized.append(row)
+        transcript = sanitized
     return {
         "model": react.get("model"),
-        "transcript": react.get("transcript") or [],
+        "transcript": transcript,
         "reviews": reviews,
         "thoughts": thoughts,
     }

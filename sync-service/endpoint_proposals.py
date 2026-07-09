@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from typing import Any, Literal
@@ -53,6 +54,14 @@ def _row_to_proposal(row: tuple, columns: list[str], *, data_tier: DataTier) -> 
     return data
 
 
+def _geometry_scan_lock_key(district: str, data_tier: str) -> int:
+    """Stable advisory-lock key per district/tier geometry scan."""
+    digest = hashlib.sha256(
+        f"endpoint_fix_geom:{data_tier}:{district.strip().lower()}".encode()
+    ).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
+
+
 def generate_endpoint_fix_proposals(
     conn,
     district: str,
@@ -72,16 +81,28 @@ def generate_endpoint_fix_proposals(
     if tier == "staging":
         tolerance_m = min(tolerance_m, 5.0) if tolerance_m > 5.0 else tolerance_m
         assisted_m = min(assisted_m, 15.0) if assisted_m > 15.0 else assisted_m
+    lock_key = _geometry_scan_lock_key(district, tier)
     with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT {cfg["generate_fn"]}(
-              %s, %s, %s, %s, %s, %s
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+        locked = bool(cur.fetchone()[0])
+        if not locked:
+            raise ValueError(
+                f"Geometry scan already running for {district}. Wait for it to finish or retry in a minute."
             )
-            """,
-            (district, tolerance_m, assisted_m, limit, include_tier_b, replace_pending),
-        )
-        row = cur.fetchone()
+        try:
+            timeout_ms = max(30_000, int(os.getenv("GIOP_ENDPOINT_GEOM_SCAN_TIMEOUT_MS", "180000")))
+            cur.execute("SET LOCAL statement_timeout = %s", (f"{timeout_ms}ms",))
+            cur.execute(
+                f"""
+                SELECT {cfg["generate_fn"]}(
+                  %s, %s, %s, %s, %s, %s
+                )
+                """,
+                (district, tolerance_m, assisted_m, limit, include_tier_b, replace_pending),
+            )
+            row = cur.fetchone()
+        finally:
+            cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
     conn.commit()
     result = row[0] if row else {}
     if isinstance(result, dict):
@@ -428,4 +449,291 @@ def bulk_review_endpoint_fix_proposals(
         "filter": filter,
         "district": district_val,
         "data_tier": tier_name,
+    }
+
+
+_ASSET_KIND_LABELS: dict[str, str] = {
+    "pole_11kv": "11 kV pole",
+    "pole_33kv": "33 kV pole",
+    "pole_lv": "LV pole",
+    "distribution_transformer": "DT",
+    "power_transformer": "PT",
+    "connectivity_asset": "asset",
+}
+
+
+def _asset_kind_label(kind: str | None) -> str:
+    if not kind:
+        return "asset"
+    return _ASSET_KIND_LABELS.get(kind, kind.replace("_", " "))
+
+
+def _point_feature(
+    *,
+    role: str,
+    lon: float,
+    lat: float,
+    node_id: str,
+    resolved: bool,
+    proposed: bool = False,
+    asset_kind: str | None = None,
+) -> dict[str, Any]:
+    kind_label = _asset_kind_label(asset_kind)
+    label = f"{kind_label}: {node_id}" if proposed and asset_kind else node_id
+    return {
+        "type": "Feature",
+        "properties": {
+            "role": role,
+            "node_id": label,
+            "asset_id": node_id,
+            "asset_kind": asset_kind,
+            "resolved": resolved,
+            "proposed": proposed,
+        },
+        "geometry": {"type": "Point", "coordinates": [lon, lat]},
+    }
+
+
+def _link_feature(
+    *,
+    role: str,
+    from_lon: float,
+    from_lat: float,
+    to_lon: float,
+    to_lat: float,
+    asset_id: str,
+    asset_kind: str | None,
+    dist_m: float | None,
+) -> dict[str, Any]:
+    return {
+        "type": "Feature",
+        "properties": {
+            "role": role,
+            "asset_id": asset_id,
+            "asset_kind": asset_kind,
+            "dist_m": dist_m,
+        },
+        "geometry": {
+            "type": "LineString",
+            "coordinates": [[from_lon, from_lat], [to_lon, to_lat]],
+        },
+    }
+
+
+def endpoint_fix_proposal_map_preview(conn, proposal_id: str) -> dict[str, Any]:
+    """Map overlay: segment line, current ends, proposed asset targets, suggested links."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+              p.id,
+              p.segment_id,
+              p.district,
+              p.current_from,
+              p.current_to,
+              p.proposed_from,
+              p.proposed_to,
+              p.proposed_from_kind,
+              p.proposed_to_kind,
+              p.start_dist_m,
+              p.end_dist_m,
+              p.tier,
+              ST_AsGeoJSON(ST_Force2D(cs.geom))::json AS line_geom,
+              ST_X(ST_StartPoint(ST_Force2D(cs.geom))) AS start_lon,
+              ST_Y(ST_StartPoint(ST_Force2D(cs.geom))) AS start_lat,
+              ST_X(ST_EndPoint(ST_Force2D(cs.geom))) AS end_lon,
+              ST_Y(ST_EndPoint(ST_Force2D(cs.geom))) AS end_lat,
+              (src.mrid IS NOT NULL) AS start_resolved,
+              (tgt.mrid IS NOT NULL) AS end_resolved,
+              ST_X(COALESCE(pf.geom, amf.geom)) AS prop_from_lon,
+              ST_Y(COALESCE(pf.geom, amf.geom)) AS prop_from_lat,
+              ST_X(COALESCE(pt.geom, amt.geom)) AS prop_to_lon,
+              ST_Y(COALESCE(pt.geom, amt.geom)) AS prop_to_lat,
+              ST_XMin(ST_Envelope(cs.geom)) AS west,
+              ST_YMin(ST_Envelope(cs.geom)) AS south,
+              ST_XMax(ST_Envelope(cs.geom)) AS east,
+              ST_YMax(ST_Envelope(cs.geom)) AS north
+            FROM gis.conductor_endpoint_proposals p
+            JOIN gis.conductor_segments cs ON cs.id = p.segment_id
+            LEFT JOIN LATERAL gis.resolve_endpoint(cs.district, cs.originating_node_id) src ON TRUE
+            LEFT JOIN LATERAL gis.resolve_endpoint(cs.district, cs.end_node_id) tgt ON TRUE
+            LEFT JOIN LATERAL gis.resolve_endpoint(cs.district, p.proposed_from) pf ON TRUE
+            LEFT JOIN LATERAL gis.resolve_endpoint(cs.district, p.proposed_to) pt ON TRUE
+            LEFT JOIN gis.asset_id_map amf
+              ON amf.source_unique_id = btrim(p.proposed_from) AND pf.geom IS NULL
+            LEFT JOIN gis.asset_id_map amt
+              ON amt.source_unique_id = btrim(p.proposed_to) AND pt.geom IS NULL
+            WHERE p.id = %s::uuid
+            """,
+            (proposal_id,),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        raise ValueError("proposal_not_found")
+
+    (
+        _pid,
+        segment_id,
+        district,
+        current_from,
+        current_to,
+        proposed_from,
+        proposed_to,
+        proposed_from_kind,
+        proposed_to_kind,
+        start_dist_m,
+        end_dist_m,
+        tier,
+        line_geom,
+        start_lon,
+        start_lat,
+        end_lon,
+        end_lat,
+        start_resolved,
+        end_resolved,
+        prop_from_lon,
+        prop_from_lat,
+        prop_to_lon,
+        prop_to_lat,
+        west,
+        south,
+        east,
+        north,
+    ) = row
+
+    line_features: list[dict[str, Any]] = []
+    if line_geom and isinstance(line_geom, dict):
+        line_features.append(
+            {
+                "type": "Feature",
+                "properties": {"segment_id": segment_id, "tier": tier},
+                "geometry": line_geom,
+            }
+        )
+
+    endpoint_features: list[dict[str, Any]] = []
+    if start_lon is not None and start_lat is not None:
+        endpoint_features.append(
+            _point_feature(
+                role="start",
+                lon=float(start_lon),
+                lat=float(start_lat),
+                node_id=current_from or "start",
+                resolved=bool(start_resolved),
+            )
+        )
+    if end_lon is not None and end_lat is not None:
+        endpoint_features.append(
+            _point_feature(
+                role="end",
+                lon=float(end_lon),
+                lat=float(end_lat),
+                node_id=current_to or "end",
+                resolved=bool(end_resolved),
+            )
+        )
+
+    proposed_features: list[dict[str, Any]] = []
+    link_features: list[dict[str, Any]] = []
+
+    if prop_from_lon is not None and prop_from_lat is not None and proposed_from:
+        proposed_features.append(
+            _point_feature(
+                role="start",
+                lon=float(prop_from_lon),
+                lat=float(prop_from_lat),
+                node_id=proposed_from,
+                resolved=True,
+                proposed=True,
+                asset_kind=proposed_from_kind,
+            )
+        )
+        if start_lon is not None and start_lat is not None:
+            link_features.append(
+                _link_feature(
+                    role="start",
+                    from_lon=float(start_lon),
+                    from_lat=float(start_lat),
+                    to_lon=float(prop_from_lon),
+                    to_lat=float(prop_from_lat),
+                    asset_id=proposed_from,
+                    asset_kind=proposed_from_kind,
+                    dist_m=float(start_dist_m) if start_dist_m is not None else None,
+                )
+            )
+
+    if prop_to_lon is not None and prop_to_lat is not None and proposed_to:
+        proposed_features.append(
+            _point_feature(
+                role="end",
+                lon=float(prop_to_lon),
+                lat=float(prop_to_lat),
+                node_id=proposed_to,
+                resolved=True,
+                proposed=True,
+                asset_kind=proposed_to_kind,
+            )
+        )
+        if end_lon is not None and end_lat is not None:
+            link_features.append(
+                _link_feature(
+                    role="end",
+                    from_lon=float(end_lon),
+                    from_lat=float(end_lat),
+                    to_lon=float(prop_to_lon),
+                    to_lat=float(prop_to_lat),
+                    asset_id=proposed_to,
+                    asset_kind=proposed_to_kind,
+                    dist_m=float(end_dist_m) if end_dist_m is not None else None,
+                )
+            )
+
+    bbox = None
+    focus_lons: list[float] = []
+    focus_lats: list[float] = []
+    for lon, lat in (
+        (start_lon, start_lat),
+        (end_lon, end_lat),
+        (prop_from_lon, prop_from_lat),
+        (prop_to_lon, prop_to_lat),
+    ):
+        if lon is not None and lat is not None:
+            focus_lons.append(float(lon))
+            focus_lats.append(float(lat))
+    if focus_lons and focus_lats:
+        pad = 0.00015
+        bbox = {
+            "west": min(focus_lons) - pad,
+            "south": min(focus_lats) - pad,
+            "east": max(focus_lons) + pad,
+            "north": max(focus_lats) + pad,
+        }
+    elif None not in (west, south, east, north):
+        bbox = {
+            "west": float(west),
+            "south": float(south),
+            "east": float(east),
+            "north": float(north),
+        }
+
+    from_lbl = _asset_kind_label(proposed_from_kind)
+    to_lbl = _asset_kind_label(proposed_to_kind)
+    label = f"{district or 'GIS'} · {from_lbl} → {to_lbl} · {tier or 'proposal'}"
+
+    return {
+        "proposal_id": proposal_id,
+        "segment_id": int(segment_id),
+        "label": label,
+        "proposed_from": proposed_from,
+        "proposed_to": proposed_to,
+        "proposed_from_kind": proposed_from_kind,
+        "proposed_to_kind": proposed_to_kind,
+        "geojson": {
+            "line": {"type": "FeatureCollection", "features": line_features},
+            "endpoints": {"type": "FeatureCollection", "features": endpoint_features},
+            "proposed_assets": {"type": "FeatureCollection", "features": proposed_features},
+            "suggested_links": {"type": "FeatureCollection", "features": link_features},
+        },
+        "bbox": bbox,
     }

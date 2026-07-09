@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from geocode import geocode_map_places
+from map_autocomplete import lookup_map_place
 
 PLACE_GEOCODE_ENABLED = os.getenv("PLACE_GEOCODE_ENABLED", "1").strip().lower() in (
     "1",
@@ -431,7 +432,64 @@ def _pick_osm_hit(query: str, hits: list[dict[str, Any]]) -> dict[str, Any] | No
     return best or hits[0]
 
 
+def _map_place_hit_to_result(conn, query: str, hit: dict[str, Any]) -> dict[str, Any] | None:
+    lon = hit.get("longitude")
+    lat = hit.get("latitude")
+    if lon is None or lat is None:
+        return None
+    contained = _district_at_point(conn, float(lon), float(lat))
+    bbox = hit.get("bbox")
+    center = {"lon": float(lon), "lat": float(lat)}
+    title = str(hit.get("title") or query)
+    if contained:
+        contained["query"] = query
+        contained["matched_as"] = title
+        contained["confidence"] = CONFIDENCE_OSM
+        contained["source"] = "map_places"
+        if bbox and all(bbox.get(k) is not None for k in ("west", "south", "east", "north")):
+            contained["bbox"] = bbox
+        contained["center"] = center
+        return contained
+    if bbox and all(bbox.get(k) is not None for k in ("west", "south", "east", "north")):
+        return {
+            "query": query,
+            "matched_as": title,
+            "confidence": CONFIDENCE_OSM,
+            "source": "map_places",
+            "district": None,
+            "region": hit.get("subtitle"),
+            "center": center,
+            "bbox": bbox,
+            "candidates": [],
+        }
+    return None
+
+
+def _resolve_local_map_places(conn, query: str) -> dict[str, Any] | None:
+    hits = lookup_map_place(conn, query, limit=5)
+    if not hits:
+        return None
+    osm_hits = [
+        {
+            "title": h.get("title"),
+            "longitude": h.get("longitude"),
+            "latitude": h.get("latitude"),
+            "bbox": h.get("bbox"),
+            "subtitle": h.get("subtitle"),
+        }
+        for h in hits
+    ]
+    best = _pick_osm_hit(query, osm_hits)
+    if not best:
+        return None
+    return _map_place_hit_to_result(conn, query, best)
+
+
 def _resolve_osm(conn, query: str) -> dict[str, Any] | None:
+    local = _resolve_local_map_places(conn, query)
+    if local:
+        return local
+
     hits = geocode_map_places(query, limit=5)
     if not hits and "," not in query:
         q_low = query.strip().lower()
@@ -562,11 +620,13 @@ def _resolve_place_uncached(
 
     if geocode and _ROAD_QUERY_RE.search(q):
         for variant in _road_geocode_variants(q):
-            hit = _resolve_osm(conn, variant)
+            hit = _resolve_local_map_places(conn, variant)
+            if not hit:
+                hit = _resolve_osm(conn, variant)
             if hit:
                 hit["query"] = q
-                hit["matched_as"] = q
-                hit["source"] = "osm_road"
+                hit["matched_as"] = hit.get("matched_as") or q
+                hit["source"] = "map_places_road" if hit.get("source") == "map_places" else "osm_road"
                 return hit
 
     # Geocode localities before fuzzy district match (Roman Ridge, East Legon, romanridge).

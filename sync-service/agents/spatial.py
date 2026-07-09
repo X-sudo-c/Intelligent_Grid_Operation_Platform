@@ -58,6 +58,149 @@ ASSET_KIND_ALIASES: dict[str, tuple[str, ...]] = {
 LIST_ASSETS_MAX_LIMIT = 100
 LIST_ASSETS_DEFAULT_LIMIT = 25
 
+_MV_COUNTS_READY: bool | None = None
+
+
+def _district_asset_counts_mv_ready(conn) -> bool:
+    """True when gis.district_asset_counts_master exists and is populated."""
+    global _MV_COUNTS_READY
+    if _MV_COUNTS_READY is not None:
+        return _MV_COUNTS_READY
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('gis.district_asset_counts_master')")
+            regclass = cur.fetchone()[0]
+            if not regclass:
+                _MV_COUNTS_READY = False
+                return False
+            cur.execute("SELECT 1 FROM gis.district_asset_counts_master LIMIT 1")
+            _MV_COUNTS_READY = cur.fetchone() is not None
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        _MV_COUNTS_READY = False
+    return bool(_MV_COUNTS_READY)
+
+
+def _mv_territory_filters(
+    *,
+    district: str | None,
+    region: str | None,
+) -> tuple[str, list[Any]]:
+    filters: list[str] = []
+    params: list[Any] = []
+    if district:
+        filters.append("district ILIKE %s")
+        params.append(f"%{district.strip()}%")
+    if region:
+        filters.append("region ILIKE %s")
+        params.append(f"%{region.strip()}%")
+    if not filters:
+        return "FALSE", []
+    return " AND ".join(filters), params
+
+
+def _finalize_inventory_result(
+    *,
+    tier: str,
+    asset_kind: str | None,
+    kinds: tuple[str, ...] | None,
+    by_kind: dict[str, int],
+    total: int,
+    district: str | None,
+    region: str | None,
+    bbox: dict[str, float] | None,
+    distinct_locations: int | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "tier": tier,
+        "asset_kind_filter": asset_kind,
+        "total": total,
+        "by_kind": by_kind,
+        "district": district,
+        "region": region,
+        "bbox": bbox,
+    }
+    if distinct_locations is not None:
+        result["distinct_locations"] = distinct_locations
+    if source:
+        result["count_source"] = source
+    pole_keys = ("pole", "poles")
+    if kinds and asset_kind in pole_keys:
+        result["pole_total"] = sum(by_kind.get(k, 0) for k in POLE_KINDS)
+    place_label = district or region or "the area"
+    if district or region or bbox:
+        result["formatted_summary"] = format_asset_inventory_text(
+            result,
+            place_label=place_label,
+            asset_kind=asset_kind,
+        )
+    return result
+
+
+def _asset_inventory_counts_from_mv(
+    conn,
+    *,
+    tier: str,
+    asset_kind: str | None,
+    kinds: tuple[str, ...] | None,
+    district: str | None,
+    region: str | None,
+    bbox: dict[str, float] | None,
+) -> dict[str, Any] | None:
+    if tier != "master" or not _district_asset_counts_mv_ready(conn):
+        return None
+
+    territory_sql, territory_params = _mv_territory_filters(
+        district=district, region=region
+    )
+    kind_sql = ""
+    kind_params: list[Any] = []
+    if kinds:
+        kind_sql = " AND asset_kind = ANY(%s)"
+        kind_params = [list(kinds)]
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT asset_kind, SUM(asset_count)::int AS cnt
+                FROM gis.district_asset_counts_master
+                WHERE {territory_sql}
+                {kind_sql}
+                GROUP BY asset_kind
+                ORDER BY cnt DESC
+                """,
+                territory_params + kind_params,
+            )
+            rows = cur.fetchall()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+
+    if not rows:
+        return None
+
+    by_kind = {str(kind): int(cnt) for kind, cnt in rows}
+    total = sum(by_kind.values())
+    return _finalize_inventory_result(
+        tier=tier,
+        asset_kind=asset_kind,
+        kinds=kinds,
+        by_kind=by_kind,
+        total=total,
+        district=district,
+        region=region,
+        bbox=bbox,
+        source="district_asset_counts_mv",
+    )
+
 
 def _require_territory_scope(
     *,
@@ -321,8 +464,24 @@ def asset_inventory_counts(
     from db_pool import set_local_statement_timeout
 
     set_local_statement_timeout(conn, INVENTORY_TIMEOUT_MS)
-    bbox = _prefetch_territory_bbox(conn, district=district, region=region, bbox=bbox)
+    raw_bbox = bbox
+    use_mv = tier == "master" and raw_bbox is None and bool(district or region)
+    bbox = _prefetch_territory_bbox(conn, district=district, region=region, bbox=raw_bbox)
     kinds = _normalize_kinds(asset_kind)
+
+    if use_mv:
+        mv_result = _asset_inventory_counts_from_mv(
+            conn,
+            tier=tier,
+            asset_kind=asset_kind,
+            kinds=kinds,
+            district=district,
+            region=region,
+            bbox=bbox,
+        )
+        if mv_result is not None:
+            return mv_result
+
     schema_io, schema_cn, validation_filter, kind_expr, master_join = _node_inventory_scope(
         tier
     )
@@ -392,28 +551,18 @@ def asset_inventory_counts(
                 distinct_locations = int(row[0])
 
     by_kind = {r[0]: r[1] for r in rows}
-    result: dict[str, Any] = {
-        "tier": tier,
-        "asset_kind_filter": asset_kind,
-        "total": total,
-        "by_kind": by_kind,
-        "district": district,
-        "region": region,
-        "bbox": bbox,
-    }
-    if distinct_locations is not None:
-        result["distinct_locations"] = distinct_locations
-    pole_keys = ("pole", "poles")
-    if kinds and asset_kind in pole_keys:
-        result["pole_total"] = sum(by_kind.get(k, 0) for k in POLE_KINDS)
-    place_label = district or region or "the area"
-    if district or region or bbox:
-        result["formatted_summary"] = format_asset_inventory_text(
-            result,
-            place_label=place_label,
-            asset_kind=asset_kind,
-        )
-    return result
+    return _finalize_inventory_result(
+        tier=tier,
+        asset_kind=asset_kind,
+        kinds=kinds,
+        by_kind=by_kind,
+        total=total,
+        district=district,
+        region=region,
+        bbox=bbox,
+        distinct_locations=distinct_locations,
+        source="live_query",
+    )
 
 
 def list_assets_in_territory(
@@ -455,9 +604,23 @@ def list_assets_in_territory(
     if tier == "staging":
         staging_join = "LEFT JOIN staging.ghana_grid_assets ga ON ga.mrid = cn.mrid"
 
-    geom_select = (
-        ", ST_AsGeoJSON(cn.geom)::json AS geom" if include_geom else ""
-    )
+    # Always return lon/lat so list results can be highlighted on the map.
+    # Optional full GeoJSON when include_geom=True (heavier).
+    xfmr_join = ""
+    xfmr_select = ", NULL::text, NULL::float8, NULL::text, NULL::text"
+    if tier == "master":
+        xfmr_join = """
+            LEFT JOIN public.power_transformers pt
+              ON pt.connectivity_node_mrid = cn.mrid
+        """
+        xfmr_select = """
+            , pt.transformer_kind
+            , pt.rated_power_kva
+            , pt.vector_group
+            , pt.substation_name
+        """
+
+    geom_select = ", ST_AsGeoJSON(cn.geom)::json AS geom" if include_geom else ", NULL::json AS geom"
 
     with conn.cursor() as cur:
         cur.execute(
@@ -483,12 +646,16 @@ def list_assets_in_territory(
               io.name,
               io.validation::text,
               {kind_expr} AS asset_kind,
-              cn.boundary_feeder_id
+              cn.boundary_feeder_id,
+              ST_X(cn.geom)::float8 AS lon,
+              ST_Y(cn.geom)::float8 AS lat
+              {xfmr_select}
               {geom_select}
             FROM {schema_cn} cn
             JOIN {schema_io} io ON io.mrid = cn.mrid
             {master_join}
             {staging_join}
+            {xfmr_join}
             {territory_join}
             WHERE {validation_filter}
               AND cn.geom IS NOT NULL
@@ -510,8 +677,22 @@ def list_assets_in_territory(
             "asset_kind": row[3],
             "boundary_feeder_id": row[4],
         }
-        if include_geom and len(row) > 5:
-            item["geom"] = row[5]
+        lon, lat = row[5], row[6]
+        if lon is not None and lat is not None:
+            item["lon"] = float(lon)
+            item["lat"] = float(lat)
+            item["location"] = {"lon": float(lon), "lat": float(lat)}
+        xfmr_kind, rated_kva, vector_group, substation = row[7], row[8], row[9], row[10]
+        if xfmr_kind:
+            item["transformer_kind"] = xfmr_kind
+        if rated_kva is not None:
+            item["rated_power_kva"] = float(rated_kva)
+        if vector_group:
+            item["vector_group"] = vector_group
+        if substation:
+            item["substation_name"] = substation
+        if include_geom and row[11] is not None:
+            item["geom"] = row[11]
         assets.append(item)
 
     return {
@@ -525,6 +706,76 @@ def list_assets_in_territory(
         "offset": offset,
         "has_more": offset + len(assets) < total,
         "assets": assets,
+    }
+
+
+def assets_to_map_highlight_ui(
+    page: dict[str, Any],
+    *,
+    label: str | None = None,
+    tab: str = "map",
+) -> dict[str, Any] | None:
+    """Build a highlight_feeder-shaped UI action from list_assets rows (nodes only)."""
+    assets = page.get("assets") or []
+    features: list[dict[str, Any]] = []
+    lons: list[float] = []
+    lats: list[float] = []
+    for item in assets:
+        lon = item.get("lon")
+        lat = item.get("lat")
+        if lon is None or lat is None:
+            loc = item.get("location") or {}
+            lon, lat = loc.get("lon"), loc.get("lat")
+        if lon is None or lat is None:
+            geom = item.get("geom") or {}
+            coords = geom.get("coordinates") if isinstance(geom, dict) else None
+            if isinstance(coords, (list, tuple)) and len(coords) >= 2:
+                lon, lat = coords[0], coords[1]
+        if lon is None or lat is None:
+            continue
+        lon_f, lat_f = float(lon), float(lat)
+        lons.append(lon_f)
+        lats.append(lat_f)
+        props: dict[str, Any] = {
+            "mrid": item.get("mrid"),
+            "name": item.get("name"),
+            "asset_kind": item.get("asset_kind"),
+            "boundary_feeder_id": item.get("boundary_feeder_id"),
+        }
+        if item.get("rated_power_kva") is not None:
+            props["rated_power_kva"] = item["rated_power_kva"]
+        if item.get("transformer_kind"):
+            props["transformer_kind"] = item["transformer_kind"]
+        features.append(
+            {
+                "type": "Feature",
+                "properties": props,
+                "geometry": {"type": "Point", "coordinates": [lon_f, lat_f]},
+            }
+        )
+    if not features:
+        return None
+
+    kind = (page.get("asset_kind_filter") or "asset").replace("_", " ")
+    total = int(page.get("total") or len(features))
+    title = label or f"{total:,} {kind}s"
+    pad = 0.002
+    bbox = {
+        "west": min(lons) - pad,
+        "south": min(lats) - pad,
+        "east": max(lons) + pad,
+        "north": max(lats) + pad,
+    }
+    return {
+        "type": "highlight_feeder",
+        "tab": tab,
+        "feeder_id": f"list:{kind}:{len(features)}",
+        "label": title,
+        "bbox": bbox,
+        "geojson": {
+            "nodes": {"type": "FeatureCollection", "features": features},
+            "edges": {"type": "FeatureCollection", "features": []},
+        },
     }
 
 
@@ -817,11 +1068,18 @@ def format_list_assets_text(
     for item in assets:
         name = (item.get("name") or "").strip() or item.get("mrid") or "Unnamed asset"
         kind = (item.get("asset_kind") or "asset").replace("_", " ")
+        bits: list[str] = [kind]
+        xfmr_kind = item.get("transformer_kind")
+        if xfmr_kind and xfmr_kind not in kind:
+            bits.append(str(xfmr_kind))
+        if item.get("rated_power_kva") is not None:
+            bits.append(f"{float(item['rated_power_kva']):g} kVA")
+        if item.get("vector_group"):
+            bits.append(str(item["vector_group"]))
         feeder = item.get("boundary_feeder_id")
         if feeder:
-            lines_out.append(f"• {name} ({kind}, feeder {feeder})")
-        else:
-            lines_out.append(f"• {name} ({kind})")
+            bits.append(f"feeder {feeder}")
+        lines_out.append(f"• {name} ({', '.join(bits)})")
     if page.get("has_more"):
         remaining = max(0, total - len(assets))
         lines_out.append("")

@@ -136,15 +136,19 @@ These were tried to make tiles lighter; they were removed or narrowed because th
 
 ### Phase A — Map serving (P0, current sprint)
 
-- [ ] Node min-zoom / filtered pole view
-- [ ] Reference map-config Redis cache
-- [ ] `mapReady` on `load` not `idle`
-- [ ] Martin simplify on overview + detail tables
-- [ ] Postgres `shm_size` + post-promote `ANALYZE` in runbook
+- [x] Node min-zoom / filtered pole view (`DETAIL_NODE_MIN_ZOOM=13.5`)
+- [x] Reference map-config Redis cache
+- [x] `mapReady` on `load` not `idle`
+- [x] Defer GIS overview; default camera z11
+- [x] Map tile materialized views + promote refresh (`00100_map_tile_mvs.sql`)
+- [x] Martin in-process tile cache + larger pool (`config/martin.yaml`)
+- [x] Age-aware `refresh_map_tile_layers` (`00106_map_tile_refresh_perf.sql`)
+- [x] Optional nginx tile cache (`scripts/ensure_martin_cache.sh`, `:3002`)
+- [ ] Postgres `shm_size` + runbook discipline for large promotes
 
 ### Phase B — Pre-aggregation expansion (P1)
 
-- [ ] National low-zoom backbone materialized table (simplified MV lines, z6–10 only)
+- [ ] National low-zoom backbone simplified table (z6–10 only)
 - [ ] DQ summary rollups by region/district (refresh on promote)
 - [ ] H3 coverage stats served from rollup table, not ad-hoc scan
 

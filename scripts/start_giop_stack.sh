@@ -546,6 +546,10 @@ main() {
   else
     ensure_docker_container giop-martin "$MARTIN_PORT" || true
   fi
+  # Optional nginx tile cache on :3002 (zoom settings unchanged). Skip with GIOP_MARTIN_CACHE=0.
+  if [[ "${GIOP_MARTIN_CACHE:-1}" != "0" && -x "$ROOT/scripts/ensure_martin_cache.sh" ]]; then
+    "$ROOT/scripts/ensure_martin_cache.sh" >>"$LOG_DIR/martin-cache.log" 2>&1 || true
+  fi
   ensure_docker_container giop-timescale "$TIMESCALE_PORT" || true
   if [[ -x "$ROOT/scripts/ensure_redis.sh" ]]; then
     "$ROOT/scripts/ensure_redis.sh" >>"$LOG_DIR/redis.log" 2>&1 || ensure_docker_container giop-redis "${REDIS_PORT:-6379}" || true

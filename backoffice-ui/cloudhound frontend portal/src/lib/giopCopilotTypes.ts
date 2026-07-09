@@ -93,7 +93,9 @@ export function describeCopilotUiAction(action: GiopCopilotUiAction): string {
     case 'highlight_territory':
       return `Highlighted ${action.label ?? action.district ?? action.region ?? 'the territory'} on the map`;
     case 'highlight_feeder':
-      return `Highlighted feeder ${action.label ?? action.feeder_id} on the map`;
+      return action.feeder_id?.startsWith('list:')
+        ? `Highlighted ${action.label ?? 'listed assets'} on the map`
+        : `Highlighted feeder ${action.label ?? action.feeder_id} on the map`;
     case 'highlight_node':
       return action.tentative
         ? `Highlighted ${action.label ?? 'a node'} on the map for confirmation`

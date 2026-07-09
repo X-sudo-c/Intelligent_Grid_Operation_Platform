@@ -62,13 +62,16 @@ export function layerIdsForBoundaryProduct(
   detailSlug: string,
   configs: GiopReferenceMapLayerConfig[],
 ): string[] {
+  // Built-in ECG admin layers live in the base map style (regions + districts).
+  // Always target those ids — never ref-* placeholders that were never added.
+  const builtin = BUILTIN_BOUNDARY_LAYERS[detailSlug];
+  if (builtin) return [...builtin];
+
   const detail = configs.find((c) => c.slug === detailSlug);
-  if (!detail) {
-    return [...(BUILTIN_BOUNDARY_LAYERS[detailSlug] ?? [])];
-  }
+  if (!detail) return [];
 
   if (detail.built_in_map_style && detail.render_mode === 'martin') {
-    return [...(BUILTIN_BOUNDARY_LAYERS[detailSlug] ?? [])];
+    return [];
   }
 
   return relatedBoundarySlugs(detailSlug, configs).flatMap((slug) => catalogLayerIdsForSlug(slug));
@@ -79,15 +82,23 @@ export function boundaryHitLayerIds(
   configs: GiopReferenceMapLayerConfig[],
 ): string[] {
   const hit: string[] = [];
-  for (const product of listBoundaryOverlayProducts(configs)) {
-    if (!visibility[product.slug]) continue;
-    const detail = configs.find((c) => c.slug === product.slug);
-    if (detail?.built_in_map_style && detail.render_mode === 'martin') {
-      hit.push('ecg-regions-fill', 'ecg-regions-outline', 'ecg-boundaries-fill', 'ecg-boundaries-outline');
+  const products = listBoundaryOverlayProducts(configs);
+  const slugs = new Set(products.map((p) => p.slug));
+  for (const slug of Object.keys(BUILTIN_BOUNDARY_LAYERS)) slugs.add(slug);
+
+  for (const slug of slugs) {
+    if (!visibility[slug]) continue;
+    if (BUILTIN_BOUNDARY_LAYERS[slug]) {
+      hit.push(
+        'ecg-regions-fill',
+        'ecg-regions-outline',
+        'ecg-boundaries-fill',
+        'ecg-boundaries-outline',
+      );
       continue;
     }
-    for (const slug of relatedBoundarySlugs(product.slug, configs)) {
-      hit.push(`ref-${slug}-fill`, `ref-${slug}-line`);
+    for (const related of relatedBoundarySlugs(slug, configs)) {
+      hit.push(`ref-${related}-fill`, `ref-${related}-line`);
     }
   }
   return [...new Set(hit)];
@@ -100,8 +111,18 @@ export function setBoundaryProductVisibility(
   configs: GiopReferenceMapLayerConfig[],
 ): void {
   const value = visible ? 'visible' : 'none';
+  let touched = 0;
   for (const layerId of layerIdsForBoundaryProduct(detailSlug, configs)) {
-    if (map.getLayer(layerId)) {
+    if (!map.getLayer(layerId)) continue;
+    map.setLayoutProperty(layerId, 'visibility', value);
+    touched += 1;
+  }
+  // Stale catalog metadata can point at missing ref-* layers — fall back to built-ins.
+  if (touched === 0) {
+    const builtin = BUILTIN_BOUNDARY_LAYERS[detailSlug];
+    if (!builtin) return;
+    for (const layerId of builtin) {
+      if (!map.getLayer(layerId)) continue;
       map.setLayoutProperty(layerId, 'visibility', value);
     }
   }
@@ -112,7 +133,13 @@ export function applyAllBoundaryVisibility(
   visibility: Record<string, boolean>,
   configs: GiopReferenceMapLayerConfig[],
 ): void {
-  for (const product of listBoundaryOverlayProducts(configs)) {
-    setBoundaryProductVisibility(map, product.slug, Boolean(visibility[product.slug]), configs);
+  const products = listBoundaryOverlayProducts(configs);
+  const slugs = new Set(products.map((p) => p.slug));
+  // Keep built-in ECG toggle working even before map-config finishes loading.
+  for (const slug of Object.keys(BUILTIN_BOUNDARY_LAYERS)) {
+    slugs.add(slug);
+  }
+  for (const slug of slugs) {
+    setBoundaryProductVisibility(map, slug, Boolean(visibility[slug]), configs);
   }
 }

@@ -11,8 +11,9 @@ import { Box, Search, UserRound, Wrench } from 'lucide-react';
 import { useGiopVoiceMode } from '../context/GiopVoiceModeContext';
 import { useGiopMapOverlay } from '../context/GiopMapOverlayContext';
 import { GiopTwistWaveCanvas } from './GiopTwistWaveCanvas';
+import { GiopMapToolsMenu } from './GiopMapToolsMenu';
 import { GiopNetworkGeometryToggle } from './GiopNetworkGeometryToggle';
-import { getMapGeocode, searchMap, type GiopMapSearchKind, type GiopMapSearchResult } from '../api/giop-api';
+import { getMapAutocomplete, searchMap, type GiopMapSearchKind, type GiopMapSearchResult } from '../api/giop-api';
 import {
   mergeGeocodePlaces,
   searchMapCatalog,
@@ -78,8 +79,8 @@ function resultKey(result: GiopMapSearchResult): string {
 
 export function GiopMapSearchBar({
   isLightMode,
-  placeCatalog,
-  opsCatalog,
+  placeCatalog = [],
+  opsCatalog = [],
   placesReady = true,
   onSelect,
   onPreview,
@@ -108,6 +109,7 @@ export function GiopMapSearchBar({
   const [remoteHits, setRemoteHits] = useState<GiopMapSearchResult[]>([]);
   const [geocoding, setGeocoding] = useState(false);
   const [remoteLoading, setRemoteLoading] = useState(false);
+  const { networkGeometryMode, setNetworkGeometryMode, getLiveMapViewport } = useGiopMapOverlay();
 
   const wantsGeocode = filter === 'all';
 
@@ -123,7 +125,12 @@ export function GiopMapSearchBar({
     setGeocoding(true);
     const seq = ++geocodeSeqRef.current;
     const timer = window.setTimeout(() => {
-      void getMapGeocode({ q, limit: 8 })
+      const viewport = getLiveMapViewport();
+      void getMapAutocomplete({
+        q,
+        limit: 8,
+        bbox: viewport?.bbox ?? null,
+      })
         .then((hits) => {
           if (seq !== geocodeSeqRef.current) return;
           setGeocodeHits(hits);
@@ -135,10 +142,10 @@ export function GiopMapSearchBar({
         .finally(() => {
           if (seq === geocodeSeqRef.current) setGeocoding(false);
         });
-    }, 320);
+    }, 220);
 
     return () => window.clearTimeout(timer);
-  }, [query, wantsGeocode]);
+  }, [query, wantsGeocode, getLiveMapViewport]);
 
   useEffect(() => {
     const q = query.trim();
@@ -322,7 +329,6 @@ export function GiopMapSearchBar({
   const busy = indexing || geocoding || remoteLoading;
   const voice = useGiopVoiceMode();
   const voiceActive = voice.mapVoiceActive || voice.recording;
-  const { networkGeometryMode, setNetworkGeometryMode } = useGiopMapOverlay();
 
   return (
     <div
@@ -424,7 +430,10 @@ export function GiopMapSearchBar({
             onModeChange={setNetworkGeometryMode}
           />
         )}
-        {toolbarFilterOptions.slice(1).map(({ id, title, icon: Icon }) => {
+        {toolbarFilterOptions
+          .slice(1)
+          .filter((opt) => opt.id !== 'work_order')
+          .map(({ id, title, icon: Icon }) => {
           const active = filter === id;
           return (
             <button
@@ -440,6 +449,7 @@ export function GiopMapSearchBar({
             </button>
           );
         })}
+        <GiopMapToolsMenu isLightMode={isLightMode} />
       </div>
 
       {showPanel && (

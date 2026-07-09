@@ -93,6 +93,8 @@ export function setEcgBoundaryVisibility(map: MaplibreMap, visible: boolean): vo
 export function applyEcgBoundaryTheme(map: MaplibreMap, light: boolean): void {
   const textColor = light ? '#0c4a6e' : '#e0f2fe';
   const haloColor = light ? '#ffffff' : '#0f172a';
+  const fillColor = light ? '#0284c7' : '#38bdf8';
+  const lineColor = light ? '#0369a1' : '#7dd3fc';
   for (const id of [ECG_REGION_LABEL, ECG_BOUNDARY_LABEL_DISTRICT]) {
     if (!map.getLayer(id)) continue;
     map.setPaintProperty(id, 'text-color', textColor);
@@ -100,11 +102,12 @@ export function applyEcgBoundaryTheme(map: MaplibreMap, light: boolean): void {
   }
   for (const id of [ECG_REGION_FILL, ECG_BOUNDARY_FILL]) {
     if (!map.getLayer(id)) continue;
-    map.setPaintProperty(id, 'fill-color', light ? '#0ea5e9' : '#38bdf8');
+    map.setPaintProperty(id, 'fill-color', fillColor);
   }
   for (const id of [ECG_REGION_OUTLINE, ECG_BOUNDARY_OUTLINE]) {
     if (!map.getLayer(id)) continue;
-    map.setPaintProperty(id, 'line-color', light ? '#0369a1' : '#7dd3fc');
+    map.setPaintProperty(id, 'line-color', lineColor);
+    map.setPaintProperty(id, 'line-opacity', 0.95);
   }
 }
 

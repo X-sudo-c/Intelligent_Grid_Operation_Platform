@@ -68,13 +68,15 @@ The `/api/observability` payload includes:
 - **redis** — `giop-redis` reachability for sync-service cache (optional; gateway falls back without it)
 - **voice_tts** — Supertonic on :7788 for GIOP copilot spoken replies; sync-service `GET /api/v1/portal/ai/voice/status`
 - **data_plane** — staging asset count, open conflicts, Timescale `meter_readings` check
-- **map_tiles** — `map_connectivity_nodes` / `map_ac_line_segments` row counts, voltage mix, Martin `map_*` layer catalog
+- **map_tiles** — `map_connectivity_nodes` / `map_ac_line_segments` row counts, voltage mix, Martin `map_*` layer catalog, optional nginx cache on `:3002`
 - **trial** — master/staging counts, latest pg_dump backup, trial job running state
 - **logs** — metadata for all files in `.giop/logs/`
 
 ### Service IDs
 
-`supabase`, `memgraph`, `martin`, `timescale`, `redis`, `sync-service`, `supertonic`, `ocr-service`, `giop-portal`, `backoffice-ui`, `overseeyer-api`, `overseeyer-web`
+`supabase`, `memgraph`, `martin`, `martin-cache`, `timescale`, `redis`, `sync-service`, `supertonic`, `ocr-service`, `giop-portal`, `backoffice-ui`, `overseeyer-api`, `overseeyer-web`
+
+`martin-cache` is the optional nginx HTTP tile cache on `:3002` (`scripts/ensure_martin_cache.sh`). Start/restart recreates the container when `config/nginx-martin-cache.conf` changes. Point the portal at it with `VITE_MARTIN_URL=http://127.0.0.1:3002`.
 
 OVERSEEYER API and UI can be **Stop / Restart** from the Services panel (`service_ctl.sh`). Restart reconnects the UI in ~5s.
 

@@ -87,6 +87,15 @@ SERVICES: list[ServiceDef] = [
     ServiceDef("supabase", "Supabase", "supabase", 54321, "http://127.0.0.1:54321/rest/v1/"),
     ServiceDef("memgraph", "Memgraph", "docker", 7687, container="my-memgraph"),
     ServiceDef("martin", "Martin tiles", "docker", 3001, container="giop-martin"),
+    ServiceDef(
+        "martin-cache",
+        "Martin nginx cache",
+        "docker",
+        3002,
+        "http://127.0.0.1:3002/catalog",
+        container="giop-martin-cache",
+        log_name="martin-cache",
+    ),
     ServiceDef("timescale", "TimescaleDB", "docker", 5433, container="giop-timescale"),
     ServiceDef("redis", "Redis cache", "docker", 6379, container="giop-redis", log_name="redis"),
     ServiceDef(
@@ -513,6 +522,18 @@ def start_service(service_id: str) -> dict[str, Any]:
                 "stderr": proc.stderr[-1000:] if proc.stderr else "",
                 "result": _probe_service(defn),
             }
+        if service_id == "martin-cache":
+            # Recreate when nginx conf hash changes; requires Martin on :3001.
+            proc = _run_ensure_script("ensure_martin_cache.sh", log_name="martin-cache")
+            time.sleep(1)
+            return {
+                "service_id": service_id,
+                "action": "start",
+                "exit_code": proc.returncode,
+                "stdout": proc.stdout[-2000:] if proc.stdout else "",
+                "stderr": proc.stderr[-1000:] if proc.stderr else "",
+                "result": _probe_service(defn),
+            }
         subprocess.run(["docker", "start", defn.container], check=True, timeout=30)
         time.sleep(2)
         return {"service_id": service_id, "action": "start", "result": _probe_service(defn)}
@@ -636,6 +657,16 @@ def restart_service(service_id: str) -> dict[str, Any]:
                 "stderr": proc.stderr[-1000:] if proc.stderr else "",
                 "result": _probe_service(next(s for s in SERVICES if s.id == "martin")),
             }
+    if service_id == "martin-cache":
+        proc = _run_ensure_script("ensure_martin_cache.sh", log_name="martin-cache")
+        return {
+            "service_id": service_id,
+            "action": "restart",
+            "exit_code": proc.returncode,
+            "stdout": proc.stdout[-2000:] if proc.stdout else "",
+            "stderr": proc.stderr[-1000:] if proc.stderr else "",
+            "result": _probe_service(next(s for s in SERVICES if s.id == "martin-cache")),
+        }
     if service_id == "redis":
         proc = _run_ensure_script("ensure_redis.sh", log_name="redis")
         return {

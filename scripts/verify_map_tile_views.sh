@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke-test map tile views (migration 00017) and Martin layer catalog.
+# Smoke-test map tile materialized views (00100) and Martin layer catalog.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,11 +15,28 @@ psql_cmd() {
   psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -v ON_ERROR_STOP=1 "$@"
 }
 
-echo "== map tile views =="
+echo "== map tile layers (materialized) =="
 psql_cmd -c "
-SELECT 'map_connectivity_nodes' AS view, COUNT(*) AS rows FROM public.map_connectivity_nodes
+SELECT c.relname AS layer,
+       c.relkind,
+       pg_size_pretty(pg_total_relation_size(c.oid)) AS size
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relname IN (
+    'map_connectivity_nodes',
+    'map_ac_line_segments',
+    'map_power_transformers'
+  )
+ORDER BY 1;
+"
+
+psql_cmd -c "
+SELECT 'map_connectivity_nodes' AS layer, COUNT(*) AS rows FROM public.map_connectivity_nodes
 UNION ALL
-SELECT 'map_ac_line_segments', COUNT(*) FROM public.map_ac_line_segments;
+SELECT 'map_ac_line_segments', COUNT(*) FROM public.map_ac_line_segments
+UNION ALL
+SELECT 'map_power_transformers', COUNT(*) FROM public.map_power_transformers;
 "
 
 psql_cmd -c "
@@ -30,22 +47,15 @@ ORDER BY 2 DESC
 LIMIT 6;
 "
 
+echo "== map tile refresh age-aware (00106) =="
 psql_cmd -c "
-SELECT source_layer, COUNT(*) AS nodes
-FROM gis.asset_id_map
-WHERE source_layer IN (
-  'distribution_transformer',
-  'power_transformer',
-  'oh_support_structure_11kv',
-  'oh_support_structure_33kv',
-  'oh_support_structure_lvle'
-)
-GROUP BY 1
-ORDER BY 2 DESC;
-" 2>/dev/null || psql_cmd -c "
-SELECT column_name
-FROM information_schema.columns
-WHERE table_schema = 'public' AND table_name = 'map_connectivity_nodes' AND column_name = 'asset_kind';
+SELECT pg_get_function_identity_arguments(oid) AS args
+FROM pg_proc
+WHERE proname = 'refresh_map_tile_layers'
+ORDER BY 1;
+SELECT key, refreshed_at, details
+FROM public.topology_scan_cache_meta
+WHERE key = 'map_tile_layers';
 "
 
 echo "== Martin catalog (optional) =="
@@ -72,7 +82,7 @@ def catalog_ids(data):
 with open(catalog_path) as f:
     names = catalog_ids(json.load(f))
 missing = []
-for want in ("map_connectivity_nodes", "map_ac_line_segments"):
+for want in ("map_connectivity_nodes", "map_ac_line_segments", "map_power_transformers"):
     ok = want in names
     print(f"  {want}: {'present' if ok else 'MISSING'}")
     if not ok:
@@ -85,4 +95,4 @@ else
   exit 1
 fi
 
-echo "OK: map tile views verified"
+echo "OK: map tile layers verified"

@@ -183,6 +183,8 @@ interface DqTierMetricsPanelProps {
   scanStartedMs?: number;
   onRefreshLive: () => void;
   onRunTopologyScan: () => void;
+  onCancelTopologyScan?: () => void;
+  cancelScanBusy?: boolean;
 }
 
 export function DqTierMetricsPanel({
@@ -200,6 +202,8 @@ export function DqTierMetricsPanel({
   scanStartedMs = 0,
   onRefreshLive,
   onRunTopologyScan,
+  onCancelTopologyScan,
+  cancelScanBusy = false,
 }: DqTierMetricsPanelProps) {
   const [metricsExpanded, setMetricsExpanded] = useState(false);
   const meta = TIER_META[tier];
@@ -258,42 +262,31 @@ export function DqTierMetricsPanel({
             </button>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
-            <button
-              type="button"
-              disabled={(topoLiveBusy && tier !== 'master') || scanBusy}
-              onClick={onRefreshLive}
-              className={`rounded-lg border text-xs py-1 px-2 disabled:opacity-50 transition-colors ${
-                isLightMode
-                  ? 'border-slate-300 text-slate-700 hover:bg-slate-100'
-                  : 'border-premium-border/50 text-premium-text-secondary hover:bg-premium-hover'
-              }`}
-            >
-              {scanBusy && tier === 'master'
-                ? 'Scanning…'
-                : topoLiveBusy
-                  ? '…'
-                  : tier === 'master'
-                    ? 'Run scan'
-                    : 'Refresh live'}
-            </button>
-            <AnimatePresence mode="wait">
-              {tier === 'master' && (
-                <motion.button
-                  key="scan"
-                  type="button"
-                  disabled={scanBusy}
-                  onClick={onRunTopologyScan}
-                  initial={{ opacity: 0, scale: 0.96 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  exit={{ opacity: 0, scale: 0.96 }}
-                  className={`rounded-lg text-xs py-1 px-2 disabled:opacity-50 giop-btn-primary ${
-                    isLightMode ? 'giop-btn-primary--light' : 'giop-btn-primary--dark'
-                  }`}
-                >
-                  {scanBusy ? 'Scanning…' : 'Scan → queue'}
-                </motion.button>
-              )}
-            </AnimatePresence>
+            {tier === 'master' ? (
+              <button
+                type="button"
+                disabled={scanBusy}
+                onClick={onRunTopologyScan}
+                className={`rounded-lg text-xs py-1 px-2 disabled:opacity-50 giop-btn-primary ${
+                  isLightMode ? 'giop-btn-primary--light' : 'giop-btn-primary--dark'
+                }`}
+              >
+                {scanBusy ? 'Scanning…' : 'Scan → queue'}
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={topoLiveBusy}
+                onClick={onRefreshLive}
+                className={`rounded-lg border text-xs py-1 px-2 disabled:opacity-50 transition-colors ${
+                  isLightMode
+                    ? 'border-slate-300 text-slate-700 hover:bg-slate-100'
+                    : 'border-premium-border/50 text-premium-text-secondary hover:bg-premium-hover'
+                }`}
+              >
+                {topoLiveBusy ? '…' : 'Refresh live'}
+              </button>
+            )}
           </div>
         </div>
 
@@ -305,6 +298,8 @@ export function DqTierMetricsPanel({
             isLightMode={isLightMode}
             localStartedMs={scanStartedMs}
             compact
+            onCancel={onCancelTopologyScan}
+            cancelBusy={cancelScanBusy}
           />
         )}
 

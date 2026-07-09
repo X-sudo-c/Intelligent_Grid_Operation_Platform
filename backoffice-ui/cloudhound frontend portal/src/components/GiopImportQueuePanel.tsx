@@ -62,6 +62,7 @@ export function GiopImportQueuePanel({
   const [reasonFilter, setReasonFilter] = useState<GiopUnpromotedSegmentReason | ''>('');
   const [pageOffset, setPageOffset] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
   const [snapBusy, setSnapBusy] = useState(false);
   const [status, setStatus] = useState('');
   const [mapBusyId, setMapBusyId] = useState<number | null>(null);
@@ -82,21 +83,35 @@ export function GiopImportQueuePanel({
   const muted = isLightMode ? 'text-slate-500' : 'text-premium-muted';
   const shell = isLightMode ? 'bg-slate-50 border-slate-200' : 'bg-premium-surface/40 border-premium-border/50';
 
-  const load = useCallback(async () => {
+  const loadDiagnostics = useCallback(async () => {
+    if (!enabled || !expanded || !showImportQueue) return;
+    setDiagnosticsLoading(true);
+    try {
+      const diagnostics = await getGisEndpointDiagnostics();
+      setEndpointDiagnostics(diagnostics);
+    } catch {
+      // Keep last snapshot; diagnostics are supplemental to the steward queue.
+    } finally {
+      setDiagnosticsLoading(false);
+    }
+  }, [enabled, expanded, showImportQueue]);
+
+  const load = useCallback(async (opts?: { refreshDiagnostics?: boolean }) => {
     if (!enabled || !expanded || !showImportQueue) return;
     setLoading(true);
+    if (opts?.refreshDiagnostics) {
+      void loadDiagnostics();
+    }
     try {
-      const [sum, page, diagnostics] = await Promise.all([
+      const [sum, page] = await Promise.all([
         getGisUnpromotedSummary(),
         listGisUnpromotedSegments({
           reason: reasonFilter || undefined,
           limit: PAGE_SIZE,
           offset: pageOffset,
         }),
-        getGisEndpointDiagnostics(),
       ]);
       setSummary(sum);
-      setEndpointDiagnostics(diagnostics);
       setSegments(page.segments);
       setTotal(page.total);
       setStatus('');
@@ -107,7 +122,7 @@ export function GiopImportQueuePanel({
     } finally {
       setLoading(false);
     }
-  }, [enabled, expanded, reasonFilter, pageOffset, showImportQueue]);
+  }, [enabled, expanded, reasonFilter, pageOffset, showImportQueue, loadDiagnostics]);
 
   useEffect(() => {
     setPageOffset(0);
@@ -116,6 +131,12 @@ export function GiopImportQueuePanel({
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Diagnostics are heavy — load once when the panel opens (not on every page/filter change).
+  useEffect(() => {
+    if (!enabled || !expanded || !showImportQueue) return;
+    void loadDiagnostics();
+  }, [enabled, expanded, showImportQueue, loadDiagnostics]);
 
   const handleSnap = async () => {
     const before = summary?.total_unpromoted ?? null;
@@ -137,7 +158,7 @@ export function GiopImportQueuePanel({
       setLastSnapResult(result);
 
       setSnapPhase('reload');
-      const refreshed = await load();
+      const refreshed = await load({ refreshDiagnostics: true });
       setUnpromotedAfterSnap(refreshed?.total_unpromoted ?? result.import_status?.total_unpromoted ?? null);
 
       setStatus(
@@ -264,7 +285,7 @@ export function GiopImportQueuePanel({
 
           <GisImportEndpointDiagnostics
             diagnostics={endpointDiagnostics}
-            loading={loading}
+            loading={diagnosticsLoading}
             isLightMode={isLightMode}
           />
 
@@ -350,7 +371,7 @@ export function GiopImportQueuePanel({
             <button
               type="button"
               disabled={loading || snapBusy}
-              onClick={() => void load()}
+              onClick={() => void load({ refreshDiagnostics: true })}
               className={`rounded border text-xs py-1 px-2 disabled:opacity-50 ${
                 isLightMode
                   ? 'border-slate-300 text-slate-700 hover:bg-slate-100'

@@ -35,9 +35,9 @@ export function GiopCopilotPanel({
       id: 'welcome',
       role: 'assistant',
       content:
-        'I can count poles and assets by district or map view, review staging captures, ' +
-        'highlight territories on the map, and answer by voice. Tap the mic, speak your question, ' +
-        'tap again to send (local Whisper — no Google). Example: "How many poles in Accra?"',
+        'Hi — I am ready to help with the map, transformers, feeders, and counts. ' +
+        'Ask for inventory by district or map view, review staging, or highlight assets on the map. ' +
+        'If I am unsure what you mean, I will ask.',
     },
   ]);
   const scrollRef = useRef<HTMLDivElement | null>(null);

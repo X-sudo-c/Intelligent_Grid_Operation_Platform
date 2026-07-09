@@ -132,17 +132,22 @@ function peerDiagnosticSnapshot(peerConnection: RTCPeerConnection): Record<strin
 }
 
 const AGENT_INSTRUCTIONS = `
-You are the GIOP grid copilot for Ghana ECG, speaking with a GIS data steward.
+You are the GIOP grid copilot for Ghana ECG, speaking with field engineers and GIS stewards.
 Keep replies short and conversational — this is a live voice call.
 
+When the session starts (or you are first activated), greet the user: say "Hi"
+and that you are ready to help with the map, transformers, feeders, and counts.
+Do not wait for them to speak first.
+
 You control a map and grid database ONLY through the run_giop_command tool.
-Whenever the user asks to see, zoom, pan, highlight, or count anything on the
-map or in the data (districts, regions, towns, poles, transformers, staging
-captures, feeders, work orders in view), call run_giop_command immediately with
-their request phrased plainly — do not ask clarifying questions first for obvious
-map commands,
-e.g. "zoom into Dome", "highlight Accra", "how many poles in Kumasi",
-"what work orders are in view".
+For clear map/data requests (zoom into Dome, how many poles in Kumasi, work orders
+in view), call run_giop_command with their request phrased plainly.
+If the request is ambiguous, incomplete, or you are not sure what they mean —
+always ask a short clarifying question before calling the tool. Never guess a
+district, asset type, or map action when unsure.
+When listing transformers or assets, the backend may ask whether to highlight
+them on the map — if the user says yes, call run_giop_command with
+"highlight them on the map" (or "yes, highlight them").
 For relative zoom on the current map view (not a named place), pass the command
 verbatim: "zoom in", "zoom out", "zoom in a bit", "zoom out more" — do not add
 place names or rephrase as "zoom to …". Relative zoom is applied instantly on the
@@ -156,7 +161,6 @@ The tool moves the map and returns the factual answer — read that answer back
 naturally. Never invent counts, place names, or map actions; always rely on the
 tool result. For general questions you can answer directly.
 `.trim();
-
 function historyTextSummary(items: RealtimeItem[], limit = 8): string {
   const lines: string[] = [];
   for (const item of items.slice(-limit)) {
@@ -285,6 +289,8 @@ export function useGiopRealtimeSession({
   const lastReconnectReasonRef = useRef<string | null>(null);
   const lastSessionErrorRef = useRef<{ key: string; at: number } | null>(null);
   const lastInstantZoomKeyRef = useRef<string | null>(null);
+  /** Speak a short "Hi" once when the user activates live voice (not on silent reconnect). */
+  const greetOnConnectRef = useRef(false);
   const openSessionRef = useRef<() => Promise<void>>(async () => undefined);
   const scheduleRecoveryRef = useRef<(reason?: string) => void>(() => undefined);
   const performReconnectRef = useRef<(reason?: string) => void>(() => undefined);
@@ -672,6 +678,24 @@ export function useGiopRealtimeSession({
       });
     }
 
+    if (greetOnConnectRef.current) {
+      greetOnConnectRef.current = false;
+      try {
+        session.transport.requestResponse?.({
+          instructions:
+            'Greet the user now in one short sentence: say "Hi" and that you are ready ' +
+            'to help with the map, transformers, feeders, and counts. Do not call tools.',
+        });
+        pushDebugEvent('info', 'session_greeting_requested');
+      } catch (err) {
+        pushDebugEvent(
+          'warn',
+          'session_greeting_failed',
+          err instanceof Error ? err.message : String(err),
+        );
+      }
+    }
+
     setStatus('live');
   }, [buildAgent, clearTimers, pushDebugEvent, snapshotHistory]);
   openSessionRef.current = openSession;
@@ -806,11 +830,13 @@ export function useGiopRealtimeSession({
     pushDebugEvent('info', 'manual_connect');
     intentLiveRef.current = true;
     attemptsRef.current = 0;
+    greetOnConnectRef.current = true;
     setError(null);
     setStatus('connecting');
     try {
       await openSessionRef.current();
     } catch (err) {
+      greetOnConnectRef.current = false;
       intentLiveRef.current = false;
       intentionalCloseRef.current = true;
       closeSession();

@@ -19,6 +19,8 @@ import type { GiopRepairPreviewLayers } from '../lib/giopRepairPreviewGeojson';
 import type { DuplicateClusterOverlay } from '../lib/giopDuplicateFan';
 import type { FeederHighlightState } from '../lib/giopFeederHighlight';
 import type { ImportSegmentHighlightState } from '../lib/giopImportSegmentHighlight';
+import { polylineLengthMeters } from '../lib/giopMapMeasure';
+import { DEFAULT_CLEARANCE_RADIUS_M } from '../lib/giopMapClearance';
 import { useGiopSelection } from './GiopSelectionContext';
 
 export type { TerritoryHighlightState };
@@ -48,6 +50,9 @@ export interface MapViewportCommand {
   zoom?: number;
   max_zoom?: number;
   duration?: number;
+  padding?: number;
+  /** Minimum bbox span in degrees (~0.0005 ≈ 55 m at Ghana latitudes). */
+  min_span?: number;
 }
 
 interface GiopMapOverlayContextValue {
@@ -106,6 +111,25 @@ interface GiopMapOverlayContextValue {
   /** Map instances register a synchronous bounds reader for hands-free voice. */
   registerMapViewportReader: (reader: () => MapViewportContext | null) => () => void;
   getLiveMapViewport: () => MapViewportContext | null;
+  /** Tap-to-measure polyline on the map. */
+  mapMeasureActive: boolean;
+  setMapMeasureActive: (active: boolean) => void;
+  measurePoints: [number, number][];
+  addMeasurePoint: (lon: number, lat: number) => void;
+  updateMeasurePoint: (index: number, lon: number, lat: number) => void;
+  removeMeasurePoint: (index: number) => void;
+  clearMeasure: () => void;
+  measureTotalMeters: number;
+  /** Clearance buffer around the measure path (or a single point). */
+  mapClearanceActive: boolean;
+  setMapClearanceActive: (active: boolean) => void;
+  clearanceRadiusM: number;
+  setClearanceRadiusM: (meters: number) => void;
+  /** Click-to-trace downstream electrical impact on the map. */
+  mapTraceActive: boolean;
+  setMapTraceActive: (active: boolean) => void;
+  mapTraceStatus: string | null;
+  setMapTraceStatus: (status: string | null) => void;
 }
 
 const GiopMapOverlayContext = createContext<GiopMapOverlayContextValue | null>(null);
@@ -139,6 +163,12 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
     readNetworkGeometryMode(),
   );
   const [mapIdentifyFocusMrid, setMapIdentifyFocusMrid] = useState<string | null>(null);
+  const [mapMeasureActive, setMapMeasureActiveState] = useState(false);
+  const [measurePoints, setMeasurePoints] = useState<[number, number][]>([]);
+  const [mapClearanceActive, setMapClearanceActiveState] = useState(false);
+  const [clearanceRadiusM, setClearanceRadiusMState] = useState(DEFAULT_CLEARANCE_RADIUS_M);
+  const [mapTraceActive, setMapTraceActiveState] = useState(false);
+  const [mapTraceStatus, setMapTraceStatus] = useState<string | null>(null);
   const focusCameraRequestIdRef = useRef(0);
   const mapViewportCommandIdRef = useRef(0);
   /** Only the latest focusOnMap call may apply state after its async coordinate lookup. */
@@ -251,6 +281,73 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
   const clearMapIdentifyFocus = useCallback(() => {
     setMapIdentifyFocusMrid(null);
   }, []);
+
+  const setMapMeasureActive = useCallback((active: boolean) => {
+    setMapMeasureActiveState(active);
+    if (!active) {
+      setMeasurePoints([]);
+      setMapClearanceActiveState(false);
+    } else {
+      setMapTraceActiveState(false);
+      setMapTraceStatus(null);
+    }
+  }, []);
+
+  const setMapClearanceActive = useCallback((active: boolean) => {
+    setMapClearanceActiveState(active);
+    if (active) {
+      setMapMeasureActiveState(true);
+      setMapTraceActiveState(false);
+      setMapTraceStatus(null);
+    }
+  }, []);
+
+  const setMapTraceActive = useCallback((active: boolean) => {
+    setMapTraceActiveState(active);
+    if (active) {
+      setMapMeasureActiveState(false);
+      setMeasurePoints([]);
+      setMapClearanceActiveState(false);
+      setMapTraceStatus('Click a pole or transformer to trace downstream');
+    } else {
+      setMapTraceStatus(null);
+      setImpactOverlayState(null);
+    }
+  }, []);
+
+  const setClearanceRadiusM = useCallback((meters: number) => {
+    if (!Number.isFinite(meters) || meters <= 0) return;
+    setClearanceRadiusMState(Math.min(Math.max(meters, 1), 500));
+  }, []);
+
+  const addMeasurePoint = useCallback((lon: number, lat: number) => {
+    setMeasurePoints((prev) => [...prev, [lon, lat]]);
+  }, []);
+
+  const updateMeasurePoint = useCallback((index: number, lon: number, lat: number) => {
+    setMeasurePoints((prev) => {
+      if (index < 0 || index >= prev.length) return prev;
+      const next = [...prev];
+      next[index] = [lon, lat];
+      return next;
+    });
+  }, []);
+
+  const removeMeasurePoint = useCallback((index: number) => {
+    setMeasurePoints((prev) => {
+      if (index < 0 || index >= prev.length) return prev;
+      return prev.filter((_, i) => i !== index);
+    });
+  }, []);
+
+  const clearMeasure = useCallback(() => {
+    setMeasurePoints([]);
+  }, []);
+
+  const measureTotalMeters = useMemo(
+    () => polylineLengthMeters(measurePoints),
+    [measurePoints],
+  );
 
   const setImpactOverlay = useCallback((payload: GiopTopologyPayload | null) => {
     setImpactOverlayState(payload);
@@ -438,6 +535,22 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
       bumpSidePanelFly,
       registerMapViewportReader,
       getLiveMapViewport,
+      mapMeasureActive,
+      setMapMeasureActive,
+      measurePoints,
+      addMeasurePoint,
+      updateMeasurePoint,
+      removeMeasurePoint,
+      clearMeasure,
+      measureTotalMeters,
+      mapClearanceActive,
+      setMapClearanceActive,
+      clearanceRadiusM,
+      setClearanceRadiusM,
+      mapTraceActive,
+      setMapTraceActive,
+      mapTraceStatus,
+      setMapTraceStatus,
     }),
     [
       impactOverlay,
@@ -475,6 +588,22 @@ export function GiopMapOverlayProvider({ children }: { children: ReactNode }) {
       bumpSidePanelFly,
       registerMapViewportReader,
       getLiveMapViewport,
+      mapMeasureActive,
+      setMapMeasureActive,
+      measurePoints,
+      addMeasurePoint,
+      updateMeasurePoint,
+      removeMeasurePoint,
+      clearMeasure,
+      measureTotalMeters,
+      mapClearanceActive,
+      setMapClearanceActive,
+      clearanceRadiusM,
+      setClearanceRadiusM,
+      mapTraceActive,
+      setMapTraceActive,
+      mapTraceStatus,
+      setMapTraceStatus,
     ],
   );
 

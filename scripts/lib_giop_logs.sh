@@ -23,6 +23,7 @@ GIOP_STACK_LOG_STEMS=(
   backoffice-ui
   redis
   martin
+  martin-cache
   memgraph-bootstrap
   verify-topology
   supertonic

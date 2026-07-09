@@ -20,6 +20,7 @@ def _endpoint_side(
     lookup_ok: bool,
     nearest_id: str | None,
     dist_m: float | None,
+    asset_kind: str | None = None,
     tolerance_m: float,
     assisted_m: float,
 ) -> dict[str, Any]:
@@ -28,10 +29,13 @@ def _endpoint_side(
         return {
             "text_id": raw or None,
             "lookup_ok": True,
+            "nearest_asset_id": raw or None,
             "nearest_pole_id": raw or None,
+            "nearest_asset_kind": asset_kind,
             "distance_m": round(dist_m, 3) if dist_m is not None else 0.0,
             "tier": "resolved",
             "suggested_id": raw or None,
+            "suggested_kind": asset_kind,
         }
 
     tier = "manual"
@@ -49,10 +53,13 @@ def _endpoint_side(
     return {
         "text_id": raw or None,
         "lookup_ok": False,
+        "nearest_asset_id": nearest_id,
         "nearest_pole_id": nearest_id,
+        "nearest_asset_kind": asset_kind,
         "distance_m": round(dist_m, 3) if dist_m is not None else None,
         "tier": tier,
         "suggested_id": suggested,
+        "suggested_kind": asset_kind if suggested else None,
     }
 
 
@@ -63,7 +70,7 @@ def preview_geom_snap_candidate(
     tolerance_m: float = DEFAULT_TIER_A_M,
     assisted_m: float = DEFAULT_TIER_B_M,
 ) -> dict[str, Any]:
-    """Inspect one unpromoted segment: endpoint IDs, nearest poles, distances, tiers."""
+    """Inspect one unpromoted segment: endpoint IDs, nearest assets, distances, tiers."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -107,26 +114,18 @@ def preview_geom_snap_candidate(
         start_pt, end_pt = cur.fetchone()
         cur.execute(
             """
-            SELECT am.source_unique_id,
-                   ST_Distance(%s::geography, am.geom::geography)
-            FROM gis.asset_id_map am
-            WHERE am.source_layer LIKE 'oh_support_structure%%' AND am.geom IS NOT NULL
-            ORDER BY am.geom <-> %s::geometry
-            LIMIT 1
+            SELECT na.unique_id, na.dist_m, na.asset_kind
+            FROM gis.nearest_line_endpoint_asset(%s::geometry) na
             """,
-            (start_pt, start_pt),
+            (start_pt,),
         )
         ns = cur.fetchone()
         cur.execute(
             """
-            SELECT am.source_unique_id,
-                   ST_Distance(%s::geography, am.geom::geography)
-            FROM gis.asset_id_map am
-            WHERE am.source_layer LIKE 'oh_support_structure%%' AND am.geom IS NOT NULL
-            ORDER BY am.geom <-> %s::geometry
-            LIMIT 1
+            SELECT na.unique_id, na.dist_m, na.asset_kind
+            FROM gis.nearest_line_endpoint_asset(%s::geometry) na
             """,
-            (end_pt, end_pt),
+            (end_pt,),
         )
         ne = cur.fetchone()
 
@@ -135,6 +134,7 @@ def preview_geom_snap_candidate(
         lookup_ok=bool(row[9]),
         nearest_id=ns[0] if ns else None,
         dist_m=float(ns[1]) if ns else None,
+        asset_kind=ns[2] if ns else None,
         tolerance_m=tolerance_m,
         assisted_m=assisted_m,
     )
@@ -143,6 +143,7 @@ def preview_geom_snap_candidate(
         lookup_ok=bool(row[10]),
         nearest_id=ne[0] if ne else None,
         dist_m=float(ne[1]) if ne else None,
+        asset_kind=ne[2] if ne else None,
         tolerance_m=tolerance_m,
         assisted_m=assisted_m,
     )

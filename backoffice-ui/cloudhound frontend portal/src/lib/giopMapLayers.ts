@@ -87,9 +87,9 @@ export interface MapBoundsLike {
 export function fitMapBounds(
   map: MaplibreMap,
   bbox: MapBoundsLike,
-  opts?: { padding?: number; duration?: number; maxZoom?: number },
+  opts?: { padding?: number; duration?: number; maxZoom?: number; minSpan?: number },
 ): void {
-  const minSpan = 0.008;
+  const minSpan = opts?.minSpan ?? 0.008;
   let west = bbox.west;
   let south = bbox.south;
   let east = bbox.east;
@@ -144,6 +144,9 @@ export const DETAIL_LINE_MIN_ZOOM = 11;
 
 /** LV service drops from this zoom (MV detail from DETAIL_LINE_MIN_ZOOM). */
 export const DETAIL_LV_MIN_ZOOM = 13;
+
+/** Connectivity nodes (~924k) — poles/support from mid detail zoom. */
+export const DETAIL_NODE_MIN_ZOOM = 11.5;
 
 /** Martin H3 rebuild coverage (toggle via layout visibility). */
 export const H3_REBUILD_COVERAGE_SOURCE = 'h3_rebuild_coverage';
@@ -1028,6 +1031,20 @@ export const GIOP_BASEMAP_TILES = {
   darkLabels: ['https://basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}.png'],
 } as const;
 
+/**
+ * Native basemap detail stops here. Beyond this zoom MapLibre overzooms the last
+ * tiles so road casings scale up with the map instead of staying hairline-thin
+ * (Carto redraws streets as thin strokes at every z-level).
+ * 18 keeps overzoom mild at map max (z20) so tiles stay usable for site work.
+ */
+export const GIOP_BASEMAP_NATIVE_MAX_ZOOM = 18;
+
+/**
+ * Street/place-name raster labels hide past this zoom so names do not blow up
+ * into unreadable blobs during close-in measuring / planning.
+ */
+export const GIOP_BASEMAP_LABELS_MAX_ZOOM = 16;
+
 /** Side-map / duplicate fan asset name labels — amber ink, no halo stroke. */
 export const GIOP_MAP_FOCUS_LABEL_COLOR = '#b45309';
 
@@ -1584,12 +1601,13 @@ export function buildGiopMapStyle(
 
   return {
     version: 8,
-    glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
+    glyphs: 'https://fonts.openmaptiles.org/{fontstack}/{range}.pbf',
     sources: {
       'basemap-light': {
         type: 'raster',
         tiles: [...GIOP_BASEMAP_TILES.light],
         tileSize: 256,
+        maxzoom: GIOP_BASEMAP_NATIVE_MAX_ZOOM,
         attribution:
           '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
       },
@@ -1597,6 +1615,7 @@ export function buildGiopMapStyle(
         type: 'raster',
         tiles: [...GIOP_BASEMAP_TILES.dark],
         tileSize: 256,
+        maxzoom: GIOP_BASEMAP_NATIVE_MAX_ZOOM,
         attribution:
           '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
       },
@@ -1604,18 +1623,22 @@ export function buildGiopMapStyle(
         type: 'raster',
         tiles: [...GIOP_BASEMAP_TILES.lightLabels],
         tileSize: 256,
+        maxzoom: GIOP_BASEMAP_NATIVE_MAX_ZOOM,
       },
       'basemap-labels-dark': {
         type: 'raster',
         tiles: [...GIOP_BASEMAP_TILES.darkLabels],
         tileSize: 256,
+        maxzoom: GIOP_BASEMAP_NATIVE_MAX_ZOOM,
       },
       ...gisOverviewSources,
+      // Source min/maxzoom must stay within Martin's published range (see config/martin.yaml).
+      // Requests outside that range return plain-text 404s that MapLibre mis-parses as PBF.
       map_connectivity_nodes: {
         type: 'vector',
         tiles: [vector('map_connectivity_nodes')],
-        minzoom: 11.5,
-        maxzoom: 14,
+        minzoom: 11,
+        maxzoom: 16,
       },
       map_ac_line_segments: {
         type: 'vector',
@@ -1632,14 +1655,14 @@ export function buildGiopMapStyle(
       ecg_admin_boundaries: {
         type: 'vector',
         tiles: [vector('ecg_admin_boundaries')],
-        minzoom: 0,
-        maxzoom: 14,
+        minzoom: 6,
+        maxzoom: 16,
       },
       ecg_admin_regions: {
         type: 'vector',
         tiles: [vector('ecg_admin_regions')],
-        minzoom: 0,
-        maxzoom: 14,
+        minzoom: 6,
+        maxzoom: 16,
       },
       [H3_REBUILD_COVERAGE_SOURCE]: {
         type: 'vector',
@@ -1705,24 +1728,66 @@ export function buildGiopMapStyle(
         type: 'circle',
         source: 'map_connectivity_nodes',
         'source-layer': 'map_connectivity_nodes',
-        minzoom: 11.5,
+        minzoom: DETAIL_NODE_MIN_ZOOM,
         filter: tileNodeNonTransformerFilter(),
         paint: tileNodeCirclePaint(light),
       },
       ...gisOverviewTransformerLayers,
       ...masterTransformerLayerEntries(),
-      // ECG regions (country/regional zoom) — one outline + label per region.
+      // H3 rebuild coverage above network geometry (toggle via layout visibility).
+      ...(h3CoverageLayerEntries(light) ?? []),
+      // Place-name labels above network geometry (CARTO label-only raster).
+      // Cap zoom so street names disappear for close-in engineering work.
+      {
+        id: GIOP_BASEMAP_LABELS_LAYER_LIGHT,
+        type: 'raster',
+        source: 'basemap-labels-light',
+        maxzoom: GIOP_BASEMAP_LABELS_MAX_ZOOM,
+        layout: { visibility: light ? 'visible' : 'none' },
+        paint: {
+          'raster-opacity': [
+            'interpolate',
+            ['linear'],
+            ['zoom'],
+            GIOP_BASEMAP_LABELS_MAX_ZOOM - 1,
+            1,
+            GIOP_BASEMAP_LABELS_MAX_ZOOM,
+            0,
+          ],
+        },
+      },
+      {
+        id: GIOP_BASEMAP_LABELS_LAYER_DARK,
+        type: 'raster',
+        source: 'basemap-labels-dark',
+        maxzoom: GIOP_BASEMAP_LABELS_MAX_ZOOM,
+        layout: { visibility: light ? 'none' : 'visible' },
+        paint: {
+          'raster-opacity': [
+            'interpolate',
+            ['linear'],
+            ['zoom'],
+            GIOP_BASEMAP_LABELS_MAX_ZOOM - 1,
+            1,
+            GIOP_BASEMAP_LABELS_MAX_ZOOM,
+            0,
+          ],
+        },
+      },
+      // ECG admin boundaries above basemap labels so the overlay toggle is always visible.
+      // Regions below zoom 10; districts at/above zoom 10.
       {
         id: 'ecg-regions-fill',
         type: 'fill',
         source: 'ecg_admin_regions',
         'source-layer': 'ecg_admin_regions',
+        minzoom: 6,
         maxzoom: 10,
         layout: { visibility: 'none' },
         paint: {
-          'fill-color': light ? '#0ea5e9' : '#38bdf8',
-          'fill-opacity': ['interpolate', ['linear'], ['zoom'], 5, 0.04, 7, 0.08, 9, 0.12],
-          'fill-antialias': false,
+          'fill-color': light ? '#0284c7' : '#38bdf8',
+          'fill-opacity': ['interpolate', ['linear'], ['zoom'], 6, 0.1, 8, 0.14, 9.5, 0.18],
+          'fill-antialias': true,
         },
       },
       {
@@ -1730,6 +1795,7 @@ export function buildGiopMapStyle(
         type: 'line',
         source: 'ecg_admin_regions',
         'source-layer': 'ecg_admin_regions',
+        minzoom: 6,
         maxzoom: 10,
         layout: {
           visibility: 'none',
@@ -1738,8 +1804,8 @@ export function buildGiopMapStyle(
         },
         paint: {
           'line-color': light ? '#0369a1' : '#7dd3fc',
-          'line-width': ['interpolate', ['linear'], ['zoom'], 5, 0.8, 8, 2, 9, 2.4],
-          'line-opacity': ['interpolate', ['linear'], ['zoom'], 5, 0, 6.5, 0.35, 8, 0.75, 9, 0.95],
+          'line-width': ['interpolate', ['linear'], ['zoom'], 6, 1.8, 8, 2.6, 9.5, 3.2],
+          'line-opacity': 0.95,
         },
       },
       {
@@ -1747,12 +1813,12 @@ export function buildGiopMapStyle(
         type: 'symbol',
         source: 'ecg_admin_regions',
         'source-layer': 'ecg_admin_regions',
-        minzoom: 5,
+        minzoom: 6,
         maxzoom: 10,
         layout: {
           visibility: 'none',
           'text-field': ['get', 'region'],
-          'text-size': ['interpolate', ['linear'], ['zoom'], 5, 10, 7, 13, 9, 15],
+          'text-size': ['interpolate', ['linear'], ['zoom'], 6, 11, 8, 14, 9.5, 16],
           'text-font': GIOP_MAP_LABEL_FONT_BOLD,
           'text-anchor': 'center',
           'text-allow-overlap': false,
@@ -1764,10 +1830,9 @@ export function buildGiopMapStyle(
           'text-color': light ? '#0c4a6e' : '#e0f2fe',
           'text-halo-color': light ? '#ffffff' : '#0f172a',
           'text-halo-width': 2.5,
-          'text-opacity': ['interpolate', ['linear'], ['zoom'], 5, 0.85, 8, 1],
+          'text-opacity': 1,
         },
       },
-      // ECG districts — visible from zoom 10+ when regional view would be too coarse.
       {
         id: 'ecg-boundaries-fill',
         type: 'fill',
@@ -1776,9 +1841,9 @@ export function buildGiopMapStyle(
         minzoom: 10,
         layout: { visibility: 'none' },
         paint: {
-          'fill-color': light ? '#0ea5e9' : '#38bdf8',
-          'fill-opacity': ['interpolate', ['linear'], ['zoom'], 10, 0.08, 12, 0.14, 13, 0.18],
-          'fill-antialias': false,
+          'fill-color': light ? '#0284c7' : '#38bdf8',
+          'fill-opacity': ['interpolate', ['linear'], ['zoom'], 10, 0.1, 12, 0.16, 13, 0.2],
+          'fill-antialias': true,
         },
       },
       {
@@ -1790,7 +1855,7 @@ export function buildGiopMapStyle(
         layout: { visibility: 'none' },
         paint: {
           'line-color': light ? '#0369a1' : '#7dd3fc',
-          'line-width': ['interpolate', ['linear'], ['zoom'], 10, 1.4, 12, 2.2, 13, 2.8],
+          'line-width': ['interpolate', ['linear'], ['zoom'], 10, 1.6, 12, 2.4, 13, 3],
           'line-opacity': 0.95,
         },
       },
@@ -1814,23 +1879,8 @@ export function buildGiopMapStyle(
           'text-color': light ? '#0c4a6e' : '#e0f2fe',
           'text-halo-color': light ? '#ffffff' : '#0f172a',
           'text-halo-width': 2,
-          'text-opacity': ['interpolate', ['linear'], ['zoom'], 10, 0.9, 12, 1],
+          'text-opacity': 1,
         },
-      },
-      // H3 rebuild coverage above network geometry (toggle via layout visibility).
-      ...(h3CoverageLayerEntries(light) ?? []),
-      // Place-name labels above network geometry (CARTO label-only raster).
-      {
-        id: GIOP_BASEMAP_LABELS_LAYER_LIGHT,
-        type: 'raster',
-        source: 'basemap-labels-light',
-        layout: { visibility: light ? 'visible' : 'none' },
-      },
-      {
-        id: GIOP_BASEMAP_LABELS_LAYER_DARK,
-        type: 'raster',
-        source: 'basemap-labels-dark',
-        layout: { visibility: light ? 'none' : 'visible' },
       },
     ],
   } as StyleSpecification;
@@ -1852,7 +1902,7 @@ export const GIOP_LAYER_ZOOM_RANGE: Record<string, { min?: number; max?: number 
   'lines-overhead-lv': { min: DETAIL_LV_MIN_ZOOM },
   'lines-underground-lv': { min: DETAIL_LV_MIN_ZOOM },
   [UNPROMOTED_GIS_GAP_LAYER_ID]: { min: UNPROMOTED_GIS_GAP_MIN_ZOOM },
-  nodes: { min: 11.5 },
+  nodes: { min: DETAIL_NODE_MIN_ZOOM },
   'nodes-transformers-dt': { min: TRANSFORMER_ICON_MIN_ZOOM },
   'nodes-transformers-pt': { min: TRANSFORMER_ICON_MIN_ZOOM },
   'master-transformers-dt': { min: TRANSFORMER_ICON_MIN_ZOOM },

@@ -12,7 +12,14 @@ import { getReferenceLayerGeojson } from '../api/giop-api';
 
 /** Built-in Martin layers to hide when catalog serves the same slug via GeoJSON. */
 export const REFERENCE_BUILTIN_MARTIN_HIDE: Record<string, string[]> = {
-  'ecg-admin-boundaries': [ECG_BOUNDARY_FILL, ECG_BOUNDARY_OUTLINE, ECG_BOUNDARY_LABEL_DISTRICT],
+  'ecg-admin-boundaries': [
+    ECG_BOUNDARY_FILL,
+    ECG_BOUNDARY_OUTLINE,
+    ECG_BOUNDARY_LABEL_DISTRICT,
+    'ecg-regions-fill',
+    'ecg-regions-outline',
+    'ecg-regions-label',
+  ],
 };
 
 function sourceId(slug: string): string {
@@ -68,6 +75,9 @@ function setBuiltInMartinVisibility(map: MaplibreMap, configs: GiopReferenceMapL
   for (const cfg of configs) {
     if (!cfg.built_in_map_style) continue;
     if (cfg.render_mode !== 'geojson_static' && cfg.render_mode !== 'geojson_bbox') continue;
+    // Only hide built-in Martin once the catalog GeoJSON source is on the map.
+    // Hiding earlier leaves a gap if the GeoJSON fetch fails or is still in flight.
+    if (!map.getSource(sourceId(cfg.slug))) continue;
     const hideIds = REFERENCE_BUILTIN_MARTIN_HIDE[cfg.slug] ?? [];
     for (const layerId of hideIds) {
       if (map.getLayer(layerId)) {
@@ -218,8 +228,6 @@ export async function applyReferenceMapConfig(
   configs: GiopReferenceMapLayerConfig[],
   light: boolean,
 ): Promise<void> {
-  setBuiltInMartinVisibility(map, configs);
-
   for (const cfg of configs) {
     if (cfg.render_mode === 'martin') {
       addMartinLayers(map, cfg, light);
@@ -232,6 +240,8 @@ export async function applyReferenceMapConfig(
     }
     // geojson_bbox layers are updated on viewport change
   }
+  // After GeoJSON sources exist, hide duplicate built-in Martin layers.
+  setBuiltInMartinVisibility(map, configs);
 }
 
 export async function refreshReferenceBboxLayers(

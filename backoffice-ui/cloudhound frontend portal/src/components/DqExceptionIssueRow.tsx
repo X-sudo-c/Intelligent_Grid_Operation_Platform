@@ -110,6 +110,28 @@ export function DqExceptionIssueRow({
                 >
                   Defer
                 </button>
+                <button
+                  type="button"
+                  disabled={busy}
+                  className={btn}
+                  title="Hold for later review"
+                  onClick={() => onResolve('QUARANTINED')}
+                >
+                  Quarantine
+                </button>
+                <button
+                  type="button"
+                  disabled={busy}
+                  className={`${btn} ${
+                    isLightMode
+                      ? 'border-red-200 text-red-700 hover:bg-red-50'
+                      : 'border-premium-danger-border/40 text-premium-danger-fg hover:bg-premium-danger-bg'
+                  }`}
+                  title="Reject this exception"
+                  onClick={() => onResolve('REJECTED')}
+                >
+                  Reject
+                </button>
               </>
             ) : null}
           </div>

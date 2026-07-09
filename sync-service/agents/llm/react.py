@@ -90,11 +90,14 @@ def _tool_schemas() -> list[dict[str, Any]]:
                 "name": "inspect_node",
                 "description": (
                     "Describe ONE connectivity node (grid node): name, lifecycle/validation, "
-                    "feeder, location, district, connections. Call WITHOUT mrid when the user "
-                    "says 'this node', 'the node in view', or 'what am I looking at' — it "
-                    "auto-resolves from the selected map asset or the node nearest map center. "
-                    "Only pass mrid when the user gives a specific UUID. When confirmation_needed "
-                    "is true in the result, the map shows an amber highlight — ask the user to confirm."
+                    "feeder, location, district, connections. For transformers also returns "
+                    "rated_power_kva, vector_group, transformer_kind, manufacturer, model, serial, "
+                    "and year when present in CIM. Call WITHOUT mrid when the user says 'this node', "
+                    "'the node in view', or 'what am I looking at' — it auto-resolves from the "
+                    "selected map asset or the node nearest map center. Only pass mrid when the "
+                    "user gives a specific UUID. When confirmation_needed is true, the map shows "
+                    "an amber highlight — ask the user to confirm. Use show_on_map=true to fly to "
+                    "and highlight the node."
                 ),
                 "parameters": {
                     "type": "object",
@@ -476,7 +479,12 @@ def _tool_schemas() -> list[dict[str, Any]]:
                 "description": (
                     "List a paginated sample of point assets in a district, region, or bbox. "
                     "Always returns total count plus up to limit rows (default 25, max 100). "
-                    "Use after asset_inventory_counts when the user asks to show or list assets. "
+                    "Each row includes lon/lat; transformers also include rated_power_kva, "
+                    "vector_group, and transformer_kind when known. "
+                    "By default show_on_map=false — list first, then ask if they want "
+                    "highlights; set show_on_map=true only when they confirm or already "
+                    "asked to highlight/pin on the map. "
+                    "Use when the user asks to show, list, name, or highlight assets (e.g. transformers) in an area. "
                     "Never claim you listed every row when has_more is true."
                 ),
                 "parameters": {
@@ -497,7 +505,15 @@ def _tool_schemas() -> list[dict[str, Any]]:
                         "offset": {"type": "integer", "description": "Pagination offset."},
                         "include_geom": {
                             "type": "boolean",
-                            "description": "Include GeoJSON geometry (heavier).",
+                            "description": "Include full GeoJSON geometry (heavier; lon/lat already returned).",
+                        },
+                        "show_on_map": {
+                            "type": "boolean",
+                            "description": (
+                                "Highlight listed assets on the map. Default false — ask first "
+                                "unless the user already requested a highlight."
+                            ),
+                            "default": False,
                         },
                     },
                 },
@@ -1037,6 +1053,9 @@ def _execute_tool(
             north=arguments.get("north"),
         )
     if name == "list_assets_in_territory":
+        show_on_map = arguments.get("show_on_map")
+        if show_on_map is None:
+            show_on_map = False
         return spatial_tools.tool_list_assets_in_territory(
             conn,
             tier=arguments.get("tier") or "master",
@@ -1050,6 +1069,7 @@ def _execute_tool(
             limit=int(arguments.get("limit") or 25),
             offset=int(arguments.get("offset") or 0),
             include_geom=bool(arguments.get("include_geom")),
+            show_on_map=bool(show_on_map),
         )
     if name == "territory_network_summary":
         return spatial_tools.tool_territory_network_summary(

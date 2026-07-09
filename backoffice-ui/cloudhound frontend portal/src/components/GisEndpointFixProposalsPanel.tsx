@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   aiScanGisEndpointFixProposals,
   applyGisEndpointFixProposals,
@@ -6,12 +6,13 @@ import {
   generateGisEndpointFixProposals,
   getActiveGisEndpointFixAiDistrictRun,
   getGisEndpointFixProposalSummary,
-  getGisUnpromotedSegmentGeojson,
+  getGisEndpointFixProposalMapPreview,
   getLatestGisEndpointFixAiScan,
   listGisEndpointFixProposals,
   reviewGisEndpointFixProposals,
   startGisEndpointFixDistrictAiScan,
   type GiopEndpointFixAiDistrictRun,
+  type GiopEndpointFixAiReview,
   type GiopEndpointFixAiScanRecord,
   type GiopEndpointFixAiTranscriptEntry,
   type GiopEndpointFixProposal,
@@ -19,7 +20,20 @@ import {
   type GiopEndpointFixTier,
 } from '../api/giop-api';
 import { useGiopMapOverlay } from '../context/GiopMapOverlayContext';
-import type { ImportSegmentHighlightState } from '../lib/giopImportSegmentHighlight';
+import { endpointAssetKindLabel } from '../lib/gisEndpointAssetKind';
+import {
+  formatEndpointFixAiThoughts,
+  sanitizeEndpointFixTranscript,
+  summarizeEndpointFixAiReviews,
+} from '../lib/gisEndpointFixAiDisplay';
+import {
+  districtNamesFromPlaces,
+  loadPlacesIndex,
+} from '../hooks/useGiopMapSearchCatalog';
+import {
+  bboxFromEndpointFixGeojson,
+  type ImportSegmentHighlightState,
+} from '../lib/giopImportSegmentHighlight';
 
 interface GisEndpointFixProposalsPanelProps {
   isLightMode: boolean;
@@ -49,6 +63,35 @@ function confidenceBadge(
     return isLightMode ? 'text-red-800 bg-red-50' : 'text-red-200 bg-red-950/40';
   }
   return isLightMode ? 'text-slate-700 bg-slate-100' : 'text-slate-200 bg-slate-800/60';
+}
+
+function AiReviewsSummary({
+  reviews,
+  isLightMode,
+  muted,
+}: {
+  reviews: GiopEndpointFixAiReview[];
+  isLightMode: boolean;
+  muted: string;
+}) {
+  if (!reviews.length) return null;
+  const shell = isLightMode ? 'border-slate-200 bg-white' : 'border-premium-border/50 bg-premium-surface/30';
+  const disagrees = reviews.filter((r) => r.agree === false).slice(0, 8);
+  return (
+    <div className={`rounded-lg border p-2 text-xs space-y-2 ${shell}`}>
+      <p className={muted}>{summarizeEndpointFixAiReviews(reviews)}</p>
+      {disagrees.length > 0 && (
+        <ul className={`space-y-1 ${isLightMode ? 'text-slate-700' : 'text-premium-text-secondary'}`}>
+          {disagrees.map((r, idx) => (
+            <li key={r.proposal_id ?? `${r.segment_id}-${idx}`}>
+              <span className="font-mono">#{r.segment_id ?? '?'}</span>
+              {r.rationale ? ` — ${r.rationale}` : ' — flagged for review'}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 function TranscriptBlock({
@@ -91,14 +134,6 @@ function TranscriptBlock({
             </p>
           );
         }
-        if (entry.role === 'user' && entry.content) {
-          return (
-            <p key={idx} className={`whitespace-pre-wrap ${muted}`}>
-              <span className="font-medium">Prompt · </span>
-              {entry.content}
-            </p>
-          );
-        }
         return null;
       })}
     </div>
@@ -113,12 +148,16 @@ export function GisEndpointFixProposalsPanel({
 }: GisEndpointFixProposalsPanelProps) {
   const { queueMapViewportCommand, setImportSegmentHighlight } = useGiopMapOverlay();
   const [district, setDistrict] = useState(defaultDistrict);
+  const [districtOptions, setDistrictOptions] = useState<string[]>([]);
+  const [districtsLoading, setDistrictsLoading] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [geometryScanning, setGeometryScanning] = useState(false);
   const [status, setStatus] = useState('');
   const [summaryPending, setSummaryPending] = useState(0);
   const [summaryApproved, setSummaryApproved] = useState(0);
+  const [tierCounts, setTierCounts] = useState({ tier_a: 0, tier_b: 0 });
   const [proposals, setProposals] = useState<GiopEndpointFixProposal[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
@@ -141,6 +180,17 @@ export function GisEndpointFixProposalsPanel({
 
   const isStaging = dataTier === 'staging';
 
+  const aiTranscript = useMemo(
+    () => sanitizeEndpointFixTranscript(aiScan?.transcript ?? []),
+    [aiScan?.transcript],
+  );
+  const aiThoughtsText = useMemo(
+    () => formatEndpointFixAiThoughts(aiScan?.thoughts),
+    [aiScan?.thoughts],
+  );
+
+  const workspaceKeyRef = useRef('');
+
   const loadLatestScan = useCallback(async () => {
     if (!districtTrim) return;
     try {
@@ -151,41 +201,130 @@ export function GisEndpointFixProposalsPanel({
     }
   }, [districtTrim, dataTier]);
 
+  const fetchProposalData = useCallback(async () => {
+    const [page, summary] = await Promise.all([
+      listGisEndpointFixProposals({
+        data_tier: dataTier,
+        district: districtTrim,
+        status: 'pending',
+        tier: tierFilter || undefined,
+        limit: PAGE_SIZE,
+        offset,
+      }),
+      getGisEndpointFixProposalSummary(districtTrim, dataTier),
+    ]);
+    setProposals(page.proposals);
+    setTotal(page.total);
+    setSummaryPending(summary.pending);
+    setSummaryApproved(summary.approved);
+    setTierCounts({
+      tier_a: summary.by_status_tier?.['pending:tier_a'] ?? 0,
+      tier_b: summary.by_status_tier?.['pending:tier_b'] ?? 0,
+    });
+    setSelected(new Set());
+    await loadLatestScan();
+    return summary;
+  }, [districtTrim, dataTier, loadLatestScan, offset, tierFilter]);
+
+  const runGeometryScan = useCallback(async () => {
+    setGeometryScanning(true);
+    try {
+      return await generateGisEndpointFixProposals({
+        district: districtTrim,
+        data_tier: dataTier,
+        replace_pending: false,
+      });
+    } finally {
+      setGeometryScanning(false);
+    }
+  }, [districtTrim, dataTier]);
+
   const refresh = useCallback(async () => {
     if (!enabled || !districtTrim) return;
     setLoading(true);
     try {
-      const [page, summary] = await Promise.all([
-        listGisEndpointFixProposals({
-          data_tier: dataTier,
-          district: districtTrim,
-          status: 'pending',
-          tier: tierFilter || undefined,
-          limit: PAGE_SIZE,
-          offset,
-        }),
-        getGisEndpointFixProposalSummary(districtTrim, dataTier),
-      ]);
-      setProposals(page.proposals);
-      setTotal(page.total);
-      setSummaryPending(summary.pending);
-      setSummaryApproved(summary.approved);
-      setSelected(new Set());
-      await loadLatestScan();
+      await fetchProposalData();
     } catch (err) {
       setStatus(err instanceof Error ? err.message : 'Failed to load proposals');
     } finally {
       setLoading(false);
     }
-  }, [districtTrim, enabled, loadLatestScan, offset, tierFilter, dataTier]);
+  }, [districtTrim, enabled, fetchProposalData]);
+
+  const loadDistrictWorkspace = useCallback(
+    async (options?: { autoGenerateIfEmpty?: boolean }) => {
+      if (!enabled || !districtTrim) return;
+      setLoading(true);
+      if (options?.autoGenerateIfEmpty) setStatus('');
+      try {
+        if (options?.autoGenerateIfEmpty) {
+          const summary = await getGisEndpointFixProposalSummary(districtTrim, dataTier);
+          if (summary.pending === 0) {
+            setStatus(`Scanning geometry for ${districtTrim} (up to 5,000 segments)…`);
+            const result = await runGeometryScan();
+            if (result.inserted > 0) {
+              setStatus(
+                `Generated ${result.inserted.toLocaleString()} proposals · ${result.tier_a_pending.toLocaleString()} Tier A pending`,
+              );
+            } else {
+              setStatus(`No new endpoint fixes found in ${districtTrim}.`);
+            }
+          }
+        }
+        await fetchProposalData();
+      } catch (err) {
+        setStatus(err instanceof Error ? err.message : 'Failed to load district');
+      } finally {
+        setLoading(false);
+      }
+    },
+    [dataTier, districtTrim, enabled, fetchProposalData, runGeometryScan],
+  );
 
   useEffect(() => {
-    if (expanded && districtTrim) void refresh();
-  }, [expanded, districtTrim, refresh]);
+    if (!enabled || !districtTrim) return;
+    const workspaceKey = `${expanded}:${dataTier}:${districtTrim}`;
+    const openedOrSwitchedDistrict = workspaceKeyRef.current !== workspaceKey;
+    workspaceKeyRef.current = workspaceKey;
+    if (!expanded) return;
+    void loadDistrictWorkspace({ autoGenerateIfEmpty: openedOrSwitchedDistrict });
+  }, [dataTier, districtTrim, enabled, expanded, loadDistrictWorkspace, offset, tierFilter]);
+
+  const handleTierFilter = (tier: GiopEndpointFixTier | '') => {
+    setTierFilter(tier);
+    setOffset(0);
+    setSelected(new Set());
+  };
 
   useEffect(() => {
     setDistrict((prev) => prev || defaultDistrict);
   }, [defaultDistrict]);
+
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    setDistrictsLoading(true);
+    void loadPlacesIndex()
+      .then((places) => {
+        if (cancelled) return;
+        setDistrictOptions(districtNamesFromPlaces(places));
+      })
+      .finally(() => {
+        if (!cancelled) setDistrictsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled]);
+
+  const districtSelectOptions = useMemo(() => {
+    const options = [...districtOptions];
+    const current = district.trim();
+    if (current && !options.some((name) => name.toLowerCase() === current.toLowerCase())) {
+      options.unshift(current);
+    }
+    return options;
+  }, [district, districtOptions]);
 
   useEffect(() => {
     if (!districtTrim || !expanded) return;
@@ -233,24 +372,23 @@ export function GisEndpointFixProposalsPanel({
 
   const handleGenerate = async () => {
     if (!districtTrim) {
-      setStatus('Enter an ECG district name first');
+      setStatus('Select a district first');
       return;
     }
+    if (geometryScanning) return;
     setBusy(true);
-    setStatus('');
+    setStatus(`Scanning geometry for ${districtTrim} (adds new rows only, up to 5,000)…`);
     try {
-      const result = await generateGisEndpointFixProposals({
-        district: districtTrim,
-        data_tier: dataTier,
-        replace_pending: false,
-      });
+      const result = await runGeometryScan();
       setStatus(
-        `Generated ${result.inserted.toLocaleString()} proposals · ${result.tier_a_pending.toLocaleString()} Tier A pending`,
+        result.inserted > 0
+          ? `Generated ${result.inserted.toLocaleString()} proposals · ${result.tier_a_pending.toLocaleString()} Tier A pending`
+          : `No new proposals — ${result.pending_total.toLocaleString()} already pending`,
       );
       setOffset(0);
       await refresh();
     } catch (err) {
-      setStatus(err instanceof Error ? err.message : 'Generate failed');
+      setStatus(err instanceof Error ? err.message : 'Geometry scan failed');
     } finally {
       setBusy(false);
     }
@@ -374,21 +512,25 @@ export function GisEndpointFixProposalsPanel({
     }
   };
 
-  const showOnMap = async (segmentId: number) => {
-    setMapBusyId(segmentId);
+  const showOnMap = async (proposal: GiopEndpointFixProposal) => {
+    setMapBusyId(proposal.segment_id);
     try {
-      const highlight = await getGisUnpromotedSegmentGeojson(segmentId);
+      const preview = await getGisEndpointFixProposalMapPreview(proposal.id);
+      const focusBbox = bboxFromEndpointFixGeojson(preview.geojson) ?? preview.bbox ?? undefined;
       const state: ImportSegmentHighlightState = {
-        segmentId,
-        label: highlight.label,
-        geojson: highlight.geojson,
+        segmentId: preview.segment_id,
+        label: preview.label,
+        geojson: preview.geojson,
+        bbox: focusBbox,
       };
       setImportSegmentHighlight(state);
-      if (highlight.bbox) {
+      if (focusBbox) {
         queueMapViewportCommand({
           type: 'fit_bounds',
-          bbox: highlight.bbox,
-          max_zoom: 18,
+          bbox: focusBbox,
+          max_zoom: 20,
+          padding: 28,
+          min_span: 0.00045,
         });
       }
     } catch (err) {
@@ -423,14 +565,15 @@ export function GisEndpointFixProposalsPanel({
         <p className={`text-xs ${muted}`}>
           {isStaging ? (
             <>
-              Compare field-capture line geometry with assigned connectivity nodes. Generate proposals
-              from nearest staging nodes, run AI scan for steward reasoning, review each row, then apply
+              Compare field-capture line geometry with assigned connectivity nodes. Pick a district to
+              auto-scan unpromoted lines, run AI scan for steward reasoning, review each row, then apply
               approved fixes to <span className="font-mono">staging.ac_line_segments</span>.
             </>
           ) : (
             <>
-              Compare map geometry with missing or wrong pole IDs. Generate proposals from nearest poles,
-              run AI scan for steward reasoning, review each row, then apply approved fixes to{' '}
+              Compare map geometry with missing or wrong endpoint IDs (poles, DT, PT). Pick a district
+              to auto-scan unpromoted lines, run AI scan for steward reasoning, review each row (map
+              shows dashed links to proposed targets), then apply approved fixes to{' '}
               <span className="font-mono">gis.conductor_segments</span> (from/to only — promote is separate).
             </>
           )}
@@ -439,25 +582,40 @@ export function GisEndpointFixProposalsPanel({
         <div className="flex flex-wrap gap-2 items-end">
           <label className={`text-xs flex flex-col gap-1 ${muted}`}>
             District
-            <input
-              type="text"
+            <select
               value={district}
-              onChange={(e) => setDistrict(e.target.value)}
-              placeholder="e.g. Ga West"
-              className={`rounded border px-2 py-1 text-xs min-w-[140px] ${
+              disabled={districtsLoading && districtOptions.length === 0}
+              onChange={(e) => {
+                setDistrict(e.target.value);
+                setOffset(0);
+                setTierFilter('');
+                setSelected(new Set());
+              }}
+              className={`rounded border px-2 py-1 text-xs min-w-[160px] max-w-[220px] ${
                 isLightMode
                   ? 'border-slate-300 bg-white text-slate-800'
                   : 'border-premium-border/50 bg-premium-surface text-premium-text'
               }`}
-            />
+            >
+              <option value="">
+                {districtsLoading && districtOptions.length === 0
+                  ? 'Loading districts…'
+                  : 'Select district…'}
+              </option>
+              {districtSelectOptions.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
           </label>
           <button
             type="button"
-            disabled={busy || !districtTrim}
+            disabled={busy || geometryScanning || loading || !districtTrim}
             onClick={() => void handleGenerate()}
             className="rounded border px-2 py-1 text-xs giop-btn-primary disabled:opacity-50"
           >
-            {busy ? 'Working…' : 'Generate from geometry'}
+            {busy || geometryScanning ? 'Scanning…' : 'Re-scan geometry'}
           </button>
           <label className={`text-xs flex flex-col gap-1 ${muted}`}>
             Batch
@@ -617,62 +775,96 @@ export function GisEndpointFixProposalsPanel({
             </button>
             {showThoughts && (
               <>
-                {aiScan?.thoughts && (
+                {aiScan?.thoughts && formatEndpointFixAiThoughts(aiScan.thoughts) && (
                   <p
-                    className={`text-xs rounded-lg border p-2 ${
+                    className={`text-xs rounded-lg border p-2 whitespace-pre-wrap ${
                       isLightMode
                         ? 'border-violet-200 bg-violet-50/80 text-violet-950'
                         : 'border-violet-500/30 bg-violet-950/20 text-violet-100'
                     }`}
                   >
-                    {aiScan.thoughts}
+                    {formatEndpointFixAiThoughts(aiScan.thoughts)}
                   </p>
                 )}
-                <TranscriptBlock
-                  transcript={aiScan?.transcript ?? []}
-                  isLightMode={isLightMode}
-                  muted={muted}
-                />
+                {(aiScan?.reviews?.length ?? 0) > 0 && (
+                  <AiReviewsSummary
+                    reviews={aiScan.reviews ?? []}
+                    isLightMode={isLightMode}
+                    muted={muted}
+                  />
+                )}
+                {sanitizeEndpointFixTranscript(aiScan?.transcript ?? []).length > 0 && (
+                  <TranscriptBlock
+                    transcript={sanitizeEndpointFixTranscript(aiScan?.transcript ?? [])}
+                    isLightMode={isLightMode}
+                    muted={muted}
+                  />
+                )}
               </>
             )}
           </div>
         )}
 
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap gap-2 items-center">
           {(['', 'tier_a', 'tier_b'] as const).map((tier) => {
-            const label = tier === '' ? 'All tiers' : tier === 'tier_a' ? 'Tier A (auto)' : 'Tier B (review)';
+            const label =
+              tier === ''
+                ? `All tiers (${summaryPending})`
+                : tier === 'tier_a'
+                  ? `Tier A (${tierCounts.tier_a})`
+                  : `Tier B (${tierCounts.tier_b})`;
             const on = tierFilter === tier;
             return (
               <button
                 key={tier || 'all'}
                 type="button"
-                onClick={() => {
-                  setTierFilter(tier);
-                  setOffset(0);
+                disabled={loading}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleTierFilter(tier);
                 }}
-                className={`rounded-full border px-2 py-0.5 text-xs ${
+                className={`rounded-full border px-2 py-0.5 text-xs disabled:opacity-50 ${
                   on
                     ? isLightMode
                       ? 'border-fuchsia-600 bg-fuchsia-50 text-fuchsia-900'
                       : 'border-fuchsia-500/50 bg-fuchsia-950/30 text-fuchsia-200'
                     : isLightMode
-                      ? 'border-slate-200 text-slate-600'
-                      : 'border-premium-border/40 text-premium-muted'
+                      ? 'border-slate-200 text-slate-600 hover:bg-slate-50'
+                      : 'border-premium-border/40 text-premium-muted hover:bg-premium-hover'
                 }`}
               >
                 {label}
               </button>
             );
           })}
+          {tierFilter && !loading && (
+            <span className={`text-xs ${muted}`}>
+              Showing {proposals.length} of {total.toLocaleString()}{' '}
+              {tierFilter === 'tier_a' ? 'Tier A' : 'Tier B'}
+            </span>
+          )}
         </div>
 
         {status && <p className={`text-xs ${muted}`}>{status}</p>}
+        {geometryScanning && (
+          <p className={`text-xs ${isLightMode ? 'text-amber-700' : 'text-amber-200'}`}>
+            Geometry scan in progress — up to 5,000 segments per batch (typically 10–30s).
+          </p>
+        )}
 
         {loading ? (
           <p className={`text-xs ${muted}`}>Loading proposals…</p>
         ) : proposals.length === 0 ? (
           <p className={`text-xs ${muted}`}>
-            {districtTrim ? 'No pending proposals — generate from geometry.' : 'Enter a district to start.'}
+            {!districtTrim
+              ? 'Select a district to start.'
+              : tierFilter === 'tier_a'
+                ? `No Tier A proposals in ${districtTrim} (${tierCounts.tier_b} Tier B pending).`
+                : tierFilter === 'tier_b'
+                  ? `No Tier B proposals in ${districtTrim} (${tierCounts.tier_a} Tier A pending).`
+                  : loading
+                    ? 'Scanning geometry…'
+                    : 'No pending proposals — none found for this district.'}
           </p>
         ) : (
           <>
@@ -735,7 +927,18 @@ export function GisEndpointFixProposalsPanel({
                       <td className="p-2">
                         <span className="line-through opacity-60">{p.current_from ?? '—'}</span>
                         <span className="mx-1">→</span>
-                        <span className="font-medium text-fuchsia-700 dark:text-fuchsia-300">{p.proposed_from}</span>
+                        <span className="font-medium text-fuchsia-700 dark:text-fuchsia-300">
+                          {p.proposed_from}
+                        </span>
+                        {p.proposed_from_kind && (
+                          <span
+                            className={`ml-1 rounded px-1 py-0.5 text-[10px] ${
+                              isLightMode ? 'bg-teal-50 text-teal-800' : 'bg-teal-950/50 text-teal-200'
+                            }`}
+                          >
+                            {endpointAssetKindLabel(p.proposed_from_kind)}
+                          </span>
+                        )}
                         {p.start_dist_m != null && (
                           <span className={`block ${muted}`}>{p.start_dist_m.toFixed(1)} m</span>
                         )}
@@ -743,7 +946,18 @@ export function GisEndpointFixProposalsPanel({
                       <td className="p-2">
                         <span className="line-through opacity-60">{p.current_to ?? '—'}</span>
                         <span className="mx-1">→</span>
-                        <span className="font-medium text-fuchsia-700 dark:text-fuchsia-300">{p.proposed_to}</span>
+                        <span className="font-medium text-fuchsia-700 dark:text-fuchsia-300">
+                          {p.proposed_to}
+                        </span>
+                        {p.proposed_to_kind && (
+                          <span
+                            className={`ml-1 rounded px-1 py-0.5 text-[10px] ${
+                              isLightMode ? 'bg-teal-50 text-teal-800' : 'bg-teal-950/50 text-teal-200'
+                            }`}
+                          >
+                            {endpointAssetKindLabel(p.proposed_to_kind)}
+                          </span>
+                        )}
                         {p.end_dist_m != null && (
                           <span className={`block ${muted}`}>{p.end_dist_m.toFixed(1)} m</span>
                         )}
@@ -776,7 +990,7 @@ export function GisEndpointFixProposalsPanel({
                           <button
                             type="button"
                             disabled={mapBusyId === p.segment_id}
-                            onClick={() => void showOnMap(p.segment_id)}
+                            onClick={() => void showOnMap(p)}
                             className="underline disabled:opacity-50"
                           >
                             {mapBusyId === p.segment_id ? '…' : 'Show'}

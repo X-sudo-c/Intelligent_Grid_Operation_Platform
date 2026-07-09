@@ -124,6 +124,79 @@ def tool_inspect_node(
             result["district"] = terr[0]
             result["region"] = terr[1]
 
+    # Transformer / CIM equipment details when this node is a PT or DT.
+    if schema == "public":
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT pt.mrid::text,
+                       pt.transformer_kind,
+                       pt.rated_power_kva,
+                       pt.vector_group,
+                       pt.substation_name,
+                       ai.manufacturer,
+                       ai.model_number,
+                       ai.serial_number,
+                       ai.year_of_manufacture,
+                       aim.source_layer
+                FROM public.power_transformers pt
+                LEFT JOIN public.cim_assets ca ON ca.equipment_mrid = pt.mrid
+                LEFT JOIN public.cim_asset_info ai ON ai.mrid = ca.mrid
+                LEFT JOIN gis.asset_id_map aim ON aim.mrid = pt.connectivity_node_mrid
+                WHERE pt.connectivity_node_mrid::text = %s
+                LIMIT 1
+                """,
+                (mrid,),
+            )
+            xfmr = cur.fetchone()
+        if xfmr:
+            (
+                equip_mrid,
+                xfmr_kind,
+                rated_kva,
+                vector_group,
+                substation,
+                manufacturer,
+                model_number,
+                serial_number,
+                year_mfg,
+                source_layer,
+            ) = xfmr
+            result["asset_kind"] = source_layer or (
+                "power_transformer" if xfmr_kind == "power" else "distribution_transformer"
+            )
+            result["equipment_mrid"] = equip_mrid
+            result["transformer_kind"] = xfmr_kind
+            if rated_kva is not None:
+                result["rated_power_kva"] = float(rated_kva)
+            if vector_group:
+                result["vector_group"] = vector_group
+            if substation:
+                result["substation_name"] = substation
+            if manufacturer:
+                result["manufacturer"] = manufacturer
+            if model_number:
+                result["model_number"] = model_number
+            if serial_number:
+                result["serial_number"] = serial_number
+            if year_mfg is not None:
+                result["year_of_manufacture"] = int(year_mfg)
+            result["is_transformer"] = True
+        else:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT source_layer
+                    FROM gis.asset_id_map
+                    WHERE mrid::text = %s
+                    LIMIT 1
+                    """,
+                    (mrid,),
+                )
+                kind_row = cur.fetchone()
+            if kind_row and kind_row[0]:
+                result["asset_kind"] = kind_row[0]
+
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -181,8 +254,10 @@ def tool_inspect_node(
             }
         elif show_on_map:
             result["ui_action"] = {
-                "type": "fly_to",
+                "type": "highlight_node",
                 "tab": "map",
+                "mrid": mrid,
+                "label": name,
                 "center": loc,
                 "zoom": 17,
             }

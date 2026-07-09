@@ -29,6 +29,11 @@ IDEMPOTENCY_TTL_SEC = int(os.getenv("REDIS_IDEMPOTENCY_TTL_SEC", "86400"))
 PLACE_GEOCODE_CACHE_TTL_SEC = int(os.getenv("PLACE_GEOCODE_CACHE_TTL_SEC", "86400"))
 PLACE_RESOLVE_CACHE_TTL_SEC = int(os.getenv("PLACE_RESOLVE_CACHE_TTL_SEC", "3600"))
 MAP_SEARCH_CACHE_TTL_SEC = int(os.getenv("MAP_SEARCH_CACHE_TTL_SEC", "300"))
+AUTOCOMPLETE_INDEX_TTL_SEC = int(os.getenv("AUTOCOMPLETE_INDEX_TTL_SEC", "3600"))
+AUTOCOMPLETE_QUERY_TTL_SEC = int(os.getenv("AUTOCOMPLETE_QUERY_TTL_SEC", "300"))
+SPATIAL_INVENTORY_CACHE_TTL_SEC = int(os.getenv("SPATIAL_INVENTORY_CACHE_TTL_SEC", "900"))
+SPATIAL_LIST_CACHE_TTL_SEC = int(os.getenv("SPATIAL_LIST_CACHE_TTL_SEC", "300"))
+SPATIAL_TERRITORY_CACHE_TTL_SEC = int(os.getenv("SPATIAL_TERRITORY_CACHE_TTL_SEC", "3600"))
 REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", "32"))
 REDIS_HEALTH_CHECK_INTERVAL = int(os.getenv("REDIS_HEALTH_CHECK_INTERVAL", "30"))
 REDIS_DELETE_BATCH_SIZE = int(os.getenv("REDIS_DELETE_BATCH_SIZE", "500"))
@@ -302,6 +307,7 @@ def invalidate_topology_cache() -> int:
             f"{_KEY_PREFIX}graph:parity",
             f"{_KEY_PREFIX}gis:import:*",
             f"{_KEY_PREFIX}reference:layers",
+            f"{_KEY_PREFIX}reference:map-config:*",
         ]
     )
 
@@ -340,10 +346,27 @@ def invalidate_ops_cache() -> int:
     )
 
 
+def invalidate_gis_import_cache() -> int:
+    """Unpromoted summary + endpoint diagnostics Redis snapshots."""
+    return delete_patterns([f"{_KEY_PREFIX}gis:import:*"])
+
+
 def invalidate_after_promote() -> None:
     invalidate_topology_cache()
     invalidate_staging_cache()
     invalidate_ops_cache()
+    invalidate_spatial_agent_cache()
+    invalidate_gis_import_cache()
+
+
+def invalidate_spatial_agent_cache() -> int:
+    """Drop cached spatial inventory / list results used by voice and copilot tools."""
+    return delete_patterns(
+        [
+            f"{_KEY_PREFIX}spatial:*",
+            f"{_KEY_PREFIX}voice:count:*",
+        ]
+    )
 
 
 def invalidate_after_staging_write() -> None:
@@ -394,6 +417,15 @@ def topology_gaps_key(
 
 def reference_layers_key() -> str:
     return f"{_KEY_PREFIX}reference:layers"
+
+
+def reference_map_config_key(martin_url: str = "") -> str:
+    digest = hashlib.sha256((martin_url or "*").encode("utf-8")).hexdigest()[:12]
+    return f"{_KEY_PREFIX}reference:map-config:{digest}"
+
+
+def invalidate_reference_map_config_cache() -> int:
+    return delete_pattern(f"{_KEY_PREFIX}reference:map-config:*")
 
 
 def topology_impact_key(start_mrid: str, max_nodes: int) -> str:
@@ -517,10 +549,109 @@ def map_search_key(query: str, limit: int, kinds: str | None) -> str:
     return f"{_KEY_PREFIX}map:search:{limit}:{kind_tag}:{digest}"
 
 
+def autocomplete_index_key() -> str:
+    return f"{_KEY_PREFIX}map:autocomplete:index:v1"
+
+
+def autocomplete_query_key(
+    query: str,
+    limit: int,
+    *,
+    west: float | None,
+    south: float | None,
+    east: float | None,
+    north: float | None,
+) -> str:
+    normalized = " ".join((query or "").strip().lower().split())
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    if None not in (west, south, east, north):
+        bbox = f"{round(west, 3)}:{round(south, 3)}:{round(east, 3)}:{round(north, 3)}"
+    else:
+        bbox = "*"
+    return f"{_KEY_PREFIX}map:autocomplete:q:{limit}:{bbox}:{digest}"
+
+
 def place_resolve_key(query: str, *, geocode_enabled: bool) -> str:
     normalized = " ".join((query or "").strip().lower().split())
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
     return f"{_KEY_PREFIX}place:resolve:{int(geocode_enabled)}:{digest}"
+
+
+def _spatial_bbox_tag(
+    west: float | None,
+    south: float | None,
+    east: float | None,
+    north: float | None,
+) -> str:
+    if None in (west, south, east, north):
+        return "*"
+    return (
+        f"{round(west, 4)}:{round(south, 4)}:{round(east, 4)}:{round(north, 4)}"
+    )
+
+
+def spatial_inventory_key(
+    *,
+    tier: str,
+    asset_kind: str | None,
+    district: str | None,
+    region: str | None,
+    west: float | None = None,
+    south: float | None = None,
+    east: float | None = None,
+    north: float | None = None,
+) -> str:
+    kind = (asset_kind or "*").strip().lower()
+    dist = (district or "").strip().lower()
+    reg = (region or "").strip().lower()
+    bbox = _spatial_bbox_tag(west, south, east, north)
+    return f"{_KEY_PREFIX}spatial:inventory:{tier}:{kind}:{dist}:{reg}:{bbox}"
+
+
+def spatial_list_key(
+    *,
+    tier: str,
+    asset_kind: str | None,
+    district: str | None,
+    region: str | None,
+    limit: int,
+    offset: int,
+    include_geom: bool,
+    west: float | None = None,
+    south: float | None = None,
+    east: float | None = None,
+    north: float | None = None,
+) -> str:
+    kind = (asset_kind or "*").strip().lower()
+    dist = (district or "").strip().lower()
+    reg = (region or "").strip().lower()
+    bbox = _spatial_bbox_tag(west, south, east, north)
+    return (
+        f"{_KEY_PREFIX}spatial:list:{tier}:{kind}:{dist}:{reg}:"
+        f"{limit}:{offset}:{int(include_geom)}:{bbox}"
+    )
+
+
+def spatial_territory_key(*, district: str | None, region: str | None) -> str:
+    dist = (district or "").strip().lower()
+    reg = (region or "").strip().lower()
+    return f"{_KEY_PREFIX}spatial:territory:{dist}:{reg}"
+
+
+def spatial_network_summary_key(
+    *,
+    tier: str,
+    district: str | None,
+    region: str | None,
+    west: float | None = None,
+    south: float | None = None,
+    east: float | None = None,
+    north: float | None = None,
+) -> str:
+    dist = (district or "").strip().lower()
+    reg = (region or "").strip().lower()
+    bbox = _spatial_bbox_tag(west, south, east, north)
+    return f"{_KEY_PREFIX}spatial:network:{tier}:{dist}:{reg}:{bbox}"
 
 
 def graph_parity_key() -> str:
@@ -548,8 +679,13 @@ def topology_scan_active_key() -> str:
     return f"{_KEY_PREFIX}topology:scan:active"
 
 
+def topology_scan_cancel_key(run_id: str) -> str:
+    return f"{_KEY_PREFIX}topology:scan:cancel:{run_id}"
+
+
 TOPOLOGY_SCAN_LOCK_NAME = "topology_master_scan"
 TOPOLOGY_SCAN_LOCK_TTL_SEC = int(os.getenv("TOPOLOGY_SCAN_LOCK_TTL_SEC", "7200"))
+TOPOLOGY_SCAN_CANCEL_TTL_SEC = int(os.getenv("TOPOLOGY_SCAN_CANCEL_TTL_SEC", "7200"))
 
 
 def gis_import_summary_key(district: str | None = None) -> str:

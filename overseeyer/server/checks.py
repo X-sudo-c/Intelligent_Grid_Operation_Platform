@@ -46,7 +46,27 @@ TIMESCALE_URI = os.getenv(
 MIN_EDGE_RATIO = float(os.getenv("GIOP_MIN_EDGE_RATIO", "0.0001"))
 MIN_EDGES = int(os.getenv("GIOP_MIN_EDGES", "10"))
 MARTIN_PORT = int(os.getenv("MARTIN_PORT", "3001"))
+MARTIN_CACHE_PORT = int(os.getenv("MARTIN_CACHE_PORT", "3002"))
 MARTIN_MAP_LAYERS = ("map_connectivity_nodes", "map_ac_line_segments")
+
+
+def _martin_cache_status(port: int = MARTIN_CACHE_PORT) -> dict[str, Any]:
+    """Optional nginx front for Martin (:3002). Portal uses it when VITE_MARTIN_URL points here."""
+    if not _port_open("127.0.0.1", port):
+        return {
+            "status": "down",
+            "port": port,
+            "hint": "Start martin-cache in Services, or ./scripts/ensure_martin_cache.sh",
+        }
+    ids, err = _martin_catalog_ids(port)
+    if err:
+        return {"status": "partial", "port": port, "error": err, "layers": sorted(ids)}
+    return {
+        "status": "up",
+        "port": port,
+        "layer_count": len(ids),
+        "has_map_layers": all(layer in ids for layer in MARTIN_MAP_LAYERS),
+    }
 
 LOG_NAME_TO_SERVICE: dict[str, str] = {
     s.log_name: s.id for s in overseer.SERVICES if s.log_name
@@ -467,6 +487,7 @@ def check_map_tile_views(*, fast: bool = False) -> dict[str, Any]:
     martin_ids, martin_error = _martin_catalog_ids()
     martin_layers = {layer: layer in martin_ids for layer in MARTIN_MAP_LAYERS}
     all_layers = all(martin_layers.values())
+    martin_cache = _martin_cache_status()
 
     if node_rows == 0 and line_rows == 0:
         return {
@@ -478,6 +499,7 @@ def check_map_tile_views(*, fast: bool = False) -> dict[str, Any]:
             "martin_port": MARTIN_PORT,
             "martin_layers": martin_layers,
             "martin_error": martin_error,
+            "martin_cache": martin_cache,
         }
 
     if not all_layers:
@@ -491,6 +513,7 @@ def check_map_tile_views(*, fast: bool = False) -> dict[str, Any]:
             "martin_port": MARTIN_PORT,
             "martin_layers": martin_layers,
             "martin_error": martin_error,
+            "martin_cache": martin_cache,
         }
 
     if not fast:
@@ -514,6 +537,7 @@ def check_map_tile_views(*, fast: bool = False) -> dict[str, Any]:
         "martin_port": MARTIN_PORT,
         "martin_layers": martin_layers,
         "martin_error": None,
+        "martin_cache": martin_cache,
     }
     if fast:
         result["estimate"] = True

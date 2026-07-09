@@ -1,13 +1,25 @@
 # GIOP Martin — publish only map layers (avoids 924k raw connectivity_nodes scan).
+# Tile layers are MATERIALIZED VIEWs (migration 00100) for fast MVT generation.
 listen_addresses: '0.0.0.0:3000'
+
+# In-process tile cache — repeats of the same z/x/y skip PostGIS.
+cache:
+  size_mb: 1024
+  tile_size_mb: 768
+  # Hot Accra/Kumasi pans stay warm; promote uses ?v= cache-bust on sources.
+  tile_idle_timeout: 1h
+  maxzoom: 16
+  minzoom: 6
+
+preferred_encoding: gzip
 
 postgres:
   connection_string: ${DATABASE_URL}
   default_srid: 4326
   auto_bounds: skip
-  pool_size: 10
+  # More concurrent tile SQL under pan/zoom (was 10).
+  pool_size: 20
   auto_publish: false
-  # Clip/simplify geometries per tile — lighter country/mid-zoom Martin payloads.
   tables:
     map_connectivity_nodes:
       schema: public
@@ -16,6 +28,9 @@ postgres:
       geometry_column: geom
       geometry_type: POINT
       bounds: [-3.5, 4.5, 1.5, 8.5]
+      # Align with portal DETAIL_NODE_MIN_ZOOM (11.5).
+      minzoom: 11
+      maxzoom: 16
       properties:
         mrid: text
         boundary_feeder_id: text

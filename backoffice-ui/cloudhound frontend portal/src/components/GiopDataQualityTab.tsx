@@ -15,6 +15,7 @@ import {
   resolveDqException,
   runDqChecks,
   runTopologyDqScan,
+  cancelTopologyDqScan,
   runValidationCycle,
   getActiveTopologyScan,
   type GiopTopologyScanProgress,
@@ -44,6 +45,7 @@ import {
 } from '../hooks/useValidationRunProgress';
 import { isValidationTerminal } from './validationRunShared';
 import {
+  DqDataTierSwitch,
   DqTierMetricsPanel,
   type DqDataTier,
 } from './DqTierMetricsPanel';
@@ -168,12 +170,16 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
   const [totalQueueItems, setTotalQueueItems] = useState(0);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState('');
+  const [queueError, setQueueError] = useState<string | null>(null);
+  type DqWorkspaceView = 'queue' | 'topology' | 'import' | 'approvals';
+  const [workspaceView, setWorkspaceView] = useState<DqWorkspaceView>('queue');
   const [busyId, setBusyId] = useState<string | null>(null);
   const [releaseBusyMrid, setReleaseBusyMrid] = useState<string | null>(null);
   const [scanBusy, setScanBusy] = useState(false);
   const [scanRunId, setScanRunId] = useState<string | null>(null);
   const [scanModalOpen, setScanModalOpen] = useState(false);
   const [scanStartedMs, setScanStartedMs] = useState(0);
+  const [cancelScanBusy, setCancelScanBusy] = useState(false);
   const scanTerminalHandledRef = useRef<string | null>(null);
   const [validationBusy, setValidationBusy] = useState(false);
   const [validationModalOpen, setValidationModalOpen] = useState(false);
@@ -214,6 +220,7 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
 
   const loadQueue = useCallback(async () => {
     setLoading(true);
+    setQueueError(null);
     try {
       const pageData = await listDqQueue({
         status: statusFilter === 'ALL' ? undefined : statusFilter,
@@ -226,7 +233,9 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
       setQueueItems(Array.isArray(pageData.items) ? pageData.items : []);
       setTotalQueueItems(pageData.total ?? 0);
     } catch (err) {
-      setStatus(err instanceof Error ? err.message : 'Failed to load staging queue');
+      const message = err instanceof Error ? err.message : 'Failed to load queue';
+      setQueueError(message);
+      setStatus(message);
       setQueueItems([]);
       setTotalQueueItems(0);
     } finally {
@@ -390,6 +399,27 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
       setScanBusy(false);
     }
   }, [scanBusy, scanRunId, resetScanProgress]);
+
+  const handleCancelTopologyScan = useCallback(async () => {
+    if (!scanRunId || cancelScanBusy) return;
+    setCancelScanBusy(true);
+    setStatus('Cancelling topology scan…');
+    try {
+      const result = await cancelTopologyDqScan(scanRunId);
+      setStatus(result.message ?? 'Topology scan cancelled');
+      setScanBusy(false);
+      // Leave runId so the progress poll can show the failed/cancelled state.
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to cancel topology scan';
+      setStatus(
+        /not found|404/i.test(message)
+          ? 'Cancel endpoint missing — restart sync-service, then try Cancel again.'
+          : message,
+      );
+    } finally {
+      setCancelScanBusy(false);
+    }
+  }, [scanRunId, cancelScanBusy]);
 
   useEffect(() => {
     void (async () => {
@@ -596,11 +626,12 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
   );
 
   useEffect(() => {
-    if (loading || queueItems.length === 0) return;
-    if (reviewMrid && queueItems.some((q) => q.mrid === reviewMrid)) return;
-    const first = queueItems.find((q) => q.mrid) ?? queueItems[0];
-    if (first) void focusQueueReview(first);
-  }, [queueItems, loading, reviewMrid, focusQueueReview]);
+    // Keep review selection in sync when the queue refreshes, but do not auto-pick
+    // the first item — let stewards choose what to put on the map.
+    if (!reviewMrid) return;
+    if (queueItems.some((q) => q.mrid === reviewMrid)) return;
+    setReviewMrid(null);
+  }, [queueItems, reviewMrid]);
 
   useEffect(() => {
     if (!sideMap.mrid) return;
@@ -1102,6 +1133,224 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
     );
   };
 
+  const filtersActive =
+    statusFilter !== 'ALL' || duplicatesOnly || Boolean(severityFilter) || Boolean(domainFilter);
+  const pendingApprovalCount = approvals.length + approvedProposals.length;
+
+  const workspaceTabs: Array<{ id: DqWorkspaceView; label: string; badge?: number }> = [
+    { id: 'queue', label: 'Queue' },
+    { id: 'topology', label: 'Topology health' },
+    { id: 'import', label: dqTier === 'master' ? 'Import pipeline' : 'Endpoint fixes' },
+    {
+      id: 'approvals',
+      label: 'Approvals',
+      badge: pendingApprovalCount > 0 ? pendingApprovalCount : undefined,
+    },
+  ];
+
+  const renderApprovalsPanel = () => (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        {agentsStatus && (
+          <p className={`text-xs ${muted}`}>
+            Engine: {agentsStatus.engine}
+            {' · '}
+            Copilot:{' '}
+            {agentsStatus.llm_configured
+              ? agentsStatus.llm_reachable === false
+                ? `unreachable (${agentsStatus.llm_model})`
+                : agentsStatus.llm_model ?? 'connected'
+              : 'rules-only'}
+            {agentsStatus.cleanup_llm_distinct ? (
+              <>
+                {' · '}
+                Cleanup agent:{' '}
+                {agentsStatus.cleanup_llm_configured
+                  ? agentsStatus.cleanup_llm_reachable === false
+                    ? `unreachable (${agentsStatus.cleanup_llm_model})`
+                    : agentsStatus.cleanup_llm_model ?? 'connected'
+                  : 'rules-only'}
+              </>
+            ) : null}
+            {agentsStatus.llm_configured && agentsStatus.llm_tool_count
+              ? ` · ${agentsStatus.llm_tool_count} tools`
+              : ''}
+          </p>
+        )}
+        <div className="flex gap-2 ml-auto">
+          <button
+            type="button"
+            disabled={validationBusy}
+            onClick={() => void handleValidationRun('deterministic')}
+            className={`rounded border text-xs py-1 px-2 disabled:opacity-50 ${
+              isLightMode
+                ? 'border-slate-300 text-slate-700 hover:bg-slate-100'
+                : 'border-premium-border/50 text-premium-text-secondary hover:bg-premium-hover'
+            }`}
+          >
+            {validationBusy ? 'Running…' : 'Run validation cycle'}
+          </button>
+          <button
+            type="button"
+            disabled={validationBusy}
+            onClick={() => void handleValidationRun('agent')}
+            className={`rounded text-xs py-1 px-2 disabled:opacity-50 giop-btn-primary ${
+              isLightMode ? 'giop-btn-primary--light' : 'giop-btn-primary--dark'
+            }`}
+          >
+            Run agent cycle
+          </button>
+        </div>
+      </div>
+      {validationBusy && validationRunId && validationRunId !== 'pending' && !validationModalOpen && (
+        <div
+          className={`rounded-lg border p-3 ${
+            isLightMode
+              ? 'border-cyan-200 bg-cyan-50/80'
+              : 'border-premium-accent/25 bg-premium-accent/[0.06]'
+          }`}
+        >
+          <div className="flex items-center justify-between gap-2 mb-2">
+            <p
+              className={`text-xs font-semibold ${
+                isLightMode ? 'text-cyan-800' : 'text-premium-text'
+              }`}
+            >
+              Validation cycle in progress
+            </p>
+            <button
+              type="button"
+              className={`text-xs underline ${
+                isLightMode ? 'text-cyan-700' : 'text-premium-accent'
+              }`}
+              onClick={() => setValidationModalOpen(true)}
+            >
+              Show details
+            </button>
+          </div>
+          <ValidationRunProgressContent
+            runId={validationRunId}
+            mode={validationRunMode}
+            progress={validationDisplayProgress}
+            pollError={validationPollError}
+            isLightMode={isLightMode}
+            localStartedMs={validationRunStartedMs}
+            awaitingProgress={validationAwaitingProgress}
+            compact
+          />
+        </div>
+      )}
+      {kpis && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+          <div>
+            <span className={muted}>Topology validity</span>
+            <p className="font-semibold">{kpis.topology_validity_pct?.toFixed(1) ?? '—'}%</p>
+          </div>
+          <div>
+            <span className={muted}>Completeness</span>
+            <p className="font-semibold">{kpis.completeness_pct?.toFixed(1) ?? '—'}%</p>
+          </div>
+          <div>
+            <span className={muted}>Critical open</span>
+            <p className="font-semibold">{kpis.critical_exception_count ?? 0}</p>
+          </div>
+          <div>
+            <span className={muted}>Pending approvals</span>
+            <p className="font-semibold">{kpis.pending_approval_count ?? approvals.length}</p>
+          </div>
+        </div>
+      )}
+      {kpis?.escalation && kpis.escalation.length > 0 && (
+        <ul className={`text-xs space-y-1 ${isLightMode ? 'text-amber-700' : 'text-premium-warn-fg'}`}>
+          {kpis.escalation.map((e) => (
+            <li key={e.code}>{e.message}</li>
+          ))}
+        </ul>
+      )}
+      {approvals.length > 0 && (
+        <div className="space-y-2">
+          <p className={`text-xs font-medium ${muted}`}>Approvals inbox ({approvals.length})</p>
+          {approvals.map((a) => (
+            <div
+              key={a.id}
+              className={`rounded border p-2 text-xs ${isLightMode ? 'border-slate-200' : 'border-premium-border/70'}`}
+            >
+              <p className="font-medium">
+                {a.rule_code ?? 'Cleanup'} · {a.severity ?? a.cleanup_mode}
+              </p>
+              <p className={muted}>{a.rationale ?? a.error_message}</p>
+              {formatChangeSummary(a.change_summary as Record<string, unknown> | null) && (
+                <p className={`mt-1 ${isLightMode ? 'text-cyan-700' : 'text-premium-accent'}`}>
+                  Dry-run: {formatChangeSummary(a.change_summary as Record<string, unknown> | null)}
+                </p>
+              )}
+              {a.target_mrid && (
+                <p className={`${muted} mt-0.5`}>Target MRID: {a.target_mrid.slice(0, 8)}…</p>
+              )}
+              <div className="flex gap-2 mt-2">
+                <button
+                  type="button"
+                  disabled={busyId === a.id}
+                  onClick={() => void handleApproval(a.id, true)}
+                  className="px-2 py-0.5 rounded bg-emerald-700 text-white disabled:opacity-50"
+                >
+                  Approve proposal
+                </button>
+                <button
+                  type="button"
+                  disabled={busyId === a.id}
+                  onClick={() => void handleApproval(a.id, false)}
+                  className="px-2 py-0.5 rounded bg-slate-600 text-white disabled:opacity-50"
+                >
+                  Reject
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {approvedProposals.length > 0 && (
+        <div className="space-y-2">
+          <p className={`text-xs font-medium ${muted}`}>
+            Ready to publish ({approvedProposals.length})
+          </p>
+          {approvedProposals.map((p) => (
+            <div
+              key={p.id}
+              className={`rounded border p-2 text-xs ${isLightMode ? 'border-emerald-200 bg-emerald-50/50' : 'border-premium-success-border/50 bg-premium-success-bg/80'}`}
+            >
+              <p className="font-medium">
+                {p.rule_code ?? 'Topology repair'} · {p.severity ?? 'approved'}
+              </p>
+              <p className={muted}>{p.ai_rationale ?? p.exception_message}</p>
+              {formatChangeSummary(p.change_summary as Record<string, unknown> | null) && (
+                <p className={`mt-1 ${isLightMode ? 'text-emerald-700' : 'text-premium-success-fg'}`}>
+                  Dry-run: {formatChangeSummary(p.change_summary as Record<string, unknown> | null)}
+                </p>
+              )}
+              <div className="flex gap-2 mt-2">
+                <button
+                  type="button"
+                  disabled={busyId === p.id}
+                  onClick={() => void handlePublishProposal(p.id)}
+                  className="px-2 py-0.5 rounded bg-premium-hover-strong border border-premium-border/50 text-premium-text-secondary hover:bg-premium-hover disabled:opacity-50"
+                >
+                  Publish to master
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {!kpis && approvals.length === 0 && approvedProposals.length === 0 && !validationBusy && (
+        <p className={`text-sm ${muted}`}>
+          No pending approvals or KPI snapshot yet. Run a validation or agent cycle to populate this
+          view.
+        </p>
+      )}
+    </div>
+  );
+
   return (
     <div className="h-full min-h-0 flex flex-col overflow-hidden">
       <ValidationRunModal
@@ -1127,292 +1376,260 @@ export function GiopDataQualityTab({ isLightMode }: GiopDataQualityTabProps) {
           pollError={scanPollError}
           onClose={() => setScanModalOpen(false)}
           onRunInBackground={() => setScanModalOpen(false)}
+          onCancel={() => void handleCancelTopologyScan()}
+          cancelBusy={cancelScanBusy}
         />
       )}
 
-      <div className="shrink-0 px-3 pt-3 pb-2 border-b border-slate-200/70 dark:border-premium-border/45">
-      <DqTierMetricsPanel
-        tier={dqTier}
-        onTierChange={setDqTier}
-        isLightMode={isLightMode}
-        topoSummary={topoSummary}
-        summary={summary}
-        topoLoading={topoLoading}
-        topoRevalidating={topoRevalidating}
-        topoLiveBusy={topoLiveBusy}
-        scanBusy={scanBusy}
-        scanProgress={scanProgress}
-        scanPollError={scanPollError}
-        scanStartedMs={scanStartedMs}
-        onRefreshLive={handleRefreshLive}
-        onRunTopologyScan={handleTopologyScan}
-      />
-      </div>
-
-      <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-3 pb-4 pt-2 space-y-2">
-      <GiopImportQueuePanel
-        isLightMode={isLightMode}
-        enabled
-        dataTier={dqTier === 'staging' ? 'staging' : 'gis'}
-        showImportQueue={dqTier === 'master'}
-      />
-
-      {(kpis || approvals.length > 0 || approvedProposals.length > 0 || validationBusy) && (
-        <details
-          className={`rounded-xl border text-sm group ${card} ${
-            isLightMode ? 'open:bg-white' : 'open:bg-premium-card/80'
-          }`}
-        >
-          <summary
-            className={`cursor-pointer list-none px-3 py-2 font-medium flex items-center justify-between gap-2 ${
-              isLightMode ? 'text-slate-800' : 'text-premium-text-secondary'
-            }`}
-          >
-            <span>Agent KPIs &amp; approvals</span>
-            <span className={`text-xs font-normal ${muted}`}>Expand</span>
-          </summary>
-          <div className="px-3 pb-3 space-y-3 border-t border-slate-200/80 dark:border-premium-border/70/80 pt-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            {agentsStatus && (
-              <p className={`text-xs ${muted}`}>
-                Engine: {agentsStatus.engine}
-                {' · '}
-                Copilot:{' '}
-                {agentsStatus.llm_configured
-                  ? agentsStatus.llm_reachable === false
-                    ? `unreachable (${agentsStatus.llm_model})`
-                    : agentsStatus.llm_model ?? 'connected'
-                  : 'rules-only'}
-                {agentsStatus.cleanup_llm_distinct ? (
-                  <>
-                    {' · '}
-                    Cleanup agent:{' '}
-                    {agentsStatus.cleanup_llm_configured
-                      ? agentsStatus.cleanup_llm_reachable === false
-                        ? `unreachable (${agentsStatus.cleanup_llm_model})`
-                        : agentsStatus.cleanup_llm_model ?? 'connected'
-                      : 'rules-only'}
-                  </>
-                ) : null}
-                {agentsStatus.llm_configured && agentsStatus.llm_tool_count
-                  ? ` · ${agentsStatus.llm_tool_count} tools`
-                  : ''}
-              </p>
-            )}
-            <div className="flex gap-2 ml-auto">
-              <button
-                type="button"
-                disabled={validationBusy}
-                onClick={() => void handleValidationRun('deterministic')}
-                className={`rounded border text-xs py-1 px-2 disabled:opacity-50 ${
-                  isLightMode
-                    ? 'border-slate-300 text-slate-700 hover:bg-slate-100'
-                    : 'border-premium-border/50 text-premium-text-secondary hover:bg-premium-hover'
-                }`}
-              >
-                {validationBusy ? 'Running…' : 'Run validation cycle'}
-              </button>
-              <button
-                type="button"
-                disabled={validationBusy}
-                onClick={() => void handleValidationRun('agent')}
-                className={`rounded text-xs py-1 px-2 disabled:opacity-50 giop-btn-primary ${
-                  isLightMode ? 'giop-btn-primary--light' : 'giop-btn-primary--dark'
-                }`}
-              >
-                Run agent cycle
-              </button>
-            </div>
-          </div>
-          {validationBusy && validationRunId && validationRunId !== 'pending' && !validationModalOpen && (
-            <div
-              className={`rounded-lg border p-3 ${
-                isLightMode
-                  ? 'border-cyan-200 bg-cyan-50/80'
-                  : 'border-premium-accent/25 bg-premium-accent/[0.06]'
-              }`}
-            >
-              <div className="flex items-center justify-between gap-2 mb-2">
-                <p
-                  className={`text-xs font-semibold ${
-                    isLightMode ? 'text-cyan-800' : 'text-premium-text'
-                  }`}
-                >
-                  Validation cycle in progress
-                </p>
-                <button
-                  type="button"
-                  className={`text-xs underline ${
-                    isLightMode ? 'text-cyan-700' : 'text-premium-accent'
-                  }`}
-                  onClick={() => setValidationModalOpen(true)}
-                >
-                  Show details
-                </button>
-              </div>
-              <ValidationRunProgressContent
-                runId={validationRunId}
-                mode={validationRunMode}
-                progress={validationDisplayProgress}
-                pollError={validationPollError}
-                isLightMode={isLightMode}
-                localStartedMs={validationRunStartedMs}
-                awaitingProgress={validationAwaitingProgress}
-                compact
-              />
-            </div>
-          )}
-          {kpis && (
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
-              <div>
-                <span className={muted}>Topology validity</span>
-                <p className="font-semibold">{kpis.topology_validity_pct?.toFixed(1) ?? '—'}%</p>
-              </div>
-              <div>
-                <span className={muted}>Completeness</span>
-                <p className="font-semibold">{kpis.completeness_pct?.toFixed(1) ?? '—'}%</p>
-              </div>
-              <div>
-                <span className={muted}>Critical open</span>
-                <p className="font-semibold">{kpis.critical_exception_count ?? 0}</p>
-              </div>
-              <div>
-                <span className={muted}>Pending approvals</span>
-                <p className="font-semibold">{kpis.pending_approval_count ?? approvals.length}</p>
-              </div>
-            </div>
-          )}
-          {kpis?.escalation && kpis.escalation.length > 0 && (
-            <ul className={`text-xs space-y-1 ${isLightMode ? 'text-amber-700' : 'text-premium-warn-fg'}`}>
-              {kpis.escalation.map((e) => (
-                <li key={e.code}>{e.message}</li>
-              ))}
-            </ul>
-          )}
-          {approvals.length > 0 && (
-            <div className="space-y-2">
-              <p className={`text-xs font-medium ${muted}`}>Approvals inbox ({approvals.length})</p>
-              {approvals.map((a) => (
-                <div
-                  key={a.id}
-                  className={`rounded border p-2 text-xs ${isLightMode ? 'border-slate-200' : 'border-premium-border/70'}`}
-                >
-                  <p className="font-medium">
-                    {a.rule_code ?? 'Cleanup'} · {a.severity ?? a.cleanup_mode}
-                  </p>
-                  <p className={muted}>{a.rationale ?? a.error_message}</p>
-                  {formatChangeSummary(a.change_summary as Record<string, unknown> | null) && (
-                    <p className={`mt-1 ${isLightMode ? 'text-cyan-700' : 'text-premium-accent'}`}>
-                      Dry-run: {formatChangeSummary(a.change_summary as Record<string, unknown> | null)}
-                    </p>
-                  )}
-                  {a.target_mrid && (
-                    <p className={`${muted} mt-0.5`}>Target MRID: {a.target_mrid.slice(0, 8)}…</p>
-                  )}
-                  <div className="flex gap-2 mt-2">
-                    <button
-                      type="button"
-                      disabled={busyId === a.id}
-                      onClick={() => void handleApproval(a.id, true)}
-                      className="px-2 py-0.5 rounded bg-emerald-700 text-white disabled:opacity-50"
-                    >
-                      Approve proposal
-                    </button>
-                    <button
-                      type="button"
-                      disabled={busyId === a.id}
-                      onClick={() => void handleApproval(a.id, false)}
-                      className="px-2 py-0.5 rounded bg-slate-600 text-white disabled:opacity-50"
-                    >
-                      Reject
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-          {approvedProposals.length > 0 && (
-            <div className="space-y-2">
-              <p className={`text-xs font-medium ${muted}`}>
-                Ready to publish ({approvedProposals.length})
-              </p>
-              {approvedProposals.map((p) => (
-                <div
-                  key={p.id}
-                  className={`rounded border p-2 text-xs ${isLightMode ? 'border-emerald-200 bg-emerald-50/50' : 'border-premium-success-border/50 bg-premium-success-bg/80'}`}
-                >
-                  <p className="font-medium">
-                    {p.rule_code ?? 'Topology repair'} · {p.severity ?? 'approved'}
-                  </p>
-                  <p className={muted}>{p.ai_rationale ?? p.exception_message}</p>
-                  {formatChangeSummary(p.change_summary as Record<string, unknown> | null) && (
-                    <p className={`mt-1 ${isLightMode ? 'text-emerald-700' : 'text-premium-success-fg'}`}>
-                      Dry-run: {formatChangeSummary(p.change_summary as Record<string, unknown> | null)}
-                    </p>
-                  )}
-                  <div className="flex gap-2 mt-2">
-                    <button
-                      type="button"
-                      disabled={busyId === p.id}
-                      onClick={() => void handlePublishProposal(p.id)}
-                      className="px-2 py-0.5 rounded bg-premium-hover-strong border border-premium-border/50 text-premium-text-secondary hover:bg-premium-hover disabled:opacity-50"
-                    >
-                      Publish to master
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-          </div>
-        </details>
-      )}
-
       <div
-        className={`sticky top-0 z-10 -mx-3 px-3 py-2 border-b backdrop-blur-sm ${
-          isLightMode
-            ? 'bg-white/95 border-slate-200/80'
-            : 'bg-premium-bg/95 border-premium-border/45'
+        className={`shrink-0 px-4 pt-3 pb-2 space-y-2 border-b ${
+          isLightMode ? 'border-slate-200/70' : 'border-premium-border/45'
         }`}
       >
-      <DqQueueToolbar
-        isLightMode={isLightMode}
-        statusFilter={statusFilter}
-        duplicatesOnly={duplicatesOnly}
-        severityFilter={severityFilter}
-        domainFilter={domainFilter}
-        onStatusFilterChange={setStatusFilter}
-        onDuplicatesOnlyChange={setDuplicatesOnly}
-        onSeverityFilterChange={setSeverityFilter}
-        onDomainFilterChange={setDomainFilter}
-        onRefresh={() => void loadQueue()}
-        loading={loading}
-        statusMessage={status || undefined}
-        page={page}
-        pageSize={pageSize}
-        total={totalQueueItems}
-        onPageChange={setPage}
-        onPageSizeChange={setPageSize}
-      />
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <p className={`text-sm font-semibold ${isLightMode ? 'text-slate-900' : 'text-premium-text'}`}>
+              Data quality
+            </p>
+            <p className={`text-xs ${muted}`}>
+              Review captures → resolve issues → release to Operations
+            </p>
+          </div>
+          <div
+            className={`inline-flex p-1 rounded-xl border ${
+              isLightMode
+                ? 'bg-slate-100/90 border-slate-200'
+                : 'bg-premium-surface border-premium-border/50'
+            }`}
+            role="tablist"
+            aria-label="Data quality workspace"
+          >
+            {workspaceTabs.map((tab) => {
+              const active = workspaceView === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  onClick={() => setWorkspaceView(tab.id)}
+                  className={`relative px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                    active
+                      ? isLightMode
+                        ? 'bg-white text-slate-900 shadow-sm'
+                        : 'bg-premium-card text-premium-text shadow-sm'
+                      : isLightMode
+                        ? 'text-slate-500 hover:text-slate-700'
+                        : 'text-premium-muted hover:text-premium-text-secondary'
+                  }`}
+                >
+                  {tab.label}
+                  {tab.badge != null ? (
+                    <span
+                      className={`ml-1.5 inline-flex min-w-[1.1rem] justify-center rounded-full px-1 text-[10px] font-semibold ${
+                        isLightMode ? 'bg-amber-100 text-amber-900' : 'bg-premium-warn-bg text-premium-warn-fg'
+                      }`}
+                    >
+                      {tab.badge}
+                    </span>
+                  ) : null}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {pendingApprovalCount > 0 && workspaceView !== 'approvals' && (
+          <button
+            type="button"
+            onClick={() => setWorkspaceView('approvals')}
+            className={`w-full text-left rounded-lg border px-3 py-2 text-xs transition-colors ${
+              isLightMode
+                ? 'border-amber-300 bg-amber-50 text-amber-950 hover:bg-amber-100/80'
+                : 'border-premium-warn-border/40 bg-premium-warn-bg text-premium-warn-fg hover:bg-premium-warn-bg/80'
+            }`}
+          >
+            <span className="font-semibold">
+              {approvals.length > 0
+                ? `${approvals.length} cleanup proposal${approvals.length === 1 ? '' : 's'} awaiting approval`
+                : null}
+              {approvals.length > 0 && approvedProposals.length > 0 ? ' · ' : null}
+              {approvedProposals.length > 0
+                ? `${approvedProposals.length} ready to publish`
+                : null}
+            </span>
+            <span className="ml-2 underline">Open Approvals</span>
+          </button>
+        )}
       </div>
 
-      {loading && (
-        <p className="text-sm text-slate-500 py-2">
-          {dqTier === 'master' ? 'Loading exception queue…' : 'Loading staging queue…'}
-        </p>
-      )}
-      {!loading && queueItems.length === 0 && (
-        <p className="text-sm text-slate-500">
-          {dqTier === 'master'
-            ? 'No open topology exceptions in the master queue.'
-            : 'No staging captures in the DQ queue. Field submissions appear here as PENDING_FIELD.'}
-        </p>
-      )}
+      <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-4 pb-4 pt-3 space-y-3">
+        {workspaceView === 'topology' && (
+          <DqTierMetricsPanel
+            tier={dqTier}
+            onTierChange={setDqTier}
+            isLightMode={isLightMode}
+            topoSummary={topoSummary}
+            summary={summary}
+            topoLoading={topoLoading}
+            topoRevalidating={topoRevalidating}
+            topoLiveBusy={topoLiveBusy}
+            scanBusy={scanBusy}
+            scanProgress={scanProgress}
+            scanPollError={scanPollError}
+            scanStartedMs={scanStartedMs}
+            onRefreshLive={handleRefreshLive}
+            onRunTopologyScan={handleTopologyScan}
+            onCancelTopologyScan={() => void handleCancelTopologyScan()}
+            cancelScanBusy={cancelScanBusy}
+          />
+        )}
 
-      <div className="space-y-2">
-        {clusters.map((cluster) => renderQueueCluster(cluster))}
-        {singletons.map((item) => renderQueueCard(item))}
-      </div>
+        {workspaceView === 'import' && (
+          <GiopImportQueuePanel
+            isLightMode={isLightMode}
+            enabled
+            dataTier={dqTier === 'staging' ? 'staging' : 'gis'}
+            showImportQueue={dqTier === 'master'}
+          />
+        )}
+
+        {workspaceView === 'approvals' && (
+          <div className={`rounded-xl border p-3 text-sm ${card}`}>{renderApprovalsPanel()}</div>
+        )}
+
+        {workspaceView === 'queue' && (
+          <>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <DqDataTierSwitch
+                tier={dqTier}
+                onTierChange={setDqTier}
+                isLightMode={isLightMode}
+                disabled={topoLoading && !topoSummary}
+              />
+              <p className={`text-xs ${muted}`}>
+                {dqTier === 'master'
+                  ? 'Master topology exceptions'
+                  : 'Staging: field submissions awaiting validation'}
+              </p>
+            </div>
+
+            <div
+              className={`sticky top-0 z-10 -mx-4 px-4 py-2 border-b backdrop-blur-sm ${
+                isLightMode
+                  ? 'bg-white/95 border-slate-200/80'
+                  : 'bg-premium-bg/95 border-premium-border/45'
+              }`}
+            >
+              <DqQueueToolbar
+                isLightMode={isLightMode}
+                statusFilter={statusFilter}
+                duplicatesOnly={duplicatesOnly}
+                severityFilter={severityFilter}
+                domainFilter={domainFilter}
+                onStatusFilterChange={setStatusFilter}
+                onDuplicatesOnlyChange={setDuplicatesOnly}
+                onSeverityFilterChange={setSeverityFilter}
+                onDomainFilterChange={setDomainFilter}
+                onRefresh={() => void loadQueue()}
+                loading={loading}
+                statusMessage={status || undefined}
+                page={page}
+                pageSize={pageSize}
+                total={totalQueueItems}
+                onPageChange={setPage}
+                onPageSizeChange={setPageSize}
+              />
+            </div>
+
+            {loading && (
+              <div className="space-y-2 py-1" aria-busy="true" aria-label="Loading queue">
+                {[0, 1, 2].map((i) => (
+                  <div
+                    key={i}
+                    className={`h-20 rounded-lg border animate-pulse ${
+                      isLightMode ? 'border-slate-200 bg-slate-100/80' : 'border-premium-border/40 bg-premium-surface'
+                    }`}
+                  />
+                ))}
+              </div>
+            )}
+
+            {!loading && queueError && (
+              <div
+                className={`rounded-lg border px-3 py-2 text-sm ${
+                  isLightMode
+                    ? 'border-red-200 bg-red-50 text-red-800'
+                    : 'border-premium-danger-border/40 bg-premium-danger-bg text-premium-danger-fg'
+                }`}
+              >
+                <p className="font-medium">Could not load queue</p>
+                <p className="text-xs mt-0.5 opacity-90">{queueError}</p>
+                <button
+                  type="button"
+                  className="mt-2 text-xs underline"
+                  onClick={() => void loadQueue()}
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+
+            {!loading && !queueError && queueItems.length === 0 && (
+              <div
+                className={`rounded-lg border px-3 py-4 text-sm ${
+                  isLightMode ? 'border-slate-200 bg-slate-50 text-slate-600' : 'border-premium-border/45 bg-premium-surface text-premium-muted'
+                }`}
+              >
+                {filtersActive ? (
+                  <>
+                    <p className="font-medium">No matches for the current filters</p>
+                    <p className="text-xs mt-1">
+                      Clear filters or broaden severity / domain to see more records.
+                    </p>
+                    <button
+                      type="button"
+                      className="mt-2 text-xs underline"
+                      onClick={() => {
+                        setStatusFilter('ALL');
+                        setDuplicatesOnly(false);
+                        setSeverityFilter('');
+                        setDomainFilter('');
+                      }}
+                    >
+                      Clear all filters
+                    </button>
+                  </>
+                ) : dqTier === 'master' ? (
+                  <>
+                    <p className="font-medium">No open topology exceptions</p>
+                    <p className="text-xs mt-1">
+                      Run <strong>Scan → queue</strong> from Topology health if you expect new issues.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="font-medium">No staging captures in queue</p>
+                    <p className="text-xs mt-1">
+                      Field submissions appear here as PENDING_FIELD after capture.
+                    </p>
+                  </>
+                )}
+              </div>
+            )}
+
+            {!loading && !queueError && queueItems.length > 0 && !reviewMrid && (
+              <p className={`text-xs ${muted}`}>
+                Select a capture to review it on the map. Map stays idle until you choose one.
+              </p>
+            )}
+
+            <div className="space-y-2">
+              {clusters.map((cluster) => renderQueueCluster(cluster))}
+              {singletons.map((item) => renderQueueCard(item))}
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

@@ -66,9 +66,9 @@ export function EnhancedCopilotPanel({
       id: 'welcome',
       role: 'assistant',
       content:
-        'I can count poles and assets by district or map view, review staging captures, ' +
-        'highlight territories on the map, and answer by voice. Tap the wave on the map for ' +
-        'hands-free mode — speak naturally and it sends when you pause; tap the wave or Escape to stop.',
+        'Hi — I am ready to help with the map, transformers, feeders, and counts. ' +
+        'Ask for inventory by district or map view, review staging, or highlight assets on the map. ' +
+        'If I am unsure what you mean, I will ask. Tap the wave on the map for hands-free voice.',
     },
   ]);
   const scrollRef = useRef<HTMLDivElement | null>(null);

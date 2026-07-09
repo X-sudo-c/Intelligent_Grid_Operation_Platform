@@ -134,6 +134,14 @@ export interface MapTilesCheck {
   martin_port?: number;
   martin_layers?: Record<string, boolean>;
   martin_error?: string | null;
+  martin_cache?: {
+    status: string;
+    port?: number;
+    layer_count?: number;
+    has_map_layers?: boolean;
+    error?: string;
+    hint?: string;
+  };
 }
 
 export interface TrialCheck {

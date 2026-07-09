@@ -112,7 +112,7 @@ function compareSearchHits(a: GiopMapSearchResult, b: GiopMapSearchResult, q: st
 }
 
 export function searchLocalMapCatalog(
-  catalog: GiopMapSearchResult[],
+  catalog: GiopMapSearchResult[] | null | undefined,
   query: string,
   filter: GiopMapSearchFilter,
   limit = 12,
@@ -123,7 +123,7 @@ export function searchLocalMapCatalog(
   const kinds =
     filter === 'all' ? null : new Set<GiopMapSearchKind>([filter]);
 
-  const hits = catalog.filter((item) => {
+  const hits = (catalog ?? []).filter((item) => {
     if (kinds && !kinds.has(item.kind)) return false;
     const hay = `${item.title} ${item.subtitle ?? ''} ${item.id}`;
     return fuzzyMatchesMapQuery(hay, q);
@@ -137,8 +137,8 @@ export function searchLocalMapCatalog(
 /** Search places + ops without scanning both catalogs as one giant list. */
 export function searchMapCatalog(options: {
   filter: GiopMapSearchFilter;
-  placeCatalog: GiopMapSearchResult[];
-  opsCatalog: GiopMapSearchResult[];
+  placeCatalog?: GiopMapSearchResult[] | null;
+  opsCatalog?: GiopMapSearchResult[] | null;
   query: string;
   limit?: number;
   /** OSM / server geocode hits — always shown (already matched upstream). */
@@ -146,7 +146,15 @@ export function searchMapCatalog(options: {
   /** Server-side DB search fallback hits. */
   remoteHits?: GiopMapSearchResult[];
 }): GiopMapSearchResult[] {
-  const { filter, placeCatalog, opsCatalog, query, limit = 12, geocodeHits = [], remoteHits = [] } = options;
+  const {
+    filter,
+    placeCatalog = [],
+    opsCatalog = [],
+    query,
+    limit = 12,
+    geocodeHits = [],
+    remoteHits = [],
+  } = options;
   const q = query.trim();
   if (q.length < 1) return [];
 

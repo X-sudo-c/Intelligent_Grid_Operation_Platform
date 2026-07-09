@@ -16,7 +16,8 @@ export function formatScanElapsed(startedAt?: string | null, localStartedMs?: nu
 }
 
 export function formatScanEta(seconds?: number | null): string | null {
-  if (seconds == null || seconds <= 0) return null;
+  if (seconds == null) return null;
+  if (seconds <= 0) return 'past estimate — still running';
   if (seconds < 60) return `~${seconds}s remaining`;
   return `~${Math.ceil(seconds / 60)}m remaining`;
 }

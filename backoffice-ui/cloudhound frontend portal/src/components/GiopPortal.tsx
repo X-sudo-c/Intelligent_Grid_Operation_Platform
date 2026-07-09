@@ -21,8 +21,17 @@ import { GiopWorkOrdersTab } from './GiopWorkOrdersTab';
 import { GiopOutagesTab } from './GiopOutagesTab';
 import { GiopReportsTab } from './GiopReportsTab';
 import { GiopSideMapPanel } from './GiopSideMapPanel';
+import { GiopFloatingMapShell } from './GiopFloatingMapShell';
 import { GiopMapErrorBoundary } from './GiopMapErrorBoundary';
 import { GiopWorkspaceLayout } from './GiopWorkspaceLayout';
+import {
+  readSideMapDockMode,
+  readSideMapDockWidth,
+  readSideMapFloatRect,
+  writeSideMapDockMode,
+  type SideMapDockMode,
+  type SideMapFloatRect,
+} from '../lib/giopSideMapDock';
 import { GiopSelectionProvider, useGiopSelection } from '../context/GiopSelectionContext';
 import { GiopMapOverlayProvider, useGiopMapOverlay } from '../context/GiopMapOverlayContext';
 import { GiopVoiceModeProvider } from '../context/GiopVoiceModeContext';
@@ -212,6 +221,9 @@ function GiopPortalInner() {
   const [isLightMode, setIsLightMode] = useState(readSavedTheme);
   const [mapRefreshToken, setMapRefreshToken] = useState(0);
   const [sideMapEpoch, setSideMapEpoch] = useState(0);
+  const [sideMapDockMode, setSideMapDockMode] = useState<SideMapDockMode>(() => readSideMapDockMode());
+  const [sideMapDockWidth, setSideMapDockWidth] = useState(() => readSideMapDockWidth());
+  const [sideMapFloatRect, setSideMapFloatRect] = useState<SideMapFloatRect>(() => readSideMapFloatRect());
   const [opsRefreshToken, setOpsRefreshToken] = useState(0);
   const [liveStatus, setLiveStatus] = useState<'idle' | 'loading' | 'live'>('idle');
   const [mapViewport, setMapViewport] = useState<MapViewportContext | null>(() => defaultMapViewport());
@@ -488,6 +500,23 @@ function GiopPortalInner() {
     setMapRefreshToken((t) => t + 1);
   }, []);
 
+  /** Coalesce bursty master-table realtime events so the map does not flash-reload. */
+  const masterMapRefreshTimerRef = useRef<number | undefined>(undefined);
+  const scheduleMapRefresh = useCallback(() => {
+    window.clearTimeout(masterMapRefreshTimerRef.current);
+    masterMapRefreshTimerRef.current = window.setTimeout(() => {
+      masterMapRefreshTimerRef.current = undefined;
+      refreshMap();
+    }, 2500);
+  }, [refreshMap]);
+
+  useEffect(
+    () => () => {
+      window.clearTimeout(masterMapRefreshTimerRef.current);
+    },
+    [],
+  );
+
   const copilotContext = useMemo((): GiopCopilotPortalContext => {
     const pending = staging.filter((a) => a.validation !== 'REJECTED').length;
     const base: GiopCopilotPortalContext = {
@@ -574,7 +603,7 @@ function GiopPortalInner() {
           setSelectedTerritory({ district: action.district, region: action.region });
         }
         if (tab === 'operations') setOpsRefreshToken((t) => t + 1);
-        if (tab === 'map' || tab === 'combined' || tab === 'operations') refreshMap();
+        // Camera/nav only — do not bust Martin tiles (that looked like a random refresh).
         return;
       }
 
@@ -588,7 +617,6 @@ function GiopPortalInner() {
           bbox: action.bbox,
           max_zoom: action.max_zoom,
         });
-        refreshMap();
         return;
       }
 
@@ -600,7 +628,6 @@ function GiopPortalInner() {
           zoom: action.zoom,
           duration: action.duration,
         });
-        refreshMap();
         return;
       }
 
@@ -618,7 +645,6 @@ function GiopPortalInner() {
           center: action.center,
           zoom: action.zoom ?? 17,
         });
-        refreshMap();
         return;
       }
 
@@ -651,7 +677,6 @@ function GiopPortalInner() {
           }
         })();
         queueMapViewportCommand({ type: 'fit_bounds', bbox: action.bbox });
-        refreshMap();
         return;
       }
 
@@ -668,7 +693,6 @@ function GiopPortalInner() {
         if (action.bbox) {
           queueMapViewportCommand({ type: 'fit_bounds', bbox: action.bbox });
         }
-        refreshMap();
         return;
       }
 
@@ -683,7 +707,6 @@ function GiopPortalInner() {
         if (action.bbox) {
           queueMapViewportCommand({ type: 'fit_bounds', bbox: action.bbox, max_zoom: 17 });
         }
-        refreshMap();
       }
     },
     [
@@ -692,7 +715,6 @@ function GiopPortalInner() {
       goToTab,
       graphQuery,
       queueMapViewportCommand,
-      refreshMap,
       setSelection,
       setTerritoryHighlight,
       setFeederHighlight,
@@ -750,7 +772,7 @@ function GiopPortalInner() {
     },
     onMasterChange: () => {
       setOpsRefreshToken((t) => t + 1);
-      refreshMap();
+      scheduleMapRefresh();
       if (!needsTraceRef.current) return;
       setTimeout(() => void refreshTopology(), 1200);
     },
@@ -947,6 +969,11 @@ function GiopPortalInner() {
     });
   }, [focusOnMap, sideMap.mrid, sideMap.name, sideMapCoordinates]);
 
+  const handleSideMapDockModeChange = useCallback((mode: SideMapDockMode) => {
+    setSideMapDockMode(mode);
+    writeSideMapDockMode(mode);
+  }, []);
+
   const mapPulseFocus =
     mapIdentifyFocusMrid != null && selection.mrid === mapIdentifyFocusMrid;
   const mapPulseTentative = copilotTentativeHighlight && mapPulseFocus;
@@ -959,6 +986,10 @@ function GiopPortalInner() {
     },
     [clearMapIdentifyFocus, setSelection],
   );
+
+  const dqMapPinned = route.tab === 'data-quality';
+  const sideMapVisible = dqMapPinned || sideMap.open;
+  const sideMapFloating = sideMapVisible && sideMapDockMode === 'floating';
 
   const sideMapPanel = (
     <GiopMapErrorBoundary
@@ -979,6 +1010,8 @@ function GiopPortalInner() {
         flyRequest={sidePanelFlyRequest}
         impactOverlay={impactOverlay}
         persistent={route.tab === 'data-quality'}
+        dockMode={sideMapDockMode}
+        onDockModeChange={handleSideMapDockModeChange}
         onClose={closeSideMap}
         onOpenFullMap={openSideMapFullTab}
         onNodeClick={(mrid, coordinates) =>
@@ -987,8 +1020,6 @@ function GiopPortalInner() {
       />
     </GiopMapErrorBoundary>
   );
-
-  const dqMapPinned = route.tab === 'data-quality';
 
   const tabContent = (
     <>
@@ -1159,11 +1190,24 @@ function GiopPortalInner() {
       footerLink={{ href: 'http://localhost:8080', label: 'Legacy UI ↗' }}
     >
       <GiopWorkspaceLayout
-        sideOpen={dqMapPinned || sideMap.open}
+        sideOpen={sideMapVisible}
+        sideFloating={sideMapFloating}
         sidePanel={sideMapPanel}
+        sideWidth={sideMapDockWidth}
+        onSideWidthChange={setSideMapDockWidth}
+        isLightMode={isLightMode}
       >
         {tabContent}
       </GiopWorkspaceLayout>
+      {sideMapFloating && (
+        <GiopFloatingMapShell
+          rect={sideMapFloatRect}
+          onRectChange={setSideMapFloatRect}
+          isLightMode={isLightMode}
+        >
+          {sideMapPanel}
+        </GiopFloatingMapShell>
+      )}
       <EnhancedCopilotPanel
         isLightMode={isLightMode}
         portalContext={copilotContext}

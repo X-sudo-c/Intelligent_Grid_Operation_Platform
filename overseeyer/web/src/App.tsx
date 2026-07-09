@@ -988,6 +988,23 @@ export function App() {
                           .join(' · ')}
                       </p>
                     )}
+                    {mapTiles?.martin_cache && (
+                      <p className="text-xs text-slate-500 mt-1">
+                        nginx cache :{mapTiles.martin_cache.port ?? 3002}{' '}
+                        <span
+                          className={
+                            mapTiles.martin_cache.status === 'up'
+                              ? 'text-emerald-400'
+                              : 'text-amber-400'
+                          }
+                        >
+                          {mapTiles.martin_cache.status}
+                        </span>
+                        {mapTiles.martin_cache.status !== 'up' && mapTiles.martin_cache.hint
+                          ? ` — ${mapTiles.martin_cache.hint}`
+                          : ''}
+                      </p>
+                    )}
                     {mapTiles?.hint && <p className="text-xs text-amber-500 mt-1">{mapTiles.hint}</p>}
                     {mapTiles?.reason && mapTiles.status !== 'pass' && (
                       <p className="text-xs text-slate-500 mt-1">{mapTiles.reason}</p>
@@ -1010,6 +1027,23 @@ export function App() {
                         disabled={busyService?.id === 'martin' && busyService.action === 'restart'}
                         color="amber"
                         onClick={() => void serviceAction('martin', 'restart')}
+                        className="mt-3 ml-2 text-xs px-3 py-1.5"
+                      />
+                    )}
+                    {mapTiles?.martin_cache?.status !== 'up' && (
+                      <ActionButton
+                        label="Start nginx cache"
+                        loading={
+                          busyService?.id === 'martin-cache' &&
+                          (busyService.action === 'start' || busyService.action === 'restart')
+                        }
+                        loadingLabel="Starting cache…"
+                        disabled={
+                          busyService?.id === 'martin-cache' &&
+                          (busyService.action === 'start' || busyService.action === 'restart')
+                        }
+                        color="amber"
+                        onClick={() => void serviceAction('martin-cache', 'start')}
                         className="mt-3 ml-2 text-xs px-3 py-1.5"
                       />
                     )}

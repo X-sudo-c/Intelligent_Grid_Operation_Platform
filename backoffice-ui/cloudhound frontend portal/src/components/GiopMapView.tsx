@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react';
 import maplibregl from '../lib/maplibreSetup';
-import { MARTIN_URL, getAssetLocation, isUuidMrid, probeGisOverviewAvailable, probeUnpromotedGapAvailable, getReferenceMapConfig } from '../api/giop-api';
+import { MARTIN_URL, getAssetLocation, getTopologyImpact, isUuidMrid, probeGisOverviewAvailable, probeUnpromotedGapAvailable, getReferenceMapConfig, getReferenceMapConfigCached } from '../api/giop-api';
 import type { GiopReferenceMapLayerConfig } from '../api/giop-api';
 import type { GiopStagingAsset, GiopFieldTechnician, GiopWorkOrder, GiopTopologyPayload } from '../api/giop-api';
 import type { MapBbox } from '../hooks/useGiopGraphChunk';
@@ -15,6 +15,7 @@ import {
   applyStagingMapLayersPaint,
   stagingPointCirclePaint,
   workOrderPinCirclePaint,
+  fitMapBounds,
   impactNodeCirclePaint,
   focusIdentifyCirclePaint,
   focusTentativeCirclePaint,
@@ -29,12 +30,12 @@ import {
   MIN_MAP_ZOOM,
   NODE_DETAIL_ZOOM,
   readNetworkGeometryMode,
-  fitMapBounds,
   flyToLatLon,
   flyToNodeFocus,
   GIOP_MAP_LABEL_FONT_BOLD,
   TRANSFORMER_SYMBOL_LAYER_IDS,
 } from '../lib/giopMapLayers';
+import { readStoredMapCamera, writeStoredMapCamera } from '../lib/giopMapCameraStorage';
 import {
   applyReferenceMapConfig,
   refreshReferenceBboxLayers,
@@ -74,11 +75,47 @@ import {
   IMPORT_SEGMENT_LABEL_LAYER,
   IMPORT_SEGMENT_LINE_LAYER,
   IMPORT_SEGMENT_LINE_SOURCE,
+  IMPORT_SEGMENT_LINK_LAYER,
+  IMPORT_SEGMENT_LINK_SOURCE,
+  IMPORT_SEGMENT_PROPOSED_LABEL_LAYER,
+  IMPORT_SEGMENT_PROPOSED_LAYER,
+  IMPORT_SEGMENT_PROPOSED_SOURCE,
   importSegmentEndpointPaint,
   importSegmentLabelLayout,
   importSegmentLabelPaint,
   importSegmentLinePaint,
+  importSegmentProposedLabelLayout,
+  importSegmentProposedPaint,
+  importSegmentSuggestedLinkPaint,
 } from '../lib/giopImportSegmentHighlight';
+import {
+  MAP_MEASURE_LABEL_LAYER,
+  MAP_MEASURE_LABEL_SOURCE,
+  MAP_MEASURE_LINE_LAYER,
+  MAP_MEASURE_LINE_SOURCE,
+  MAP_MEASURE_POINT_HALO_LAYER,
+  MAP_MEASURE_POINT_LAYER,
+  MAP_MEASURE_POINT_SOURCE,
+  buildMeasureGeoJson,
+  formatMeasureMeters,
+  measureLabelLayout,
+  measureLabelPaint,
+  measureLinePaint,
+  measurePointHaloPaint,
+  measurePointPaint,
+  snapMeasurePoint,
+} from '../lib/giopMapMeasure';
+import {
+  CLEARANCE_RADIUS_PRESETS_M,
+  MAP_CLEARANCE_FILL_LAYER,
+  MAP_CLEARANCE_OUTLINE_LAYER,
+  MAP_CLEARANCE_SOURCE,
+  buildClearanceGeoJson,
+  clearanceAreaMeters2,
+  clearanceFillPaint,
+  clearanceOutlinePaint,
+  formatClearanceArea,
+} from '../lib/giopMapClearance';
 import {
   applyEcgBoundaryTheme,
   ecgBoundaryPopupHtml,
@@ -146,10 +183,43 @@ interface GiopMapViewProps {
 }
 
 const DEFAULT_CENTER: [number, number] = [-0.2941, 5.6812];
+const DEFAULT_ZOOM = 13;
+const DEFAULT_CAMERA = {
+  center: DEFAULT_CENTER,
+  zoom: DEFAULT_ZOOM,
+  bearing: 0,
+  pitch: 0,
+} as const;
 const EMPTY_FC = { type: 'FeatureCollection' as const, features: [] };
 
 /** Avoid re-probing Martin on every side-map remount (Show on map opens a fresh map). */
 let cachedGisOverviewAvailable: boolean | undefined;
+
+const BOUNDARY_VISIBILITY_STORAGE_KEY = 'giop.boundaryOverlayVisibility';
+
+function readStoredBoundaryVisibility(): Record<string, boolean> {
+  try {
+    const raw = sessionStorage.getItem(BOUNDARY_VISIBILITY_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out: Record<string, boolean> = {};
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof value === 'boolean') out[key] = value;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function writeStoredBoundaryVisibility(state: Record<string, boolean>): void {
+  try {
+    sessionStorage.setItem(BOUNDARY_VISIBILITY_STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
 
 const ZOOM_HINT_HIDE_MS = 1500;
 const ZOOM_HINT_INITIAL_MS = 2000;
@@ -279,6 +349,21 @@ function pinFocusIdentifyLayersToTop(map: maplibregl.Map): void {
   });
 }
 
+function pinMeasureLayersToTop(map: maplibregl.Map): void {
+  safeMapMutate(map, () => {
+    for (const id of [
+      MAP_CLEARANCE_FILL_LAYER,
+      MAP_CLEARANCE_OUTLINE_LAYER,
+      MAP_MEASURE_LINE_LAYER,
+      MAP_MEASURE_LABEL_LAYER,
+      MAP_MEASURE_POINT_HALO_LAYER,
+      MAP_MEASURE_POINT_LAYER,
+    ]) {
+      if (map.getLayer(id)) map.moveLayer(id);
+    }
+  });
+}
+
 function applyMapTheme(map: maplibregl.Map, isLightMode: boolean) {
   syncGiopMapTheme(map, isLightMode);
   applyEcgBoundaryTheme(map, isLightMode);
@@ -326,20 +411,33 @@ export function GiopMapView({
   );
   const [unpromotedGapAvailable, setUnpromotedGapAvailable] = useState(false);
   const [referenceMapConfig, setReferenceMapConfig] = useState<GiopReferenceMapLayerConfig[]>([]);
-  const [zoomHintVisible, setZoomHintVisible] = useState(false);
+  const referenceMapConfigRef = useRef(referenceMapConfig);  const [zoomHintVisible, setZoomHintVisible] = useState(false);
   const hideZoomHintTimerRef = useRef<number | undefined>(undefined);
   const [showCoverage, setShowCoverage] = useState(false);
-  const [boundaryVisibility, setBoundaryVisibility] = useState<Record<string, boolean>>({});
-  const boundaryVisibilityRef = useRef(boundaryVisibility);
+  const [boundaryVisibility, setBoundaryVisibility] = useState<Record<string, boolean>>(
+    readStoredBoundaryVisibility,
+  );  const boundaryVisibilityRef = useRef(boundaryVisibility);
   const boundaryPopupRef = useRef<maplibregl.Popup | null>(null);
   const identifyPopupRef = useRef<maplibregl.Popup | null>(null);
   const [showWorkOrdersLayer, setShowWorkOrdersLayer] = useState(true);
-  const [territoryActive, setTerritoryActive] = useState(false);
+  const showWorkOrdersLayerRef = useRef(showWorkOrdersLayer);  const [territoryActive, setTerritoryActive] = useState(false);
   const territoryActiveRef = useRef(false);
+  const mapMeasureActiveRef = useRef(false);
+  const mapTraceActiveRef = useRef(false);
+  const mapTraceSeqRef = useRef(0);
+  const [mapTraceLoading, setMapTraceLoading] = useState(false);
+  const measureDragRef = useRef<{
+    index: number;
+    startX: number;
+    startY: number;
+    moved: boolean;
+  } | null>(null);
+  const measureSkipClickRef = useRef(false);
+  const [measureDragging, setMeasureDragging] = useState(false);
   const handledCameraRequestIdRef = useRef(0);
   const handledViewportCommandIdRef = useRef(0);
   const stagingAssetsRef = useRef(stagingAssets);
-  const { focusCameraRequest, clearFocusCamera, mapViewportCommand, clearMapViewportCommand, territoryHighlight, clearTerritoryHighlight, repairPreviewLayers, duplicateClusterOverlay, importSegmentHighlight, networkGeometryMode, setNetworkGeometryMode, focusOnMap, queueMapViewportCommand, registerMapViewportReader } =
+  const { focusCameraRequest, clearFocusCamera, mapViewportCommand, clearMapViewportCommand, territoryHighlight, clearTerritoryHighlight, repairPreviewLayers, duplicateClusterOverlay, importSegmentHighlight, networkGeometryMode, setNetworkGeometryMode, focusOnMap, queueMapViewportCommand, registerMapViewportReader, mapMeasureActive, measurePoints, addMeasurePoint, updateMeasurePoint, removeMeasurePoint, clearMeasure, measureTotalMeters, mapClearanceActive, clearanceRadiusM, setClearanceRadiusM, mapTraceActive, setMapTraceActive, mapTraceStatus, setMapTraceStatus, setImpactOverlay, clearImpactOverlay } =
     useGiopMapOverlay();
 
   const { placeCatalog, opsCatalog, placesReady } = useGiopMapSearchCatalog({
@@ -351,12 +449,30 @@ export function GiopMapView({
   stagingAssetsRef.current = stagingAssets;
 
   territoryActiveRef.current = territoryActive;
+  mapMeasureActiveRef.current = mapMeasureActive;
+  mapTraceActiveRef.current = mapTraceActive;
+  showWorkOrdersLayerRef.current = showWorkOrdersLayer;
   boundaryVisibilityRef.current = boundaryVisibility;
+  referenceMapConfigRef.current = referenceMapConfig;
+  useEffect(() => {
+    writeStoredBoundaryVisibility(boundaryVisibility);
+  }, [boundaryVisibility]);
 
-  const boundaryOverlayProducts = useMemo(
-    () => listBoundaryOverlayProducts(referenceMapConfig),
-    [referenceMapConfig],
-  );
+  const boundaryOverlayProducts = useMemo(() => {
+    const fromCatalog = listBoundaryOverlayProducts(referenceMapConfig);
+    if (fromCatalog.some((p) => p.slug === 'ecg-admin-boundaries')) {
+      return fromCatalog;
+    }
+    // Keep the built-in ECG toggle available before map-config finishes loading.
+    return [
+      {
+        slug: 'ecg-admin-boundaries',
+        display_name: 'ECG Admin Boundaries',
+        hint: 'Regions below zoom 10, districts at/above',
+      },
+      ...fromCatalog,
+    ];
+  }, [referenceMapConfig]);
 
   const anyBoundaryVisible = useMemo(
     () => boundaryOverlayProducts.some((p) => boundaryVisibility[p.slug]),
@@ -411,6 +527,54 @@ export function GiopMapView({
   ) => {
     const mrid = feature?.properties?.mrid as string | undefined;
     if (!mrid) return;
+
+    if (mapTraceActiveRef.current) {
+      const seq = ++mapTraceSeqRef.current;
+      setMapTraceLoading(true);
+      setMapTraceStatus(`Tracing downstream from ${mrid.slice(0, 8)}…`);
+      void getTopologyImpact(mrid)
+        .then((payload) => {
+          if (seq !== mapTraceSeqRef.current || !mapTraceActiveRef.current) return;
+          setImpactOverlay(payload);
+          const nodeCount = payload.metrics?.downstream_nodes ?? payload.nodes.length;
+          const edgeCount = payload.metrics?.edge_count ?? payload.edges.length;
+          const truncated = payload.metrics?.truncated ? ' · truncated' : '';
+          setMapTraceStatus(
+            `Downstream: ${nodeCount} nodes · ${edgeCount} lines${truncated}`,
+          );
+
+          const coords: [number, number][] = [];
+          for (const node of payload.nodes) {
+            const lon =
+              (node as { longitude?: number }).longitude ?? (node as { lon?: number }).lon;
+            const lat =
+              (node as { latitude?: number }).latitude ?? (node as { lat?: number }).lat;
+            if (lon != null && lat != null) coords.push([lon, lat]);
+          }
+          for (const edge of payload.edges) {
+            if (edge.coordinates) {
+              for (const c of edge.coordinates) coords.push(c);
+            }
+          }
+          if (coords.length > 0) {
+            const west = Math.min(...coords.map((c) => c[0]));
+            const east = Math.max(...coords.map((c) => c[0]));
+            const south = Math.min(...coords.map((c) => c[1]));
+            const north = Math.max(...coords.map((c) => c[1]));
+            fitMapBounds(map, { west, south, east, north }, { padding: 56, maxZoom: 17, duration: 900 });
+          }
+        })
+        .catch((err) => {
+          if (seq !== mapTraceSeqRef.current || !mapTraceActiveRef.current) return;
+          clearImpactOverlay();
+          setMapTraceStatus(err instanceof Error ? err.message : 'Trace failed');
+        })
+        .finally(() => {
+          if (seq === mapTraceSeqRef.current) setMapTraceLoading(false);
+        });
+      return;
+    }
+
     let coordinates: [number, number] | undefined;
     const geom = feature?.geometry;
     if (geom && geom.type === 'Point' && Array.isArray(geom.coordinates)) {
@@ -446,9 +610,15 @@ export function GiopMapView({
         giopLog.map.warn('GIS overview probe failed; keeping overview layers enabled');
       })
       .finally(() => window.clearTimeout(timer));
+    const cachedMapConfig = getReferenceMapConfigCached();
+    if (cachedMapConfig && cachedMapConfig.length > 0) {
+      setReferenceMapConfig(cachedMapConfig);
+    }
     void getReferenceMapConfig()
       .then(setReferenceMapConfig)
-      .catch(() => setReferenceMapConfig([]));
+      .catch(() => {
+        if (!cachedMapConfig?.length) setReferenceMapConfig([]);
+      });
     void probeUnpromotedGapAvailable(MARTIN_URL, controller.signal)
       .then(setUnpromotedGapAvailable)
       .catch(() => setUnpromotedGapAvailable(false));
@@ -489,14 +659,21 @@ export function GiopMapView({
     if (!host) return;
 
     const includeGisOverview = cachedGisOverviewAvailable ?? true;
+    const initialCamera = readStoredMapCamera(DEFAULT_CAMERA);
 
     const map = new maplibregl.Map({
       container: containerRef.current,
       style: buildGiopMapStyle(MARTIN_URL, light, { includeGisOverview }),
-      center: DEFAULT_CENTER,
-      zoom: 13,
+      center: initialCamera.center,
+      zoom: initialCamera.zoom,
+      bearing: initialCamera.bearing ?? 0,
+      pitch: initialCamera.pitch ?? 0,
       minZoom: MIN_MAP_ZOOM,
       maxZoom: 20,
+      // Snappier pan-back after detail tiles load (does not change zoom look).
+      maxTileCacheZoomLevels: 12,
+      fadeDuration: 0,
+      antialias: false,
     });
 
     map.addControl(new maplibregl.NavigationControl(), 'top-right');
@@ -504,6 +681,15 @@ export function GiopMapView({
 
     const syncMapZoom = () => {
       setMapZoom(Number(map.getZoom().toFixed(1)));
+    };
+    const persistCamera = () => {
+      const c = map.getCenter();
+      writeStoredMapCamera({
+        center: [c.lng, c.lat],
+        zoom: map.getZoom(),
+        bearing: map.getBearing(),
+        pitch: map.getPitch(),
+      });
     };
     const revealZoomHint = () => {
       window.clearTimeout(hideZoomHintTimerRef.current);
@@ -526,6 +712,7 @@ export function GiopMapView({
     map.on('moveend', () => {
       syncMovingState();
       syncMapZoom();
+      persistCamera();
     });
     map.on('zoomstart', () => {
       syncMovingState();
@@ -535,8 +722,9 @@ export function GiopMapView({
       syncMovingState();
       syncMapZoom();
       scheduleHideZoomHint();
+      persistCamera();
     });
-    map.on('idle', markMapReady);
+    // Interactive on style load — do not wait for full tile idle.
 
     const handleNodeFeatureClickInit = (
       feature: maplibregl.MapGeoJSONFeature | undefined,
@@ -590,7 +778,12 @@ export function GiopMapView({
           },
         );
         bindMartinClicks();
-        detachHover = attachGiopMapHover(map, host, () => isLightModeRef.current);
+        detachHover = attachGiopMapHover(
+          map,
+          host,
+          () => isLightModeRef.current,
+          () => mapMeasureActiveRef.current || mapTraceActiveRef.current,
+        );
         detachPulse = attachGiopMapPulseCanvasOverlay(map);
         pinTransformerLayersAboveNodes(map);
         resizeMap();
@@ -603,7 +796,13 @@ export function GiopMapView({
     });
 
     map.on('error', (event) => {
-      giopLog.map.error('MapLibre error', event.error?.message ?? event);
+      const message = event.error?.message ?? String(event.error ?? event);
+      // Martin plain-text zoom 404s used to parse as PBF ("Unimplemented type: N").
+      // nginx now returns empty 204s; ignore any leftover browser-cached bodies.
+      if (typeof message === 'string' && message.includes('Unimplemented type:')) {
+        return;
+      }
+      giopLog.map.error('MapLibre error', message);
     });
 
     map.on('styleimagemissing', (event) => {
@@ -724,6 +923,8 @@ export function GiopMapView({
       const layer = martinLayerPath(id);
       src.setTiles([`${MARTIN_URL}/${layer}/{z}/{x}/{y}?v=${refreshToken}`]);
     }
+    // Tile URL bust can leave overlay layout visibility out of sync — re-assert toggles.
+    applyAllBoundaryVisibility(map, boundaryVisibilityRef.current, referenceMapConfigRef.current);
     map.triggerRepaint();
   }, [refreshToken]);
 
@@ -731,12 +932,15 @@ export function GiopMapView({
     if (refreshToken === 0) return;
     void getReferenceMapConfig()
       .then(setReferenceMapConfig)
-      .catch(() => setReferenceMapConfig([]));
+      .catch((err) => {
+        // Keep the last good catalog — clearing it removes Overlays toggles until a hard reload.
+        giopLog.map.warn('reference map-config refresh failed; keeping previous', err);
+      });
   }, [refreshToken]);
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || mapBusy || referenceMapConfig.length === 0) return;
+    if (!map || !mapReady || referenceMapConfig.length === 0) return;
 
     const apply = () => {
       void applyReferenceMapConfig(map, referenceMapConfig, isLightModeRef.current)
@@ -750,20 +954,20 @@ export function GiopMapView({
 
     if (map.isStyleLoaded()) apply();
     else whenMapCanAddLayers(map, apply);
-  }, [referenceMapConfig, mapBusy, isLightMode]);
+  }, [referenceMapConfig, mapReady, isLightMode]);
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || mapBusy) return;
+    if (!map || !mapReady) return;
 
     const apply = () => applyAllBoundaryVisibility(map, boundaryVisibility, referenceMapConfig);
     whenMapCanAddLayers(map, apply);
     if (!anyBoundaryVisible) boundaryPopupRef.current?.remove();
-  }, [boundaryVisibility, referenceMapConfig, mapBusy, anyBoundaryVisible]);
+  }, [boundaryVisibility, referenceMapConfig, mapReady, anyBoundaryVisible]);
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || mapBusy) return;
+    if (!map || !mapReady) return;
     if (!referenceMapConfig.some((c) => c.render_mode === 'geojson_bbox')) return;
 
     let debounceTimer: number | undefined;
@@ -781,9 +985,13 @@ export function GiopMapView({
             north: bounds.getNorth(),
           },
           isLightModeRef.current,
-        ).catch((err) => {
-          giopLog.map.warn('reference bbox refresh failed', err);
-        });
+        )
+          .then(() => {
+            applyAllBoundaryVisibility(map, boundaryVisibilityRef.current, referenceMapConfig);
+          })
+          .catch((err) => {
+            giopLog.map.warn('reference bbox refresh failed', err);
+          });
       }, 300);
     };
 
@@ -795,7 +1003,7 @@ export function GiopMapView({
       map.off('moveend', schedule);
       map.off('zoomend', schedule);
     };
-  }, [referenceMapConfig, mapBusy, isLightMode]);
+  }, [referenceMapConfig, mapReady, isLightMode]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -1044,7 +1252,12 @@ export function GiopMapView({
     try {
       map.resize();
       if (cmd.type === 'fit_bounds' && cmd.bbox) {
-        fitMapBounds(map, cmd.bbox, { maxZoom: cmd.max_zoom ?? 14 });
+        fitMapBounds(map, cmd.bbox, {
+          maxZoom: cmd.max_zoom ?? 14,
+          padding: cmd.padding,
+          duration: cmd.duration,
+          minSpan: cmd.min_span,
+        });
       } else if (cmd.type === 'fly_to' && cmd.center) {
         flyToLatLon(
           map,
@@ -1061,29 +1274,34 @@ export function GiopMapView({
     }
   }, [mapViewportCommand, clearMapViewportCommand, mapReady]);
 
-  // Work-order dispatch pins (FR-012 map overlay).
+  // Work-order dispatch pins (FR-012) — data sync only (not on every visibility toggle).
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || mapBusy) return;
+    if (!map || !mapReady) return;
 
     const geojson = {
       type: 'FeatureCollection' as const,
-      features: workOrders
-        .filter((wo) => wo.longitude != null && wo.latitude != null)
-        .map((wo) => ({
-          type: 'Feature' as const,
-          properties: {
-            mrid: wo.asset_mrid ?? wo.id,
-            reference: wo.reference,
-            summary: wo.summary,
-            status: wo.status,
-            work_type: wo.work_type,
+      features: workOrders.flatMap((wo) => {
+        const lon = Number(wo.longitude);
+        const lat = Number(wo.latitude);
+        if (!Number.isFinite(lon) || !Number.isFinite(lat)) return [];
+        return [
+          {
+            type: 'Feature' as const,
+            properties: {
+              mrid: wo.asset_mrid ?? wo.id,
+              reference: wo.reference,
+              summary: wo.summary,
+              status: wo.status,
+              work_type: wo.work_type,
+            },
+            geometry: {
+              type: 'Point' as const,
+              coordinates: [lon, lat] as [number, number],
+            },
           },
-          geometry: {
-            type: 'Point' as const,
-            coordinates: [wo.longitude!, wo.latitude!] as [number, number],
-          },
-        })),
+        ];
+      }),
     };
 
     const sourceId = 'work-orders-overlay';
@@ -1101,6 +1319,9 @@ export function GiopMapView({
           id: layerId,
           type: 'circle',
           source: sourceId,
+          layout: {
+            visibility: showWorkOrdersLayerRef.current ? 'visible' : 'none',
+          },
           paint: workOrderPinCirclePaint(),
         });
         map.on('click', layerId, (e) => {
@@ -1112,23 +1333,25 @@ export function GiopMapView({
             onNodeClickRef.current?.(assetMrid, coords);
           }
         });
-      } else {
-        const pinPaint = workOrderPinCirclePaint();
-        for (const key of Object.keys(pinPaint) as Array<keyof typeof pinPaint>) {
-          map.setPaintProperty(layerId, key, pinPaint[key]);
-        }
       }
-
-      const visibility = showWorkOrdersLayer ? 'visible' : 'none';
-      if (map.getLayer(layerId)) map.setLayoutProperty(layerId, 'visibility', visibility);
     };
 
-    if (map.isStyleLoaded()) {
-      ensureLayers();
-    } else {
-      whenMapCanAddLayers(map, ensureLayers);
-    }
-  }, [workOrders, mapBusy, showWorkOrdersLayer]);
+    if (map.isStyleLoaded()) ensureLayers();
+    else whenMapCanAddLayers(map, ensureLayers);
+  }, [workOrders, mapReady]);
+
+  // Visibility-only — avoid setData/setPaint on toggle (those force a heavy style rebuild).
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    const layerId = 'work-order-pins';
+    const apply = () => {
+      if (!map.getLayer(layerId)) return;
+      map.setLayoutProperty(layerId, 'visibility', showWorkOrdersLayer ? 'visible' : 'none');
+    };
+    if (map.isStyleLoaded()) apply();
+    else whenMapCanAddLayers(map, apply);
+  }, [showWorkOrdersLayer, mapReady]);
 
   // Outage downstream impact highlight (FR-016).
   useEffect(() => {
@@ -1275,18 +1498,28 @@ export function GiopMapView({
       importSegmentHighlight && networkGeometryMode !== 'master' ? importSegmentHighlight : null;
     const line = activeHighlight?.geojson.line ?? EMPTY_FC;
     const endpoints = activeHighlight?.geojson.endpoints ?? EMPTY_FC;
+    const proposedAssets = activeHighlight?.geojson.proposed_assets ?? EMPTY_FC;
+    const suggestedLinks = activeHighlight?.geojson.suggested_links ?? EMPTY_FC;
 
     const applyImportHighlight = () => {
       safeMapMutate(map, () => {
         if (!activeHighlight) {
           for (const layerId of [
+            IMPORT_SEGMENT_PROPOSED_LABEL_LAYER,
+            IMPORT_SEGMENT_PROPOSED_LAYER,
+            IMPORT_SEGMENT_LINK_LAYER,
             IMPORT_SEGMENT_LABEL_LAYER,
             IMPORT_SEGMENT_ENDPOINT_LAYER,
             IMPORT_SEGMENT_LINE_LAYER,
           ]) {
             if (map.getLayer(layerId)) map.removeLayer(layerId);
           }
-          for (const sourceId of [IMPORT_SEGMENT_ENDPOINT_SOURCE, IMPORT_SEGMENT_LINE_SOURCE]) {
+          for (const sourceId of [
+            IMPORT_SEGMENT_LINK_SOURCE,
+            IMPORT_SEGMENT_PROPOSED_SOURCE,
+            IMPORT_SEGMENT_ENDPOINT_SOURCE,
+            IMPORT_SEGMENT_LINE_SOURCE,
+          ]) {
             if (map.getSource(sourceId)) map.removeSource(sourceId);
           }
           return;
@@ -1352,6 +1585,63 @@ export function GiopMapView({
           }
         }
 
+        if (map.getSource(IMPORT_SEGMENT_LINK_SOURCE)) {
+          (map.getSource(IMPORT_SEGMENT_LINK_SOURCE) as maplibregl.GeoJSONSource).setData(suggestedLinks);
+        } else if (suggestedLinks.features.length > 0) {
+          map.addSource(IMPORT_SEGMENT_LINK_SOURCE, { type: 'geojson', data: suggestedLinks });
+        }
+
+        if (suggestedLinks.features.length > 0 && map.getSource(IMPORT_SEGMENT_LINK_SOURCE)) {
+          if (!map.getLayer(IMPORT_SEGMENT_LINK_LAYER)) {
+            map.addLayer({
+              id: IMPORT_SEGMENT_LINK_LAYER,
+              type: 'line',
+              source: IMPORT_SEGMENT_LINK_SOURCE,
+              layout: { 'line-cap': 'round', 'line-join': 'round' },
+              paint: importSegmentSuggestedLinkPaint(isLightMode),
+            });
+          } else {
+            const linkPaint = importSegmentSuggestedLinkPaint(isLightMode);
+            for (const key of Object.keys(linkPaint) as Array<keyof typeof linkPaint>) {
+              map.setPaintProperty(IMPORT_SEGMENT_LINK_LAYER, key, linkPaint[key]);
+            }
+          }
+        }
+
+        if (map.getSource(IMPORT_SEGMENT_PROPOSED_SOURCE)) {
+          (map.getSource(IMPORT_SEGMENT_PROPOSED_SOURCE) as maplibregl.GeoJSONSource).setData(
+            proposedAssets,
+          );
+        } else if (proposedAssets.features.length > 0) {
+          map.addSource(IMPORT_SEGMENT_PROPOSED_SOURCE, { type: 'geojson', data: proposedAssets });
+        }
+
+        if (proposedAssets.features.length > 0 && map.getSource(IMPORT_SEGMENT_PROPOSED_SOURCE)) {
+          if (!map.getLayer(IMPORT_SEGMENT_PROPOSED_LAYER)) {
+            map.addLayer({
+              id: IMPORT_SEGMENT_PROPOSED_LAYER,
+              type: 'circle',
+              source: IMPORT_SEGMENT_PROPOSED_SOURCE,
+              paint: importSegmentProposedPaint(isLightMode),
+            });
+          } else {
+            const proposedPaint = importSegmentProposedPaint(isLightMode);
+            for (const key of Object.keys(proposedPaint) as Array<keyof typeof proposedPaint>) {
+              map.setPaintProperty(IMPORT_SEGMENT_PROPOSED_LAYER, key, proposedPaint[key]);
+            }
+          }
+
+          if (!map.getLayer(IMPORT_SEGMENT_PROPOSED_LABEL_LAYER)) {
+            map.addLayer({
+              id: IMPORT_SEGMENT_PROPOSED_LABEL_LAYER,
+              type: 'symbol',
+              source: IMPORT_SEGMENT_PROPOSED_SOURCE,
+              layout: importSegmentProposedLabelLayout(),
+              paint: importSegmentLabelPaint(isLightMode),
+            });
+          }
+        }
+
         pinFocusIdentifyLayersToTop(map);
       });
     };
@@ -1362,6 +1652,321 @@ export function GiopMapView({
       whenMapCanAddLayers(map, applyImportHighlight);
     }
   }, [importSegmentHighlight, isLightMode, mapReady, networkGeometryMode]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady || !mapMeasureActive) return;
+
+    const POINT_HIT_PAD = 12;
+    const SNAP_PAD_PX = 10;
+    const DRAG_THRESHOLD_PX = 3;
+
+    const setMeasureCursor = (cursor: string) => {
+      if (mapMeasureActiveRef.current) {
+        map.getCanvas().style.cursor = cursor;
+      }
+    };
+
+    const hitMeasurePointIndex = (point: { x: number; y: number }): number | null => {
+      if (!map.getLayer(MAP_MEASURE_POINT_LAYER)) return null;
+      const hits = map.queryRenderedFeatures(
+        [
+          [point.x - POINT_HIT_PAD, point.y - POINT_HIT_PAD],
+          [point.x + POINT_HIT_PAD, point.y + POINT_HIT_PAD],
+        ],
+        { layers: [MAP_MEASURE_POINT_LAYER, MAP_MEASURE_POINT_HALO_LAYER].filter((id) => map.getLayer(id)) },
+      );
+      for (const feature of hits) {
+        const rawIndex = feature.properties?.index;
+        const index = typeof rawIndex === 'number' ? rawIndex : Number(rawIndex);
+        if (Number.isFinite(index)) return index;
+      }
+      return null;
+    };
+
+    const resolveCoord = (point: { x: number; y: number }): [number, number] => {
+      const snap = snapMeasurePoint(map, point, SNAP_PAD_PX);
+      return snap.coord;
+    };
+
+    const onClick = (event: maplibregl.MapMouseEvent) => {
+      if (!mapMeasureActiveRef.current) return;
+      if (measureSkipClickRef.current) {
+        measureSkipClickRef.current = false;
+        return;
+      }
+
+      // Left-click on an existing vertex is for drag only — do not add a duplicate.
+      if (hitMeasurePointIndex(event.point) != null) return;
+
+      const [lon, lat] = resolveCoord(event.point);
+      addMeasurePoint(lon, lat);
+    };
+
+    const onContextMenu = (event: maplibregl.MapMouseEvent) => {
+      if (!mapMeasureActiveRef.current) return;
+      event.preventDefault();
+      const hitIndex = hitMeasurePointIndex(event.point);
+      if (hitIndex != null) {
+        removeMeasurePoint(hitIndex);
+      }
+    };
+
+    const onPointMouseDown = (event: maplibregl.MapLayerMouseEvent) => {
+      if (!mapMeasureActiveRef.current) return;
+      // Only left-button starts a drag; right-click is handled by contextmenu.
+      if (event.originalEvent.button !== 0) return;
+      const rawIndex = event.features?.[0]?.properties?.index;
+      const index = typeof rawIndex === 'number' ? rawIndex : Number(rawIndex);
+      if (!Number.isFinite(index)) return;
+      event.preventDefault();
+      measureDragRef.current = {
+        index,
+        startX: event.point.x,
+        startY: event.point.y,
+        moved: false,
+      };
+      map.dragPan.disable();
+    };
+
+    const onMouseMove = (event: maplibregl.MapMouseEvent) => {
+      const drag = measureDragRef.current;
+      if (!drag) return;
+      const dx = event.point.x - drag.startX;
+      const dy = event.point.y - drag.startY;
+      if (!drag.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
+      if (!drag.moved) {
+        drag.moved = true;
+        measureSkipClickRef.current = true;
+        setMeasureDragging(true);
+        setMeasureCursor('grabbing');
+      }
+      const [lon, lat] = resolveCoord(event.point);
+      updateMeasurePoint(drag.index, lon, lat);
+    };
+
+    const endDrag = () => {
+      const drag = measureDragRef.current;
+      if (!drag) return;
+      measureDragRef.current = null;
+      map.dragPan.enable();
+      if (drag.moved) {
+        setMeasureDragging(false);
+      }
+      setMeasureCursor('crosshair');
+    };
+
+    const onPointEnter = () => {
+      if (!mapMeasureActiveRef.current || measureDragRef.current?.moved) return;
+      setMeasureCursor('grab');
+    };
+
+    const onPointLeave = () => {
+      if (!mapMeasureActiveRef.current || measureDragRef.current) return;
+      setMeasureCursor('crosshair');
+    };
+
+    setMeasureCursor('crosshair');
+    map.on('click', onClick);
+    map.on('contextmenu', onContextMenu);
+    map.on('mousemove', onMouseMove);
+    map.on('mouseup', endDrag);
+    map.on('mouseleave', endDrag);
+    map.on('mousedown', MAP_MEASURE_POINT_LAYER, onPointMouseDown);
+    map.on('mousedown', MAP_MEASURE_POINT_HALO_LAYER, onPointMouseDown);
+    map.on('mouseenter', MAP_MEASURE_POINT_LAYER, onPointEnter);
+    map.on('mouseleave', MAP_MEASURE_POINT_LAYER, onPointLeave);
+
+    return () => {
+      map.off('click', onClick);
+      map.off('contextmenu', onContextMenu);
+      map.off('mousemove', onMouseMove);
+      map.off('mouseup', endDrag);
+      map.off('mouseleave', endDrag);
+      map.off('mousedown', MAP_MEASURE_POINT_LAYER, onPointMouseDown);
+      map.off('mousedown', MAP_MEASURE_POINT_HALO_LAYER, onPointMouseDown);
+      map.off('mouseenter', MAP_MEASURE_POINT_LAYER, onPointEnter);
+      map.off('mouseleave', MAP_MEASURE_POINT_LAYER, onPointLeave);
+      measureDragRef.current = null;
+      setMeasureDragging(false);
+      map.dragPan.enable();
+      if (!mapMeasureActiveRef.current) {
+        map.getCanvas().style.cursor = '';
+      }
+    };
+  }, [addMeasurePoint, mapMeasureActive, mapReady, removeMeasurePoint, updateMeasurePoint]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+
+    const { line, points, labels } = buildMeasureGeoJson(measurePoints);
+    const showMeasure = mapMeasureActive && measurePoints.length > 0;
+
+    const applyMeasureOverlay = () => {
+      safeMapMutate(map, () => {
+        if (!showMeasure) {
+          if (map.getLayer(MAP_MEASURE_LABEL_LAYER)) map.removeLayer(MAP_MEASURE_LABEL_LAYER);
+          if (map.getLayer(MAP_MEASURE_POINT_LAYER)) map.removeLayer(MAP_MEASURE_POINT_LAYER);
+          if (map.getLayer(MAP_MEASURE_POINT_HALO_LAYER)) map.removeLayer(MAP_MEASURE_POINT_HALO_LAYER);
+          if (map.getLayer(MAP_MEASURE_LINE_LAYER)) map.removeLayer(MAP_MEASURE_LINE_LAYER);
+          if (map.getSource(MAP_MEASURE_LABEL_SOURCE)) map.removeSource(MAP_MEASURE_LABEL_SOURCE);
+          if (map.getSource(MAP_MEASURE_POINT_SOURCE)) map.removeSource(MAP_MEASURE_POINT_SOURCE);
+          if (map.getSource(MAP_MEASURE_LINE_SOURCE)) map.removeSource(MAP_MEASURE_LINE_SOURCE);
+          return;
+        }
+
+        if (map.getSource(MAP_MEASURE_LINE_SOURCE)) {
+          (map.getSource(MAP_MEASURE_LINE_SOURCE) as maplibregl.GeoJSONSource).setData(line);
+        } else if (line.features.length > 0) {
+          map.addSource(MAP_MEASURE_LINE_SOURCE, { type: 'geojson', data: line });
+        }
+
+        if (line.features.length > 0 && map.getSource(MAP_MEASURE_LINE_SOURCE) && !map.getLayer(MAP_MEASURE_LINE_LAYER)) {
+          map.addLayer({
+            id: MAP_MEASURE_LINE_LAYER,
+            type: 'line',
+            source: MAP_MEASURE_LINE_SOURCE,
+            layout: { 'line-cap': 'round', 'line-join': 'round' },
+            paint: measureLinePaint(isLightMode),
+          });
+        } else if (map.getLayer(MAP_MEASURE_LINE_LAYER)) {
+          const linePaint = measureLinePaint(isLightMode);
+          for (const key of Object.keys(linePaint) as Array<keyof typeof linePaint>) {
+            map.setPaintProperty(MAP_MEASURE_LINE_LAYER, key, linePaint[key]);
+          }
+        }
+
+        if (map.getSource(MAP_MEASURE_POINT_SOURCE)) {
+          (map.getSource(MAP_MEASURE_POINT_SOURCE) as maplibregl.GeoJSONSource).setData(points);
+        } else if (points.features.length > 0) {
+          map.addSource(MAP_MEASURE_POINT_SOURCE, { type: 'geojson', data: points });
+        }
+
+        if (points.features.length > 0 && map.getSource(MAP_MEASURE_POINT_SOURCE) && !map.getLayer(MAP_MEASURE_POINT_HALO_LAYER)) {
+          map.addLayer({
+            id: MAP_MEASURE_POINT_HALO_LAYER,
+            type: 'circle',
+            source: MAP_MEASURE_POINT_SOURCE,
+            paint: measurePointHaloPaint(isLightMode),
+          });
+        } else if (map.getLayer(MAP_MEASURE_POINT_HALO_LAYER)) {
+          const haloPaint = measurePointHaloPaint(isLightMode);
+          for (const key of Object.keys(haloPaint) as Array<keyof typeof haloPaint>) {
+            map.setPaintProperty(MAP_MEASURE_POINT_HALO_LAYER, key, haloPaint[key]);
+          }
+        }
+
+        if (points.features.length > 0 && map.getSource(MAP_MEASURE_POINT_SOURCE) && !map.getLayer(MAP_MEASURE_POINT_LAYER)) {
+          map.addLayer({
+            id: MAP_MEASURE_POINT_LAYER,
+            type: 'circle',
+            source: MAP_MEASURE_POINT_SOURCE,
+            paint: measurePointPaint(isLightMode),
+          });
+        } else if (map.getLayer(MAP_MEASURE_POINT_LAYER)) {
+          const pointPaint = measurePointPaint(isLightMode);
+          for (const key of Object.keys(pointPaint) as Array<keyof typeof pointPaint>) {
+            map.setPaintProperty(MAP_MEASURE_POINT_LAYER, key, pointPaint[key]);
+          }
+        }
+
+        if (map.getSource(MAP_MEASURE_LABEL_SOURCE)) {
+          (map.getSource(MAP_MEASURE_LABEL_SOURCE) as maplibregl.GeoJSONSource).setData(labels);
+        } else if (labels.features.length > 0) {
+          map.addSource(MAP_MEASURE_LABEL_SOURCE, { type: 'geojson', data: labels });
+        }
+
+        if (labels.features.length > 0 && map.getSource(MAP_MEASURE_LABEL_SOURCE) && !map.getLayer(MAP_MEASURE_LABEL_LAYER)) {
+          map.addLayer({
+            id: MAP_MEASURE_LABEL_LAYER,
+            type: 'symbol',
+            source: MAP_MEASURE_LABEL_SOURCE,
+            layout: measureLabelLayout(),
+            paint: measureLabelPaint(isLightMode),
+          });
+        } else if (map.getLayer(MAP_MEASURE_LABEL_LAYER)) {
+          const labelPaint = measureLabelPaint(isLightMode);
+          for (const key of Object.keys(labelPaint) as Array<keyof typeof labelPaint>) {
+            map.setPaintProperty(MAP_MEASURE_LABEL_LAYER, key, labelPaint[key]);
+          }
+        }
+
+        pinFocusIdentifyLayersToTop(map);
+        pinMeasureLayersToTop(map);
+      });
+    };
+
+    if (map.isStyleLoaded()) {
+      applyMeasureOverlay();
+    } else {
+      whenMapCanAddLayers(map, applyMeasureOverlay);
+    }
+  }, [isLightMode, mapMeasureActive, mapReady, measurePoints]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+
+    const showClearance = mapClearanceActive && measurePoints.length > 0;
+    const clearance = showClearance
+      ? buildClearanceGeoJson(measurePoints, clearanceRadiusM)
+      : { type: 'FeatureCollection' as const, features: [] };
+
+    const applyClearanceOverlay = () => {
+      safeMapMutate(map, () => {
+        if (!showClearance || clearance.features.length === 0) {
+          if (map.getLayer(MAP_CLEARANCE_OUTLINE_LAYER)) map.removeLayer(MAP_CLEARANCE_OUTLINE_LAYER);
+          if (map.getLayer(MAP_CLEARANCE_FILL_LAYER)) map.removeLayer(MAP_CLEARANCE_FILL_LAYER);
+          if (map.getSource(MAP_CLEARANCE_SOURCE)) map.removeSource(MAP_CLEARANCE_SOURCE);
+          return;
+        }
+
+        if (map.getSource(MAP_CLEARANCE_SOURCE)) {
+          (map.getSource(MAP_CLEARANCE_SOURCE) as maplibregl.GeoJSONSource).setData(clearance);
+        } else {
+          map.addSource(MAP_CLEARANCE_SOURCE, { type: 'geojson', data: clearance });
+        }
+
+        if (!map.getLayer(MAP_CLEARANCE_FILL_LAYER)) {
+          map.addLayer({
+            id: MAP_CLEARANCE_FILL_LAYER,
+            type: 'fill',
+            source: MAP_CLEARANCE_SOURCE,
+            paint: clearanceFillPaint(isLightMode),
+          });
+        } else {
+          const fillPaint = clearanceFillPaint(isLightMode);
+          for (const key of Object.keys(fillPaint) as Array<keyof typeof fillPaint>) {
+            map.setPaintProperty(MAP_CLEARANCE_FILL_LAYER, key, fillPaint[key]);
+          }
+        }
+
+        if (!map.getLayer(MAP_CLEARANCE_OUTLINE_LAYER)) {
+          map.addLayer({
+            id: MAP_CLEARANCE_OUTLINE_LAYER,
+            type: 'line',
+            source: MAP_CLEARANCE_SOURCE,
+            layout: { 'line-cap': 'round', 'line-join': 'round' },
+            paint: clearanceOutlinePaint(isLightMode),
+          });
+        } else {
+          const outlinePaint = clearanceOutlinePaint(isLightMode);
+          for (const key of Object.keys(outlinePaint) as Array<keyof typeof outlinePaint>) {
+            map.setPaintProperty(MAP_CLEARANCE_OUTLINE_LAYER, key, outlinePaint[key]);
+          }
+        }
+
+        pinMeasureLayersToTop(map);
+      });
+    };
+
+    if (map.isStyleLoaded()) {
+      applyClearanceOverlay();
+    } else {
+      whenMapCanAddLayers(map, applyClearanceOverlay);
+    }
+  }, [clearanceRadiusM, isLightMode, mapClearanceActive, mapReady, measurePoints]);
 
   // FR-005 topology repair preview (before/after segment snap).
   useEffect(() => {
@@ -1989,10 +2594,18 @@ export function GiopMapView({
         .addTo(map);
     };
     const onEnter = () => {
-      if (!territoryActiveRef.current) map.getCanvas().style.cursor = 'pointer';
+      if (
+        !territoryActiveRef.current &&
+        !mapMeasureActiveRef.current &&
+        !mapTraceActiveRef.current
+      ) {
+        map.getCanvas().style.cursor = 'pointer';
+      }
     };
     const onLeave = () => {
-      map.getCanvas().style.cursor = '';
+      if (!mapMeasureActiveRef.current && !mapTraceActiveRef.current) {
+        map.getCanvas().style.cursor = '';
+      }
     };
 
     whenMapCanAddLayers(map, () => {
@@ -2099,7 +2712,13 @@ export function GiopMapView({
       active={territoryActive}
       onActiveChange={setTerritoryActive}
     >
-      <div className={`giop-map-host${isSplitMap ? ' giop-map-host--split' : ''}`}>
+      <div
+        className={`giop-map-host${isSplitMap ? ' giop-map-host--split' : ''}${
+          mapMeasureActive ? ' giop-map-host--measure' : ''
+        }${mapTraceActive ? ' giop-map-host--trace' : ''}${
+          measureDragging ? ' giop-map-host--measure-dragging' : ''
+        }`}
+      >
         <div ref={containerRef} className="absolute inset-0" />
         {showSearchBar && (
           <GiopMapSearchBar
@@ -2111,6 +2730,74 @@ export function GiopMapView({
             onSelect={handleSearchSelect}
             gisOverviewAvailable={gisOverviewAvailable}
           />
+        )}
+        {mapTraceActive && (
+          <div
+            className={`giop-map-measure-hud pointer-events-auto giop-map-measure-hud--trace ${
+              isLightMode ? 'giop-map-measure-hud--light' : 'giop-map-measure-hud--dark'
+            }`}
+          >
+            <span>
+              {mapTraceLoading
+                ? mapTraceStatus ?? 'Tracing…'
+                : mapTraceStatus ?? 'Click a pole or transformer to trace downstream'}
+            </span>
+            <button
+              type="button"
+              className="giop-map-measure-hud__clear"
+              onClick={() => {
+                clearImpactOverlay();
+                setMapTraceStatus('Click a pole or transformer to trace downstream');
+              }}
+            >
+              Clear
+            </button>
+            <button
+              type="button"
+              className="giop-map-measure-hud__clear"
+              onClick={() => setMapTraceActive(false)}
+            >
+              Done
+            </button>
+          </div>
+        )}
+        {mapMeasureActive && (
+          <div
+            className={`giop-map-measure-hud pointer-events-auto ${
+              isLightMode ? 'giop-map-measure-hud--light' : 'giop-map-measure-hud--dark'
+            }${mapClearanceActive ? ' giop-map-measure-hud--clearance' : ''}`}
+          >
+            <span>
+              {measurePoints.length === 0
+                ? mapClearanceActive
+                  ? 'Clearance: place a point or path, then pick a radius'
+                  : 'Measure: snap to nodes · left-click add · right-click remove · drag adjust'
+                : mapClearanceActive
+                  ? `Clearance ${clearanceRadiusM} m · ${formatClearanceArea(clearanceAreaMeters2(measurePoints, clearanceRadiusM))} · path ${formatMeasureMeters(measureTotalMeters)}`
+                  : `Length: ${formatMeasureMeters(measureTotalMeters)} · WGS84 geodesic (${measurePoints.length} pt${measurePoints.length === 1 ? '' : 's'})`}
+            </span>
+            {mapClearanceActive && (
+              <div className="giop-map-measure-hud__radii" role="group" aria-label="Clearance radius">
+                {CLEARANCE_RADIUS_PRESETS_M.map((radius) => (
+                  <button
+                    key={radius}
+                    type="button"
+                    className={`giop-map-measure-hud__radius${
+                      clearanceRadiusM === radius ? ' giop-map-measure-hud__radius--active' : ''
+                    }`}
+                    onClick={() => setClearanceRadiusM(radius)}
+                  >
+                    {radius} m
+                  </button>
+                ))}
+              </div>
+            )}
+            {measurePoints.length > 0 && (
+              <button type="button" className="giop-map-measure-hud__clear" onClick={clearMeasure}>
+                Clear
+              </button>
+            )}
+          </div>
         )}
         <div className="pointer-events-none absolute top-3 right-16 z-10 flex items-start gap-2 flex-row-reverse">
           {fieldCrews && !isSplitMap && (
