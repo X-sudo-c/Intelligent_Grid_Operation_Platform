@@ -31,9 +31,8 @@ sync-service/uploads/
 supabase/.branches/
 supabase/.temp/
 
-# --- Local CLI binaries (install via scripts/ensure_supabase_cli.sh) ---
-.tools/supabase/supabase
-.tools/supabase/supabase-go
+# --- Local CLI binaries / tool downloads (install on the host, do not commit) ---
+.tools/
 
 # --- GIS datasets (import locally; see scripts/import_power_system_gpkg.sh) ---
 supabase/Power System.gpkg
@@ -52,8 +51,14 @@ Thumbs.db
 *.swp
 *~
 
-# --- Cursor debug ---
-.cursor/debug-*.log
+# --- Cursor (keep shared rules; ignore local editor state) ---
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
+
+# --- Root reference docs kept local (use docs/ for tracked docs) ---
+/*.pdf
+/*.docx
 
 # --- CIM export artifacts ---
 sync-service/exports/
