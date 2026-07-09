@@ -51,10 +51,8 @@ Thumbs.db
 *.swp
 *~
 
-# --- Cursor (keep shared rules; ignore local editor state) ---
-.cursor/*
-!.cursor/rules/
-!.cursor/rules/**
+# --- Cursor (local IDE; do not commit) ---
+.cursor/
 
 # --- Root reference docs kept local (use docs/ for tracked docs) ---
 /*.pdf
