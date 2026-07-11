@@ -61,7 +61,7 @@ elif isinstance(data, dict):
     tiles = data.get('tiles') or data
     if isinstance(tiles, dict):
         ids = set(tiles.keys())
-required = ('map_connectivity_nodes', 'map_ac_line_segments')
+required = ('map_connectivity_nodes', 'map_ac_line_segments', 'oh_support_structure_11kv', 'oh_support_structure_lvle')
 missing = [layer for layer in required if layer not in ids]
 for layer in required:
     print(f'    {layer}: {\"present\" if layer in ids else \"MISSING\"}')

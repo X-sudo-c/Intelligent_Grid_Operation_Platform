@@ -401,6 +401,8 @@ class VoiceRouterTests(unittest.TestCase):
         self.assertEqual(bbox, {"west": -0.3, "south": 5.5, "east": -0.1, "north": 5.7})
 
     def test_count_this_area_uses_selected_territory(self):
+        from unittest.mock import patch
+
         from agents.voice_router import execute_fast_path, parse_intent
 
         conn = MagicMock()
@@ -421,11 +423,21 @@ class VoiceRouterTests(unittest.TestCase):
         self.assertEqual(intent.tier, "staging")
         self.assertTrue(intent.use_viewport)
 
-        result = execute_fast_path(
-            conn,
-            intent,
-            context={"selected_region": "Accra"},
-        )
+        with patch(
+            "agents.spatial.resolve_territory",
+            return_value={
+                "district": None,
+                "region": "Accra",
+                "polygon_count": 1,
+                "center": {"lon": -0.2, "lat": 5.6},
+                "bbox": {"west": -0.3, "south": 5.5, "east": -0.1, "north": 5.7},
+            },
+        ):
+            result = execute_fast_path(
+                conn,
+                intent,
+                context={"selected_region": "Accra"},
+            )
         self.assertIsNotNone(result)
         assert result is not None
         self.assertIn("4", result["content"])
@@ -484,7 +496,7 @@ class VoiceRouterTests(unittest.TestCase):
         assert result is not None
         self.assertTrue(result.get("fast_path"))
         self.assertIn("15", result["content"])
-        self.assertIn("this area", result["content"].lower())
+        self.assertIn("this map view", result["content"].lower())
 
     def test_my_view_parses_as_viewport_count(self):
         from agents.voice_router import parse_intent
@@ -773,6 +785,110 @@ class VoiceRouterTests(unittest.TestCase):
                 self.assertIsNotNone(intent)
                 assert intent is not None
                 self.assertEqual(intent.kind, "inspect_node")
+
+    def test_parse_describe_viewport(self):
+        from agents.voice_router import parse_intent
+
+        for text in (
+            "what do you see on the map",
+            "what can you see",
+            "what's on the map",
+            "what is on the map",
+            "what's in this view",
+            "describe this map view",
+            "summarize the current view",
+            "what's visible here",
+        ):
+            with self.subTest(text=text):
+                intent = parse_intent(text, session={}, context={})
+                self.assertIsNotNone(intent)
+                assert intent is not None
+                self.assertEqual(intent.kind, "network_summary")
+                self.assertTrue(intent.use_viewport)
+                self.assertTrue(intent.viewport_explicit)
+
+    def test_parse_list_assets_after_count_followup(self):
+        from agents.voice_router import parse_intent
+
+        session = {
+            "last_kind": "count",
+            "last_asset_kind": "transformer",
+            "last_tier": "master",
+            "last_use_viewport": True,
+        }
+        for text in (
+            "tell me about those transformers",
+            "tell me about them",
+            "describe those transformers",
+            "show me those transformers",
+            "name them",
+        ):
+            with self.subTest(text=text):
+                intent = parse_intent(text, session=session, context={})
+                self.assertIsNotNone(intent)
+                assert intent is not None
+                self.assertEqual(intent.kind, "list_assets")
+                self.assertEqual(intent.asset_kind, "transformer")
+                self.assertTrue(intent.use_viewport)
+
+    def test_parse_common_engineer_phrases(self):
+        from agents.voice_router import parse_intent
+
+        ctx = {
+            "selected_district": "accra",
+            "focus_mrid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "viewport": {
+                "zoom": 14,
+                "center": {"lon": -0.2, "lat": 5.6},
+                "bbox": {"west": -0.25, "south": 5.55, "east": -0.15, "north": 5.65},
+            },
+        }
+        cases = (
+            ("tell me about the node in view", "inspect_node"),
+            ("what connects to it?", "trace_connection_path"),
+            ("what's downstream from this node?", "trace_downstream_path"),
+            ("show the connection path from this node", "trace_connection_path"),
+            ("what would be affected if this node went out?", "trace_downstream_path"),
+            ("show me the nearest work order", "pan_work_order"),
+            ("how many staging captures in this district?", "count"),
+        )
+        for text, kind in cases:
+            with self.subTest(text=text):
+                intent = parse_intent(text, session={}, context=ctx)
+                self.assertIsNotNone(intent)
+                assert intent is not None
+                self.assertEqual(intent.kind, kind)
+                if kind == "count":
+                    self.assertEqual(intent.tier, "staging")
+                    self.assertEqual(intent.district, "accra")
+
+    def test_asset_correction_still_requires_cue(self):
+        from agents.voice_router import parse_intent
+
+        session = {
+            "last_kind": "count",
+            "last_asset_kind": "pole",
+            "last_tier": "master",
+            "last_use_viewport": True,
+        }
+        intent = parse_intent("I asked about transformers", session=session, context={})
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.kind, "count")
+        self.assertEqual(intent.asset_kind, "transformer")
+
+    def test_describe_viewport_does_not_steal_counts(self):
+        from agents.voice_router import parse_intent
+
+        intent = parse_intent(
+            "how many poles are on the map",
+            session={},
+            context={},
+        )
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertNotEqual(intent.kind, "network_summary")
+        self.assertEqual(intent.kind, "count")
 
     def test_node_pick_uncertain(self):
         from agents.portal_context import _node_pick_uncertain
@@ -1158,7 +1274,7 @@ class VoiceRouterTests(unittest.TestCase):
         self.assertIsNone(intent)
 
     def test_count_scope_skips_selected_district_by_default(self):
-        from agents.portal_context import portal_count_scope
+        from agents.portal_context import default_map_viewport_bbox, portal_count_scope
 
         bbox, district, region = portal_count_scope(
             use_viewport=True,
@@ -1168,11 +1284,12 @@ class VoiceRouterTests(unittest.TestCase):
             context={"selected_district": "Kaneshie", "selected_region": "Accra West"},
             allow_selected_territory=False,
         )
-        self.assertIsNone(bbox)
+        # No live viewport → default map bbox; selected district must not leak in.
+        self.assertEqual(bbox, default_map_viewport_bbox())
         self.assertIsNone(district)
         self.assertIsNone(region)
 
-        _bbox, district2, region2 = portal_count_scope(
+        bbox2, district2, region2 = portal_count_scope(
             use_viewport=True,
             territory_bbox=None,
             district=None,
@@ -1180,6 +1297,7 @@ class VoiceRouterTests(unittest.TestCase):
             context={"selected_district": "Kaneshie", "selected_region": "Accra West"},
             allow_selected_territory=True,
         )
+        self.assertIsNone(bbox2)
         self.assertEqual(district2, "Kaneshie")
         self.assertEqual(region2, "Accra West")
 

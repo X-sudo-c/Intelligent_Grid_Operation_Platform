@@ -1063,6 +1063,203 @@ html.giop-theme-transition .giop-theme-toggle__knob {
   box-shadow: 0 8px 24px rgba(15, 23, 42, 0.18);
 }
 
+.giop-map-endpoint-fix-legend {
+  position: absolute;
+  left: 12px;
+  bottom: 16px;
+  z-index: 34;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: min(420px, calc(100% - 2rem));
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.14);
+}
+
+.giop-map-endpoint-fix-legend--light {
+  background: rgba(255, 255, 255, 0.94);
+  color: #334155;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+}
+
+.giop-map-endpoint-fix-legend--dark {
+  background: rgba(15, 23, 42, 0.92);
+  color: #e2e8f0;
+  border: 1px solid rgba(71, 85, 105, 0.7);
+}
+
+.giop-map-endpoint-fix-legend__from {
+  color: #16a34a;
+  font-weight: 700;
+}
+
+.giop-map-endpoint-fix-legend--dark .giop-map-endpoint-fix-legend__from {
+  color: #4ade80;
+}
+
+.giop-map-endpoint-fix-legend__to {
+  color: #d97706;
+  font-weight: 700;
+}
+
+.giop-map-endpoint-fix-legend--dark .giop-map-endpoint-fix-legend__to {
+  color: #fbbf24;
+}
+
+.giop-map-endpoint-fix-legend__sep {
+  opacity: 0.55;
+}
+
+.giop-map-endpoint-fix-legend__swatch {
+  display: inline-block;
+  width: 22px;
+  height: 0;
+  border-top-width: 3px;
+  border-top-style: solid;
+  border-top-color: #c026d3;
+  vertical-align: middle;
+}
+
+.giop-map-endpoint-fix-legend__swatch--dashed {
+  border-top-style: dashed;
+}
+
+.giop-map-endpoint-fix-legend__swatch--gray {
+  border-top-color: #0f172a;
+  border-top-style: solid;
+  border-top-width: 4px;
+}
+
+.giop-map-endpoint-fix-legend--dark .giop-map-endpoint-fix-legend__swatch--gray {
+  border-top-color: #f8fafc;
+}
+
+.giop-map-endpoint-label-root {
+  pointer-events: none;
+}
+
+.giop-map-endpoint-label {
+  pointer-events: none;
+  user-select: none;
+  white-space: nowrap;
+  max-width: 220px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  line-height: 1.3;
+  text-align: center;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.16);
+}
+
+.giop-map-endpoint-label--from {
+  color: #15803d;
+  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid rgba(22, 163, 74, 0.45);
+}
+
+.giop-map-endpoint-label--to {
+  color: #b45309;
+  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid rgba(217, 119, 6, 0.45);
+}
+
+.giop-map-endpoint-label--link {
+  color: #0f766e;
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid rgba(13, 148, 136, 0.4);
+  max-width: none;
+  padding: 1px 6px;
+}
+
+.giop-map-endpoint-label--start-badge,
+.giop-map-endpoint-label--end-badge {
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  box-shadow: 0 2px 10px rgba(15, 23, 42, 0.22);
+}
+
+.giop-map-endpoint-label--start-badge {
+  color: #ffffff;
+  background: #16a34a;
+  border: 2px solid #ffffff;
+}
+
+.giop-map-endpoint-label--end-badge {
+  color: #ffffff;
+  background: #d97706;
+  border: 2px solid #ffffff;
+}
+
+.giop-map-endpoint-label--dark.giop-map-endpoint-label--from {
+  color: #4ade80;
+  background: rgba(15, 23, 42, 0.92);
+  border-color: rgba(74, 222, 128, 0.45);
+}
+
+.giop-map-endpoint-label--dark.giop-map-endpoint-label--to {
+  color: #fbbf24;
+  background: rgba(15, 23, 42, 0.92);
+  border-color: rgba(251, 191, 36, 0.45);
+}
+
+.giop-map-endpoint-label--dark.giop-map-endpoint-label--link {
+  color: #5eead4;
+  background: rgba(15, 23, 42, 0.92);
+  border-color: rgba(45, 212, 191, 0.4);
+}
+
+.giop-map-endpoint-label--dark.giop-map-endpoint-label--start-badge {
+  color: #052e16;
+  background: #4ade80;
+  border-color: #0f172a;
+}
+
+.giop-map-endpoint-label--dark.giop-map-endpoint-label--end-badge {
+  color: #451a03;
+  background: #fbbf24;
+  border-color: #0f172a;
+}
+
+.giop-map-measure-dim-root {
+  pointer-events: none;
+}
+
+.giop-map-measure-dim {
+  pointer-events: none;
+  user-select: none;
+  white-space: nowrap;
+  padding: 2px 7px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  line-height: 1.25;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.18);
+}
+
+.giop-map-measure-dim--light {
+  border: 1px solid rgba(225, 29, 72, 0.35);
+  background: rgba(255, 255, 255, 0.96);
+  color: #9f1239;
+}
+
+.giop-map-measure-dim--dark {
+  border: 1px solid rgba(251, 113, 133, 0.45);
+  background: rgba(15, 23, 42, 0.92);
+  color: #ffe4e6;
+}
+
 .giop-map-measure-hud--light {
   border: 1px solid rgba(225, 29, 72, 0.25);
   background: rgba(255, 255, 255, 0.94);

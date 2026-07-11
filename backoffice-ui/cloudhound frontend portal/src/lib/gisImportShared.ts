@@ -64,10 +64,11 @@ export function formatDurationMs(ms?: number | null): string | null {
 }
 
 export function snapEligibleEstimateSec(conductorSegments?: number | null): number {
+  // After 00108: set-based snap + skip import-status MV refresh (~7–15s national).
   const n = conductorSegments ?? 1_900_000;
-  if (n >= 1_500_000) return 480;
-  if (n >= 500_000) return 180;
-  return 60;
+  if (n >= 1_500_000) return 30;
+  if (n >= 500_000) return 20;
+  return 10;
 }
 
 export function formatSnapEta(startedMs: number, estimateSec: number): string | null {

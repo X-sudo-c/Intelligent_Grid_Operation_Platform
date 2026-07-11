@@ -106,6 +106,46 @@ postgres:
       table: oh_conductor_11kv
       srid: 4326
       geometry_column: geom
+    oh_support_structure_33kv:
+      schema: gis
+      table: oh_support_structure_33kv
+      srid: 4326
+      geometry_column: geom
+      geometry_type: MULTIPOINT
+      bounds: [-3.5, 4.5, 1.5, 8.5]
+      # Align with portal DETAIL_NODE_MIN_ZOOM (11.5).
+      minzoom: 11
+      maxzoom: 16
+      properties:
+        unique_id: text
+        asset_name: text
+        district: text
+    oh_support_structure_11kv:
+      schema: gis
+      table: oh_support_structure_11kv
+      srid: 4326
+      geometry_column: geom
+      geometry_type: MULTIPOINT
+      bounds: [-3.5, 4.5, 1.5, 8.5]
+      minzoom: 11
+      maxzoom: 16
+      properties:
+        unique_id: text
+        asset_name: text
+        district: text
+    oh_support_structure_lvle:
+      schema: gis
+      table: oh_support_structure_lvle
+      srid: 4326
+      geometry_column: geom
+      geometry_type: MULTIPOINT
+      bounds: [-3.5, 4.5, 1.5, 8.5]
+      minzoom: 11
+      maxzoom: 16
+      properties:
+        unique_id: text
+        asset_name: text
+        district: text
     power_transformer:
       schema: gis
       table: power_transformer

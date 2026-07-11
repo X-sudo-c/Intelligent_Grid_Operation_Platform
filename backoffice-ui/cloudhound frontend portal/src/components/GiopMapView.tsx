@@ -30,6 +30,9 @@ import {
   MIN_MAP_ZOOM,
   NODE_DETAIL_ZOOM,
   readNetworkGeometryMode,
+  setGiopLayerVisibility,
+  UNPROMOTED_GIS_GAP_LAYER_ID,
+  GIS_POLE_LAYER_IDS,
   flyToLatLon,
   flyToNodeFocus,
   GIOP_MAP_LABEL_FONT_BOLD,
@@ -70,36 +73,48 @@ import {
   type FeederHighlightState,
 } from '../lib/giopFeederHighlight';
 import {
+  bboxFromEndpointFixGeojson,
+  collectImportSegmentMapLabels,
+  afterSnapLineVisiblyDiffers,
+  asLineStringFeatureCollection,
+  filterGapLinksDistinctFromWire,
+  importSegmentDirectionBadgePlacement,
+  importSegmentLabelMarkerPlacement,
   IMPORT_SEGMENT_ENDPOINT_LAYER,
   IMPORT_SEGMENT_ENDPOINT_SOURCE,
-  IMPORT_SEGMENT_LABEL_LAYER,
+  IMPORT_SEGMENT_LINE_ARROW_LAYER,
+  IMPORT_SEGMENT_LINE_BEFORE_ARROW_LAYER,
+  IMPORT_SEGMENT_LINE_BEFORE_HALO_LAYER,
+  IMPORT_SEGMENT_LINE_BEFORE_LAYER,
+  IMPORT_SEGMENT_LINE_BEFORE_SOURCE,
+  IMPORT_SEGMENT_LINE_HALO_LAYER,
   IMPORT_SEGMENT_LINE_LAYER,
   IMPORT_SEGMENT_LINE_SOURCE,
   IMPORT_SEGMENT_LINK_LAYER,
   IMPORT_SEGMENT_LINK_SOURCE,
-  IMPORT_SEGMENT_PROPOSED_LABEL_LAYER,
   IMPORT_SEGMENT_PROPOSED_LAYER,
   IMPORT_SEGMENT_PROPOSED_SOURCE,
   importSegmentEndpointPaint,
-  importSegmentLabelLayout,
-  importSegmentLabelPaint,
+  importSegmentLineArrowLayout,
+  importSegmentLineArrowPaint,
+  importSegmentLineBeforeArrowPaint,
+  importSegmentLineBeforeHaloPaint,
+  importSegmentLineBeforePaint,
+  importSegmentLineHaloPaint,
   importSegmentLinePaint,
-  importSegmentProposedLabelLayout,
   importSegmentProposedPaint,
   importSegmentSuggestedLinkPaint,
+  isEndpointFixHighlight,
 } from '../lib/giopImportSegmentHighlight';
 import {
-  MAP_MEASURE_LABEL_LAYER,
-  MAP_MEASURE_LABEL_SOURCE,
   MAP_MEASURE_LINE_LAYER,
   MAP_MEASURE_LINE_SOURCE,
   MAP_MEASURE_POINT_HALO_LAYER,
   MAP_MEASURE_POINT_LAYER,
   MAP_MEASURE_POINT_SOURCE,
   buildMeasureGeoJson,
+  buildMeasureSegmentDimensions,
   formatMeasureMeters,
-  measureLabelLayout,
-  measureLabelPaint,
   measureLinePaint,
   measurePointHaloPaint,
   measurePointPaint,
@@ -180,6 +195,8 @@ interface GiopMapViewProps {
   searchBridgeRef?: MutableRefObject<GiopMapSearchBridge | null>;
   onSearchBridgeCatalog?: (snapshot: Pick<GiopMapSearchBridge, 'placeCatalog' | 'opsCatalog' | 'placesReady'>) => void;
   flyRequest?: GiopMapFlyRequest | null;
+  /** Data Quality side map: import / endpoint-fix preview layers and legend. */
+  enableImportSegmentHighlight?: boolean;
 }
 
 const DEFAULT_CENTER: [number, number] = [-0.2941, 5.6812];
@@ -349,13 +366,32 @@ function pinFocusIdentifyLayersToTop(map: maplibregl.Map): void {
   });
 }
 
+/** Keep GIS import / endpoint-fix highlight above network tiles. */
+function pinImportSegmentHighlightLayersToTop(map: maplibregl.Map): void {
+  safeMapMutate(map, () => {
+    for (const id of [
+      // Gap under solid wire so short stubs are not buried by magenta dash.
+      IMPORT_SEGMENT_LINE_HALO_LAYER,
+      IMPORT_SEGMENT_LINE_LAYER,
+      IMPORT_SEGMENT_LINE_ARROW_LAYER,
+      IMPORT_SEGMENT_LINK_LAYER,
+      IMPORT_SEGMENT_LINE_BEFORE_HALO_LAYER,
+      IMPORT_SEGMENT_LINE_BEFORE_LAYER,
+      IMPORT_SEGMENT_LINE_BEFORE_ARROW_LAYER,
+      IMPORT_SEGMENT_ENDPOINT_LAYER,
+      IMPORT_SEGMENT_PROPOSED_LAYER,
+    ]) {
+      if (map.getLayer(id)) map.moveLayer(id);
+    }
+  });
+}
+
 function pinMeasureLayersToTop(map: maplibregl.Map): void {
   safeMapMutate(map, () => {
     for (const id of [
       MAP_CLEARANCE_FILL_LAYER,
       MAP_CLEARANCE_OUTLINE_LAYER,
       MAP_MEASURE_LINE_LAYER,
-      MAP_MEASURE_LABEL_LAYER,
       MAP_MEASURE_POINT_HALO_LAYER,
       MAP_MEASURE_POINT_LAYER,
     ]) {
@@ -392,6 +428,7 @@ export function GiopMapView({
   searchBridgeRef,
   onSearchBridgeCatalog,
   flyRequest = null,
+  enableImportSegmentHighlight = false,
 }: GiopMapViewProps) {
   const isOpsMap = mapChrome === 'operations';
   const isSplitMap = mapChrome === 'split';
@@ -434,11 +471,21 @@ export function GiopMapView({
   } | null>(null);
   const measureSkipClickRef = useRef(false);
   const [measureDragging, setMeasureDragging] = useState(false);
+  const measureDimMarkersRef = useRef<maplibregl.Marker[]>([]);
+  const importSegmentLabelMarkersRef = useRef<maplibregl.Marker[]>([]);
+  const lastImportFitHighlightRef = useRef<object | null>(null);
   const handledCameraRequestIdRef = useRef(0);
   const handledViewportCommandIdRef = useRef(0);
   const stagingAssetsRef = useRef(stagingAssets);
   const { focusCameraRequest, clearFocusCamera, mapViewportCommand, clearMapViewportCommand, territoryHighlight, clearTerritoryHighlight, repairPreviewLayers, duplicateClusterOverlay, importSegmentHighlight, networkGeometryMode, setNetworkGeometryMode, focusOnMap, queueMapViewportCommand, registerMapViewportReader, mapMeasureActive, measurePoints, addMeasurePoint, updateMeasurePoint, removeMeasurePoint, clearMeasure, measureTotalMeters, mapClearanceActive, clearanceRadiusM, setClearanceRadiusM, mapTraceActive, setMapTraceActive, mapTraceStatus, setMapTraceStatus, setImpactOverlay, clearImpactOverlay } =
     useGiopMapOverlay();
+  const activeImportSegmentHighlight = enableImportSegmentHighlight ? importSegmentHighlight : null;
+  const networkGeometryModeRef = useRef(networkGeometryMode);
+  const gisOverviewAvailableRef = useRef(gisOverviewAvailable);
+  const activeImportSegmentHighlightRef = useRef(activeImportSegmentHighlight);
+  networkGeometryModeRef.current = networkGeometryMode;
+  gisOverviewAvailableRef.current = gisOverviewAvailable;
+  activeImportSegmentHighlightRef.current = activeImportSegmentHighlight;
 
   const { placeCatalog, opsCatalog, placesReady } = useGiopMapSearchCatalog({
     workOrders,
@@ -638,17 +685,23 @@ export function GiopMapView({
     const map = mapRef.current;
     if (!map || !mapReady) return;
 
-    const apply = () => {
+    const applyGeometryMode = () => {
       syncNetworkGeometryModeOnMap(map, networkGeometryMode, {
         gisOverviewAvailable,
         light: isLightModeRef.current,
         martinUrl: MARTIN_URL,
       });
+      if (activeImportSegmentHighlight) {
+        if (map.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID)) {
+          setGiopLayerVisibility(map, UNPROMOTED_GIS_GAP_LAYER_ID, false);
+        }
+        pinImportSegmentHighlightLayersToTop(map);
+      }
     };
 
-    if (map.isStyleLoaded()) apply();
-    else whenMapCanAddLayers(map, apply);
-  }, [mapReady, networkGeometryMode, gisOverviewAvailable, isLightMode, mapZoom]);
+    if (map.isStyleLoaded()) applyGeometryMode();
+    else whenMapCanAddLayers(map, applyGeometryMode);
+  }, [mapReady, networkGeometryMode, gisOverviewAvailable, isLightMode, activeImportSegmentHighlight]);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
@@ -723,6 +776,20 @@ export function GiopMapView({
       syncMapZoom();
       scheduleHideZoomHint();
       persistCamera();
+      const liveMap = mapRef.current;
+      if (!liveMap?.isStyleLoaded()) return;
+      syncNetworkGeometryModeOnMap(liveMap, networkGeometryModeRef.current, {
+        gisOverviewAvailable: gisOverviewAvailableRef.current,
+        light: isLightModeRef.current,
+        martinUrl: MARTIN_URL,
+      });
+      if (
+        activeImportSegmentHighlightRef.current
+        && liveMap.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID)
+      ) {
+        setGiopLayerVisibility(liveMap, UNPROMOTED_GIS_GAP_LAYER_ID, false);
+        pinImportSegmentHighlightLayersToTop(liveMap);
+      }
     });
     // Interactive on style load — do not wait for full tile idle.
 
@@ -1123,11 +1190,12 @@ export function GiopMapView({
     return scheduleMapLayerWork(map, applyFieldTechnicians);
   }, [fieldTechnicians, isSplitMap]);
 
-  // Camera fly on explicit focus requests (Audit side panel, Map tab).
+  // Camera fly on explicit focus requests (Audit side panel, Map tab, topology select).
   useEffect(() => {
     if (isOpsMap) return;
     if (territoryActive) return;
-    if (!mapBusy || !focusMrid) return;
+    if (activeImportSegmentHighlight) return;
+    if (!mapReady || !focusMrid) return;
 
     const req = focusCameraRequest;
     if (!req) return;
@@ -1187,9 +1255,9 @@ export function GiopMapView({
     focusMrid,
     focusCoordinates,
     territoryActive,
+    activeImportSegmentHighlight,
     clearFocusCamera,
     gisOverviewAvailable,
-    mapBusy,
     mapReady,
   ]);
 
@@ -1197,6 +1265,7 @@ export function GiopMapView({
   useEffect(() => {
     const req = flyRequest;
     if (!req) return;
+    if (activeImportSegmentHighlight) return;
     giopLog.map.info('flyRequest received', { id: req.id, coordinates: req.coordinates });
     const coords = normalizeMapCoordinates(req.coordinates);
     if (!coords) {
@@ -1235,7 +1304,7 @@ export function GiopMapView({
     } catch (err) {
       giopLog.map.error('flyRequest pan failed', err);
     }
-  }, [flyRequest?.id, mapReady]);
+  }, [flyRequest?.id, activeImportSegmentHighlight, mapReady]);
 
   useEffect(() => {
     const cmd = mapViewportCommand;
@@ -1489,28 +1558,48 @@ export function GiopMapView({
     }
   }, [feederHighlight, isLightMode, mapBusy]);
 
-  // GIS import queue: highlight conductor line + labelled endpoints (hidden in Master-only mode).
+  // GIS import / endpoint-fix: highlight conductor line + labelled endpoints (always on when set).
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
 
-    const activeHighlight =
-      importSegmentHighlight && networkGeometryMode !== 'master' ? importSegmentHighlight : null;
-    const line = activeHighlight?.geojson.line ?? EMPTY_FC;
+    const activeHighlight = activeImportSegmentHighlight;
+    const lineRaw = activeHighlight?.geojson.line ?? EMPTY_FC;
+    const lineBeforeRaw = activeHighlight?.geojson.line_before ?? EMPTY_FC;
     const endpoints = activeHighlight?.geojson.endpoints ?? EMPTY_FC;
     const proposedAssets = activeHighlight?.geojson.proposed_assets ?? EMPTY_FC;
     const suggestedLinks = activeHighlight?.geojson.suggested_links ?? EMPTY_FC;
+    const line = asLineStringFeatureCollection(lineRaw);
+    const lineBeforeNormalized = asLineStringFeatureCollection(lineBeforeRaw);
+    // Prefer as-built; if missing, fall back to line so import-queue Show and
+    // endpoint-fix both get a solid wire (queue geojson has no line_before).
+    const lineBefore =
+      lineBeforeNormalized.features.length > 0 ? lineBeforeNormalized : line;
+    const suggestedLinksDistinct = filterGapLinksDistinctFromWire(
+      asLineStringFeatureCollection(suggestedLinks),
+      lineBefore,
+    );
 
     const applyImportHighlight = () => {
       safeMapMutate(map, () => {
         if (!activeHighlight) {
+          for (const legacyId of [
+            'import-segment-proposed-labels',
+            'import-segment-suggested-link-labels',
+            'import-segment-endpoint-labels',
+          ]) {
+            if (map.getLayer(legacyId)) map.removeLayer(legacyId);
+          }
           for (const layerId of [
-            IMPORT_SEGMENT_PROPOSED_LABEL_LAYER,
             IMPORT_SEGMENT_PROPOSED_LAYER,
             IMPORT_SEGMENT_LINK_LAYER,
-            IMPORT_SEGMENT_LABEL_LAYER,
             IMPORT_SEGMENT_ENDPOINT_LAYER,
+            IMPORT_SEGMENT_LINE_ARROW_LAYER,
             IMPORT_SEGMENT_LINE_LAYER,
+            IMPORT_SEGMENT_LINE_HALO_LAYER,
+            IMPORT_SEGMENT_LINE_BEFORE_ARROW_LAYER,
+            IMPORT_SEGMENT_LINE_BEFORE_LAYER,
+            IMPORT_SEGMENT_LINE_BEFORE_HALO_LAYER,
           ]) {
             if (map.getLayer(layerId)) map.removeLayer(layerId);
           }
@@ -1519,19 +1608,110 @@ export function GiopMapView({
             IMPORT_SEGMENT_PROPOSED_SOURCE,
             IMPORT_SEGMENT_ENDPOINT_SOURCE,
             IMPORT_SEGMENT_LINE_SOURCE,
+            IMPORT_SEGMENT_LINE_BEFORE_SOURCE,
           ]) {
             if (map.getSource(sourceId)) map.removeSource(sourceId);
           }
+          lastImportFitHighlightRef.current = null;
+          syncNetworkGeometryModeOnMap(map, networkGeometryMode, {
+            gisOverviewAvailable,
+            light: isLightMode,
+            martinUrl: MARTIN_URL,
+          });
           return;
         }
 
-        if (map.getSource(IMPORT_SEGMENT_LINE_SOURCE)) {
-          (map.getSource(IMPORT_SEGMENT_LINE_SOURCE) as maplibregl.GeoJSONSource).setData(line);
-        } else if (line.features.length > 0) {
-          map.addSource(IMPORT_SEGMENT_LINE_SOURCE, { type: 'geojson', data: line });
+        if (map.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID)) {
+          setGiopLayerVisibility(map, UNPROMOTED_GIS_GAP_LAYER_ID, false);
+        }
+        if (map.getLayer('nodes')) {
+          setGiopLayerVisibility(map, 'nodes', false);
+        }
+        for (const layerId of GIS_POLE_LAYER_IDS) {
+          if (map.getLayer(layerId)) setGiopLayerVisibility(map, layerId, false);
         }
 
-        if (line.features.length > 0 && map.getSource(IMPORT_SEGMENT_LINE_SOURCE)) {
+        if (map.getSource(IMPORT_SEGMENT_LINE_BEFORE_SOURCE)) {
+          (map.getSource(IMPORT_SEGMENT_LINE_BEFORE_SOURCE) as maplibregl.GeoJSONSource).setData(
+            lineBefore,
+          );
+        } else if (lineBefore.features.length > 0) {
+          map.addSource(IMPORT_SEGMENT_LINE_BEFORE_SOURCE, { type: 'geojson', data: lineBefore });
+        }
+
+        if (lineBefore.features.length > 0 && map.getSource(IMPORT_SEGMENT_LINE_BEFORE_SOURCE)) {
+          // Recreate so leftover dasharray / offset from older paint cannot stick.
+          for (const layerId of [
+            IMPORT_SEGMENT_LINE_BEFORE_ARROW_LAYER,
+            IMPORT_SEGMENT_LINE_BEFORE_LAYER,
+            IMPORT_SEGMENT_LINE_BEFORE_HALO_LAYER,
+          ]) {
+            if (map.getLayer(layerId)) map.removeLayer(layerId);
+          }
+
+          map.addLayer({
+            id: IMPORT_SEGMENT_LINE_BEFORE_HALO_LAYER,
+            type: 'line',
+            source: IMPORT_SEGMENT_LINE_BEFORE_SOURCE,
+            layout: { 'line-cap': 'round', 'line-join': 'round' },
+            paint: importSegmentLineBeforeHaloPaint(isLightMode),
+          });
+          map.addLayer({
+            id: IMPORT_SEGMENT_LINE_BEFORE_LAYER,
+            type: 'line',
+            source: IMPORT_SEGMENT_LINE_BEFORE_SOURCE,
+            layout: { 'line-cap': 'round', 'line-join': 'round' },
+            paint: importSegmentLineBeforePaint(isLightMode),
+          });
+          map.addLayer({
+            id: IMPORT_SEGMENT_LINE_BEFORE_ARROW_LAYER,
+            type: 'symbol',
+            source: IMPORT_SEGMENT_LINE_BEFORE_SOURCE,
+            layout: importSegmentLineArrowLayout(),
+            paint: importSegmentLineBeforeArrowPaint(isLightMode),
+          });
+        } else {
+          for (const layerId of [
+            IMPORT_SEGMENT_LINE_BEFORE_ARROW_LAYER,
+            IMPORT_SEGMENT_LINE_BEFORE_LAYER,
+            IMPORT_SEGMENT_LINE_BEFORE_HALO_LAYER,
+          ]) {
+            if (map.getLayer(layerId)) map.removeLayer(layerId);
+          }
+          if (map.getSource(IMPORT_SEGMENT_LINE_BEFORE_SOURCE) && lineBefore.features.length === 0) {
+            map.removeSource(IMPORT_SEGMENT_LINE_BEFORE_SOURCE);
+          }
+        }
+
+        const endpointFixPreview = isEndpointFixHighlight(activeHighlight.geojson);
+        // Endpoint-fix previews: show as-built + gap only. After-snap geom is often a
+        // wrong long diagonal that buries the short wire between START/END.
+        const showAfterSnap =
+          !endpointFixPreview && afterSnapLineVisiblyDiffers(line, lineBefore);
+        const afterSnapData = showAfterSnap ? line : EMPTY_FC;
+
+        if (map.getSource(IMPORT_SEGMENT_LINE_SOURCE)) {
+          (map.getSource(IMPORT_SEGMENT_LINE_SOURCE) as maplibregl.GeoJSONSource).setData(afterSnapData);
+        } else if (afterSnapData.features.length > 0) {
+          map.addSource(IMPORT_SEGMENT_LINE_SOURCE, { type: 'geojson', data: afterSnapData });
+        }
+
+        if (afterSnapData.features.length > 0 && map.getSource(IMPORT_SEGMENT_LINE_SOURCE)) {
+          if (!map.getLayer(IMPORT_SEGMENT_LINE_HALO_LAYER)) {
+            map.addLayer({
+              id: IMPORT_SEGMENT_LINE_HALO_LAYER,
+              type: 'line',
+              source: IMPORT_SEGMENT_LINE_SOURCE,
+              layout: { 'line-cap': 'round', 'line-join': 'round' },
+              paint: importSegmentLineHaloPaint(isLightMode),
+            });
+          } else {
+            const haloPaint = importSegmentLineHaloPaint(isLightMode);
+            for (const key of Object.keys(haloPaint) as Array<keyof typeof haloPaint>) {
+              map.setPaintProperty(IMPORT_SEGMENT_LINE_HALO_LAYER, key, haloPaint[key]);
+            }
+          }
+
           if (!map.getLayer(IMPORT_SEGMENT_LINE_LAYER)) {
             map.addLayer({
               id: IMPORT_SEGMENT_LINE_LAYER,
@@ -1545,6 +1725,32 @@ export function GiopMapView({
             for (const key of Object.keys(linePaint) as Array<keyof typeof linePaint>) {
               map.setPaintProperty(IMPORT_SEGMENT_LINE_LAYER, key, linePaint[key]);
             }
+          }
+
+          if (!map.getLayer(IMPORT_SEGMENT_LINE_ARROW_LAYER)) {
+            map.addLayer({
+              id: IMPORT_SEGMENT_LINE_ARROW_LAYER,
+              type: 'symbol',
+              source: IMPORT_SEGMENT_LINE_SOURCE,
+              layout: importSegmentLineArrowLayout(),
+              paint: importSegmentLineArrowPaint(isLightMode),
+            });
+          } else {
+            const arrowPaint = importSegmentLineArrowPaint(isLightMode);
+            for (const key of Object.keys(arrowPaint) as Array<keyof typeof arrowPaint>) {
+              map.setPaintProperty(IMPORT_SEGMENT_LINE_ARROW_LAYER, key, arrowPaint[key]);
+            }
+          }
+        } else {
+          for (const layerId of [
+            IMPORT_SEGMENT_LINE_ARROW_LAYER,
+            IMPORT_SEGMENT_LINE_LAYER,
+            IMPORT_SEGMENT_LINE_HALO_LAYER,
+          ]) {
+            if (map.getLayer(layerId)) map.removeLayer(layerId);
+          }
+          if (map.getSource(IMPORT_SEGMENT_LINE_SOURCE) && afterSnapData.features.length === 0) {
+            map.removeSource(IMPORT_SEGMENT_LINE_SOURCE);
           }
         }
 
@@ -1568,30 +1774,20 @@ export function GiopMapView({
               map.setPaintProperty(IMPORT_SEGMENT_ENDPOINT_LAYER, key, endpointPaint[key]);
             }
           }
-
-          if (!map.getLayer(IMPORT_SEGMENT_LABEL_LAYER)) {
-            map.addLayer({
-              id: IMPORT_SEGMENT_LABEL_LAYER,
-              type: 'symbol',
-              source: IMPORT_SEGMENT_ENDPOINT_SOURCE,
-              layout: importSegmentLabelLayout(),
-              paint: importSegmentLabelPaint(isLightMode),
-            });
-          } else {
-            const labelPaint = importSegmentLabelPaint(isLightMode);
-            for (const key of Object.keys(labelPaint) as Array<keyof typeof labelPaint>) {
-              map.setPaintProperty(IMPORT_SEGMENT_LABEL_LAYER, key, labelPaint[key]);
-            }
-          }
         }
 
         if (map.getSource(IMPORT_SEGMENT_LINK_SOURCE)) {
-          (map.getSource(IMPORT_SEGMENT_LINK_SOURCE) as maplibregl.GeoJSONSource).setData(suggestedLinks);
-        } else if (suggestedLinks.features.length > 0) {
-          map.addSource(IMPORT_SEGMENT_LINK_SOURCE, { type: 'geojson', data: suggestedLinks });
+          (map.getSource(IMPORT_SEGMENT_LINK_SOURCE) as maplibregl.GeoJSONSource).setData(
+            suggestedLinksDistinct,
+          );
+        } else if (suggestedLinksDistinct.features.length > 0) {
+          map.addSource(IMPORT_SEGMENT_LINK_SOURCE, {
+            type: 'geojson',
+            data: suggestedLinksDistinct,
+          });
         }
 
-        if (suggestedLinks.features.length > 0 && map.getSource(IMPORT_SEGMENT_LINK_SOURCE)) {
+        if (suggestedLinksDistinct.features.length > 0 && map.getSource(IMPORT_SEGMENT_LINK_SOURCE)) {
           if (!map.getLayer(IMPORT_SEGMENT_LINK_LAYER)) {
             map.addLayer({
               id: IMPORT_SEGMENT_LINK_LAYER,
@@ -1605,6 +1801,14 @@ export function GiopMapView({
             for (const key of Object.keys(linkPaint) as Array<keyof typeof linkPaint>) {
               map.setPaintProperty(IMPORT_SEGMENT_LINK_LAYER, key, linkPaint[key]);
             }
+          }
+        } else {
+          if (map.getLayer(IMPORT_SEGMENT_LINK_LAYER)) map.removeLayer(IMPORT_SEGMENT_LINK_LAYER);
+          if (
+            map.getSource(IMPORT_SEGMENT_LINK_SOURCE)
+            && suggestedLinksDistinct.features.length === 0
+          ) {
+            map.removeSource(IMPORT_SEGMENT_LINK_SOURCE);
           }
         }
 
@@ -1630,28 +1834,112 @@ export function GiopMapView({
               map.setPaintProperty(IMPORT_SEGMENT_PROPOSED_LAYER, key, proposedPaint[key]);
             }
           }
-
-          if (!map.getLayer(IMPORT_SEGMENT_PROPOSED_LABEL_LAYER)) {
-            map.addLayer({
-              id: IMPORT_SEGMENT_PROPOSED_LABEL_LAYER,
-              type: 'symbol',
-              source: IMPORT_SEGMENT_PROPOSED_SOURCE,
-              layout: importSegmentProposedLabelLayout(),
-              paint: importSegmentLabelPaint(isLightMode),
-            });
-          }
         }
 
         pinFocusIdentifyLayersToTop(map);
+        pinImportSegmentHighlightLayersToTop(map);
+
+        if (activeHighlight !== lastImportFitHighlightRef.current) {
+          lastImportFitHighlightRef.current = activeHighlight;
+          const focusBbox =
+            activeHighlight.bbox ?? bboxFromEndpointFixGeojson(activeHighlight.geojson);
+          if (focusBbox) {
+            map.resize();
+            fitMapBounds(map, focusBbox, {
+              maxZoom: 22,
+              padding: 36,
+              minSpan: 0.00008,
+              duration: 650,
+            });
+          }
+        }
       });
     };
 
-    if (map.isStyleLoaded()) {
-      applyImportHighlight();
-    } else {
-      whenMapCanAddLayers(map, applyImportHighlight);
-    }
-  }, [importSegmentHighlight, isLightMode, mapReady, networkGeometryMode]);
+    return scheduleMapLayerWork(map, applyImportHighlight);
+  }, [activeImportSegmentHighlight, isLightMode, mapReady, networkGeometryMode, gisOverviewAvailable]);
+
+  // HTML labels for endpoint-fix preview (glyph symbol layers are unreliable).
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+
+    const clearLabelMarkers = () => {
+      for (const marker of importSegmentLabelMarkersRef.current) marker.remove();
+      importSegmentLabelMarkersRef.current = [];
+    };
+
+    const syncLabelMarkers = () => {
+      clearLabelMarkers();
+      if (!activeImportSegmentHighlight) return;
+
+      const geojson = activeImportSegmentHighlight.geojson;
+      const lineBefore = asLineStringFeatureCollection(
+        geojson.line_before?.features?.length ? geojson.line_before : geojson.line,
+      );
+      const labelGeojson = {
+        ...geojson,
+        suggested_links: filterGapLinksDistinctFromWire(
+          asLineStringFeatureCollection(geojson.suggested_links),
+          lineBefore,
+        ),
+      };
+
+      const labels = collectImportSegmentMapLabels(labelGeojson)
+        .sort((a, b) => {
+          const rank = (kind: typeof a.kind) =>
+            kind === 'start-badge' || kind === 'end-badge' ? 1 : 0;
+          return rank(a.kind) - rank(b.kind);
+        });
+      for (const label of labels) {
+        const root = document.createElement('div');
+        root.className = 'giop-map-endpoint-label-root';
+        const el = document.createElement('div');
+        el.className = `giop-map-endpoint-label giop-map-endpoint-label--${label.kind}${
+          isLightMode ? '' : ' giop-map-endpoint-label--dark'
+        }`;
+        el.textContent = label.text;
+        root.appendChild(el);
+        const { anchor, offset } =
+          label.kind === 'start-badge' || label.kind === 'end-badge'
+            ? importSegmentDirectionBadgePlacement(map, label)
+            : importSegmentLabelMarkerPlacement(map, label);
+        const marker = new maplibregl.Marker({
+          element: root,
+          anchor,
+          offset,
+          pitchAlignment: 'viewport',
+          rotationAlignment: 'viewport',
+        })
+          .setLngLat(label.coord)
+          .addTo(map);
+        importSegmentLabelMarkersRef.current.push(marker);
+      }
+    };
+
+    syncLabelMarkers();
+    map.on('move', syncLabelMarkers);
+    map.on('zoom', syncLabelMarkers);
+
+    return () => {
+      map.off('move', syncLabelMarkers);
+      map.off('zoom', syncLabelMarkers);
+      clearLabelMarkers();
+    };
+  }, [activeImportSegmentHighlight, isLightMode, mapReady]);
+
+  // Network tile refreshes can bury the highlight — keep it on top while active.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady || !activeImportSegmentHighlight) return;
+
+    const repin = () => pinImportSegmentHighlightLayersToTop(map);
+    map.on('idle', repin);
+    repin();
+    return () => {
+      map.off('idle', repin);
+    };
+  }, [activeImportSegmentHighlight, mapReady, networkGeometryMode]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -1800,17 +2088,20 @@ export function GiopMapView({
     const map = mapRef.current;
     if (!map || !mapReady) return;
 
-    const { line, points, labels } = buildMeasureGeoJson(measurePoints);
+    const { line, points } = buildMeasureGeoJson(measurePoints);
     const showMeasure = mapMeasureActive && measurePoints.length > 0;
+
+    const clearDimMarkers = () => {
+      for (const marker of measureDimMarkersRef.current) marker.remove();
+      measureDimMarkersRef.current = [];
+    };
 
     const applyMeasureOverlay = () => {
       safeMapMutate(map, () => {
         if (!showMeasure) {
-          if (map.getLayer(MAP_MEASURE_LABEL_LAYER)) map.removeLayer(MAP_MEASURE_LABEL_LAYER);
           if (map.getLayer(MAP_MEASURE_POINT_LAYER)) map.removeLayer(MAP_MEASURE_POINT_LAYER);
           if (map.getLayer(MAP_MEASURE_POINT_HALO_LAYER)) map.removeLayer(MAP_MEASURE_POINT_HALO_LAYER);
           if (map.getLayer(MAP_MEASURE_LINE_LAYER)) map.removeLayer(MAP_MEASURE_LINE_LAYER);
-          if (map.getSource(MAP_MEASURE_LABEL_SOURCE)) map.removeSource(MAP_MEASURE_LABEL_SOURCE);
           if (map.getSource(MAP_MEASURE_POINT_SOURCE)) map.removeSource(MAP_MEASURE_POINT_SOURCE);
           if (map.getSource(MAP_MEASURE_LINE_SOURCE)) map.removeSource(MAP_MEASURE_LINE_SOURCE);
           return;
@@ -1871,37 +2162,66 @@ export function GiopMapView({
           }
         }
 
-        if (map.getSource(MAP_MEASURE_LABEL_SOURCE)) {
-          (map.getSource(MAP_MEASURE_LABEL_SOURCE) as maplibregl.GeoJSONSource).setData(labels);
-        } else if (labels.features.length > 0) {
-          map.addSource(MAP_MEASURE_LABEL_SOURCE, { type: 'geojson', data: labels });
-        }
-
-        if (labels.features.length > 0 && map.getSource(MAP_MEASURE_LABEL_SOURCE) && !map.getLayer(MAP_MEASURE_LABEL_LAYER)) {
-          map.addLayer({
-            id: MAP_MEASURE_LABEL_LAYER,
-            type: 'symbol',
-            source: MAP_MEASURE_LABEL_SOURCE,
-            layout: measureLabelLayout(),
-            paint: measureLabelPaint(isLightMode),
-          });
-        } else if (map.getLayer(MAP_MEASURE_LABEL_LAYER)) {
-          const labelPaint = measureLabelPaint(isLightMode);
-          for (const key of Object.keys(labelPaint) as Array<keyof typeof labelPaint>) {
-            map.setPaintProperty(MAP_MEASURE_LABEL_LAYER, key, labelPaint[key]);
-          }
-        }
-
         pinFocusIdentifyLayersToTop(map);
         pinMeasureLayersToTop(map);
       });
     };
+
+    // Chips parallel to each segment, offset to the side (screen-space angle).
+    const syncDimMarkers = () => {
+      clearDimMarkers();
+      if (!showMeasure || measurePoints.length < 2) return;
+      const sidePx = 16;
+      for (let i = 1; i < measurePoints.length; i += 1) {
+        const start = measurePoints[i - 1];
+        const end = measurePoints[i];
+        const dims = buildMeasureSegmentDimensions([start, end]);
+        const dim = dims[0];
+        if (!dim) continue;
+
+        const a = map.project(start);
+        const b = map.project(end);
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        // Screen angle of the segment (CSS: clockwise degrees from +x).
+        let angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
+        // Keep text readable (not upside-down).
+        if (angleDeg > 90 || angleDeg < -90) angleDeg += 180;
+
+        const root = document.createElement('div');
+        root.className = 'giop-map-measure-dim-root';
+        const el = document.createElement('div');
+        el.className = `giop-map-measure-dim${isLightMode ? ' giop-map-measure-dim--light' : ' giop-map-measure-dim--dark'}`;
+        el.textContent = dim.label;
+        // Right-to-left: translate beside the line in local space, then rotate to match.
+        el.style.transform = `rotate(${angleDeg}deg) translateY(-${sidePx}px)`;
+        root.appendChild(el);
+        const marker = new maplibregl.Marker({
+          element: root,
+          anchor: 'center',
+          pitchAlignment: 'viewport',
+          rotationAlignment: 'viewport',
+          rotation: 0,
+        })
+          .setLngLat(dim.coord)
+          .addTo(map);
+        measureDimMarkersRef.current.push(marker);
+      }
+    };
+
+    syncDimMarkers();
+    map.on('move', syncDimMarkers);
 
     if (map.isStyleLoaded()) {
       applyMeasureOverlay();
     } else {
       whenMapCanAddLayers(map, applyMeasureOverlay);
     }
+
+    return () => {
+      map.off('move', syncDimMarkers);
+      clearDimMarkers();
+    };
   }, [isLightMode, mapMeasureActive, mapReady, measurePoints]);
 
   useEffect(() => {
@@ -2761,6 +3081,28 @@ export function GiopMapView({
             </button>
           </div>
         )}
+        {activeImportSegmentHighlight
+          && isEndpointFixHighlight(activeImportSegmentHighlight.geojson) && (
+          <div
+            className={`giop-map-endpoint-fix-legend pointer-events-none ${
+              isLightMode
+                ? 'giop-map-endpoint-fix-legend--light'
+                : 'giop-map-endpoint-fix-legend--dark'
+            }`}
+            role="status"
+          >
+            <span className="giop-map-endpoint-fix-legend__swatch giop-map-endpoint-fix-legend__swatch--gray" />
+            <span>Wire today</span>
+            <span className="giop-map-endpoint-fix-legend__sep">·</span>
+            <span className="giop-map-endpoint-fix-legend__swatch giop-map-endpoint-fix-legend__swatch--dashed" />
+            <span>Gap</span>
+            <span className="giop-map-endpoint-fix-legend__sep">·</span>
+            <span className="giop-map-endpoint-fix-legend__from">START</span>
+            <span>/</span>
+            <span className="giop-map-endpoint-fix-legend__to">END</span>
+            <span>on wire</span>
+          </div>
+        )}
         {mapMeasureActive && (
           <div
             className={`giop-map-measure-hud pointer-events-auto ${
@@ -2891,6 +3233,7 @@ export function GiopMapView({
           mapReady={!mapBusy}
           includeGisOverview={gisOverviewAvailable}
           geometryMode={networkGeometryMode}
+          suppressUnpromotedGapLayer={Boolean(activeImportSegmentHighlight)}
         />
         )}
       </div>

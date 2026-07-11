@@ -19,6 +19,8 @@ interface GiopMapLegendProps {
   mapReady?: boolean;
   includeGisOverview?: boolean;
   geometryMode?: NetworkGeometryMode;
+  /** Hide district-wide GIS gap tiles while a row preview overlay is active. */
+  suppressUnpromotedGapLayer?: boolean;
 }
 
 function LegendSwatch({ entry }: { entry: GiopLegendGroup }) {
@@ -80,6 +82,7 @@ export function GiopMapLegend({
   mapReady = true,
   includeGisOverview = false,
   geometryMode = 'master',
+  suppressUnpromotedGapLayer = false,
 }: GiopMapLegendProps) {
   const groups = useMemo(
     () => buildGiopLegendGroups(isLightMode, { includeGisOverview }),
@@ -103,8 +106,9 @@ export function GiopMapLegend({
     applyGiopLegendVisibility(map, visibility, {
       geometryMode,
       gisOverviewAvailable: includeGisOverview,
+      suppressUnpromotedGapLayer,
     });
-  }, [mapRef, mapReady, visibility, geometryMode, includeGisOverview, mapZoom]);
+  }, [mapRef, mapReady, visibility, geometryMode, includeGisOverview, suppressUnpromotedGapLayer]);
 
   const handleRowDoubleClick = useCallback(
     (group: GiopLegendGroup) => {

@@ -272,6 +272,9 @@ const OVERVIEW_MARTIN_LAYER: Record<string, string> = {
   overview_oh_conductor_11kv: 'oh_conductor_11kv',
   overview_power_transformer: 'power_transformer',
   overview_distribution_transformer: 'distribution_transformer',
+  overview_oh_support_structure_33kv: 'oh_support_structure_33kv',
+  overview_oh_support_structure_11kv: 'oh_support_structure_11kv',
+  overview_oh_support_structure_lvle: 'oh_support_structure_lvle',
 };
 
 /** MapLibre source id → Martin tileset path segment. */
@@ -296,6 +299,9 @@ export const MARTIN_GIS_OVERVIEW_REFRESH_SOURCE_IDS = [
   'overview_oh_conductor_11kv',
   'overview_power_transformer',
   'overview_distribution_transformer',
+  'overview_oh_support_structure_33kv',
+  'overview_oh_support_structure_11kv',
+  'overview_oh_support_structure_lvle',
 ] as const;
 
 /** Martin source ids eligible for cache-bust on repair/promote. */
@@ -320,6 +326,13 @@ export const GIS_TRANSFORMER_LAYER_IDS = [
   'overview-transformers',
   'nodes-transformers-dt',
   'nodes-transformers-pt',
+] as const;
+
+/** GIS GPKG support-structure (pole) circles — GIS mode stand-in for master nodes. */
+export const GIS_POLE_LAYER_IDS = [
+  'overview-poles-33kv',
+  'overview-poles-11kv',
+  'overview-poles-lv',
 ] as const;
 
 /** Raw GPKG / GIS import Martin overview layers (country → mid zoom). */
@@ -411,14 +424,17 @@ export const NETWORK_GEOMETRY_MODE_META: Record<
   },
 };
 
-/** Extend GIS overview / compare gap layers through street zoom (map tab default is z13). */
-export const GIS_COMPARE_MAX_ZOOM = 16;
-
-/** Martin vector tile max zoom — MapLibre overzooms sources above this. */
-export const MARTIN_VECTOR_SOURCE_MAX_ZOOM = GIS_COMPARE_MAX_ZOOM;
-
 /** Layer maxzoom ceiling (exclusive); 24 = visible through map maxZoom 20. */
 export const GIOP_VECTOR_LAYER_MAX_ZOOM = 24;
+
+/** Extend GIS compare gap *layer* visibility through street zoom (tiles overzoom above tile max). */
+export const GIS_COMPARE_LAYER_MAX_ZOOM = GIOP_VECTOR_LAYER_MAX_ZOOM;
+
+/** Martin vector tile max zoom — MapLibre overzooms sources above this. */
+export const MARTIN_VECTOR_SOURCE_MAX_ZOOM = 16;
+
+/** @deprecated Use GIS_COMPARE_LAYER_MAX_ZOOM for layer maxzoom; tiles still fetch to MARTIN_VECTOR_SOURCE_MAX_ZOOM. */
+export const GIS_COMPARE_MAX_ZOOM = MARTIN_VECTOR_SOURCE_MAX_ZOOM;
 
 const GIS_OVERVIEW_LINE_STYLE: Record<
   string,
@@ -481,11 +497,15 @@ function applyGisOverviewZoomRange(
     const minZoom = spec?.minzoom ?? MIN_MAP_ZOOM;
     map.setLayerZoomRange(layerId, minZoom, maxZoom);
   }
+  for (const layerId of GIS_POLE_LAYER_IDS) {
+    if (!map.getLayer(layerId)) continue;
+    map.setLayerZoomRange(layerId, DETAIL_NODE_MIN_ZOOM, maxZoom);
+  }
 }
 
 function applyUnpromotedGapZoomRange(map: MaplibreMap, mode: NetworkGeometryMode): void {
   if (!map.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID)) return;
-  const maxZoom = mode === 'both' ? GIOP_VECTOR_LAYER_MAX_ZOOM : NODE_DETAIL_ZOOM;
+  const maxZoom = mode === 'both' ? GIS_COMPARE_LAYER_MAX_ZOOM : NODE_DETAIL_ZOOM;
   map.setLayerZoomRange(UNPROMOTED_GIS_GAP_LAYER_ID, UNPROMOTED_GIS_GAP_MIN_ZOOM, maxZoom);
 }
 
@@ -534,7 +554,14 @@ function applyNetworkGeometryModeOverride(
     }
   }
 
-  setGiopLayerVisibility(map, UNPROMOTED_GIS_GAP_LAYER_ID, false);
+  const showGapInBoth =
+    mode === 'both'
+    && !countryScale
+    && Boolean(map.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID));
+
+  if (!showGapInBoth) {
+    setGiopLayerVisibility(map, UNPROMOTED_GIS_GAP_LAYER_ID, false);
+  }
 
   if (mode === 'gis' && gisOk) {
     for (const layerId of GIS_IMPORT_GEOMETRY_LAYER_IDS) {
@@ -544,13 +571,16 @@ function applyNetworkGeometryModeOverride(
       if (layerId === 'overview-transformers') continue;
       setGiopLayerVisibility(map, layerId, true);
     }
+    for (const layerId of GIS_POLE_LAYER_IDS) {
+      setGiopLayerVisibility(map, layerId, true);
+    }
     for (const layerId of MASTER_NETWORK_LINE_LAYER_IDS) {
       setGiopLayerVisibility(map, layerId, false);
     }
     for (const layerId of MASTER_NETWORK_TRANSFORMER_LAYER_IDS) {
       setGiopLayerVisibility(map, layerId, false);
     }
-    // Master connectivity nodes do not align with raw GIS geometry.
+    // Master connectivity nodes do not align with raw GIS geometry — use GIS poles.
     setGiopLayerVisibility(map, 'nodes', false);
     setGiopLayerVisibility(map, UNPROMOTED_GIS_GAP_LAYER_ID, false);
     return;
@@ -562,6 +592,9 @@ function applyNetworkGeometryModeOverride(
         setGiopLayerVisibility(map, layerId, false);
       }
       for (const layerId of GIS_TRANSFORMER_LAYER_IDS) {
+        setGiopLayerVisibility(map, layerId, false);
+      }
+      for (const layerId of GIS_POLE_LAYER_IDS) {
         setGiopLayerVisibility(map, layerId, false);
       }
     }
@@ -577,12 +610,15 @@ function applyNetworkGeometryModeOverride(
       for (const layerId of GIS_TRANSFORMER_LAYER_IDS) {
         setGiopLayerVisibility(map, layerId, false);
       }
-      setGiopLayerVisibility(
-        map,
-        UNPROMOTED_GIS_GAP_LAYER_ID,
-        Boolean(map.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID)),
-      );
+      for (const layerId of GIS_POLE_LAYER_IDS) {
+        setGiopLayerVisibility(map, layerId, false);
+      }
     }
+    setGiopLayerVisibility(
+      map,
+      UNPROMOTED_GIS_GAP_LAYER_ID,
+      Boolean(map.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID)),
+    );
     return;
   }
 }
@@ -600,7 +636,7 @@ export function syncNetworkGeometryModeOnMap(
     if (mode === 'gis' || countryScale) {
       ensureGisOverviewOnMap(map, options.martinUrl, options.light ?? true);
     }
-    if (mode === 'both' && !countryScale) {
+    if (mode === 'both') {
       ensureUnpromotedGapOnMap(map, options.martinUrl, options.light ?? true);
     }
   }
@@ -1177,6 +1213,16 @@ export function syncGiopMapTheme(map: MaplibreMap, isLightMode: boolean): void {
     map.setPaintProperty('nodes', 'circle-stroke-color', nodePaint['circle-stroke-color']);
     map.setPaintProperty('nodes', 'circle-stroke-opacity', nodePaint['circle-stroke-opacity']);
   }
+  for (const layerId of GIS_POLE_LAYER_IDS) {
+    if (!map.getLayer(layerId)) continue;
+    const nodePaint = tileNodeCirclePaint(isLightMode);
+    map.setPaintProperty(layerId, 'circle-radius', nodePaint['circle-radius']);
+    map.setPaintProperty(layerId, 'circle-color', nodePaint['circle-color']);
+    map.setPaintProperty(layerId, 'circle-opacity', nodePaint['circle-opacity']);
+    map.setPaintProperty(layerId, 'circle-stroke-width', nodePaint['circle-stroke-width']);
+    map.setPaintProperty(layerId, 'circle-stroke-color', nodePaint['circle-stroke-color']);
+    map.setPaintProperty(layerId, 'circle-stroke-opacity', nodePaint['circle-stroke-opacity']);
+  }
   for (const band of H3_COVERAGE_RES_BANDS) {
     if (map.getLayer(band.outlineId)) {
       const outlinePaint = h3CoverageOutlinePaint(isLightMode);
@@ -1306,6 +1352,16 @@ export function applyTileLayerTheme(map: MaplibreMap, isLightMode: boolean) {
     map.setPaintProperty('nodes', 'circle-stroke-color', nodePaint['circle-stroke-color']);
     map.setPaintProperty('nodes', 'circle-stroke-opacity', nodePaint['circle-stroke-opacity']);
   }
+  for (const layerId of GIS_POLE_LAYER_IDS) {
+    if (!map.getLayer(layerId)) continue;
+    const nodePaint = tileNodeCirclePaint(isLightMode);
+    map.setPaintProperty(layerId, 'circle-radius', nodePaint['circle-radius']);
+    map.setPaintProperty(layerId, 'circle-color', nodePaint['circle-color']);
+    map.setPaintProperty(layerId, 'circle-stroke-width', nodePaint['circle-stroke-width']);
+    map.setPaintProperty(layerId, 'circle-stroke-color', nodePaint['circle-stroke-color']);
+    map.setPaintProperty(layerId, 'circle-opacity', nodePaint['circle-opacity']);
+    map.setPaintProperty(layerId, 'circle-stroke-opacity', nodePaint['circle-stroke-opacity']);
+  }
 }
 
 const GIS_OVERVIEW_BEFORE_LAYER = 'lines-overhead-mv';
@@ -1346,6 +1402,24 @@ function gisOverviewSourceEntries(martinUrl: string): Record<string, ReturnType<
       martinUrl,
       'distribution_transformer',
       TRANSFORMER_ICON_MIN_ZOOM,
+      maxZoom,
+    ),
+    overview_oh_support_structure_33kv: martinVectorSource(
+      martinUrl,
+      'oh_support_structure_33kv',
+      DETAIL_NODE_MIN_ZOOM,
+      maxZoom,
+    ),
+    overview_oh_support_structure_11kv: martinVectorSource(
+      martinUrl,
+      'oh_support_structure_11kv',
+      DETAIL_NODE_MIN_ZOOM,
+      maxZoom,
+    ),
+    overview_oh_support_structure_lvle: martinVectorSource(
+      martinUrl,
+      'oh_support_structure_lvle',
+      DETAIL_NODE_MIN_ZOOM,
       maxZoom,
     ),
   };
@@ -1464,6 +1538,39 @@ function gisOverviewConductorLayerEntries(light: boolean): StyleSpecification['l
   ] as StyleSpecification['layers'];
 }
 
+function gisOverviewPoleLayerEntries(light: boolean): StyleSpecification['layers'] {
+  const paint = tileNodeCirclePaint(light);
+  return [
+    {
+      id: 'overview-poles-33kv',
+      type: 'circle',
+      source: 'overview_oh_support_structure_33kv',
+      'source-layer': 'oh_support_structure_33kv',
+      minzoom: DETAIL_NODE_MIN_ZOOM,
+      maxzoom: NODE_DETAIL_ZOOM,
+      paint: { ...paint },
+    },
+    {
+      id: 'overview-poles-11kv',
+      type: 'circle',
+      source: 'overview_oh_support_structure_11kv',
+      'source-layer': 'oh_support_structure_11kv',
+      minzoom: DETAIL_NODE_MIN_ZOOM,
+      maxzoom: NODE_DETAIL_ZOOM,
+      paint: { ...paint },
+    },
+    {
+      id: 'overview-poles-lv',
+      type: 'circle',
+      source: 'overview_oh_support_structure_lvle',
+      'source-layer': 'oh_support_structure_lvle',
+      minzoom: DETAIL_NODE_MIN_ZOOM,
+      maxzoom: NODE_DETAIL_ZOOM,
+      paint: { ...paint },
+    },
+  ] as StyleSpecification['layers'];
+}
+
 function gisOverviewTransformerLayerEntries(light: boolean): StyleSpecification['layers'] {
   return [
     {
@@ -1526,6 +1633,7 @@ function masterTransformerLayerEntries(): StyleSpecification['layers'] {
 function gisOverviewLayerEntries(light: boolean): StyleSpecification['layers'] {
   return [
     ...gisOverviewConductorLayerEntries(light),
+    ...gisOverviewPoleLayerEntries(light),
     ...gisOverviewTransformerLayerEntries(light),
   ] as StyleSpecification['layers'];
 }
@@ -1570,6 +1678,12 @@ export function ensureGisOverviewOnMap(map: MaplibreMap, martinUrl: string, ligh
       map.addLayer(layer, GIS_OVERVIEW_BEFORE_LAYER);
     }
   }
+  for (const layer of gisOverviewPoleLayerEntries(light)) {
+    if (!map.getLayer(layer.id)) {
+      const before = map.getLayer('nodes') ? 'nodes' : GIS_OVERVIEW_BEFORE_LAYER;
+      map.addLayer(layer, before);
+    }
+  }
   for (const layer of gisOverviewTransformerLayerEntries(light)) {
     if (!map.getLayer(layer.id)) {
       const before = map.getLayer(TRANSFORMER_OVERLAY_BEFORE_LAYER)
@@ -1594,6 +1708,9 @@ export function buildGiopMapStyle(
   const gisOverviewSources = includeGisOverview ? gisOverviewSourceEntries(martinUrl) : {};
   const gisOverviewConductorLayers = (includeGisOverview
     ? gisOverviewConductorLayerEntries(light)
+    : []) as StyleSpecification['layers'];
+  const gisOverviewPoleLayers = (includeGisOverview
+    ? gisOverviewPoleLayerEntries(light)
     : []) as StyleSpecification['layers'];
   const gisOverviewTransformerLayers = (includeGisOverview
     ? gisOverviewTransformerLayerEntries(light)
@@ -1732,6 +1849,7 @@ export function buildGiopMapStyle(
         filter: tileNodeNonTransformerFilter(),
         paint: tileNodeCirclePaint(light),
       },
+      ...gisOverviewPoleLayers,
       ...gisOverviewTransformerLayers,
       ...masterTransformerLayerEntries(),
       // H3 rebuild coverage above network geometry (toggle via layout visibility).
@@ -1897,11 +2015,14 @@ export const GIOP_LAYER_ZOOM_RANGE: Record<string, { min?: number; max?: number 
   'overview-ug-33kv': { min: 0, max: NODE_DETAIL_ZOOM },
   'overview-ug-11kv': { min: 0, max: NODE_DETAIL_ZOOM },
   'overview-transformers': { min: MIN_MAP_ZOOM, max: NODE_DETAIL_ZOOM },
+  'overview-poles-33kv': { min: DETAIL_NODE_MIN_ZOOM, max: NODE_DETAIL_ZOOM },
+  'overview-poles-11kv': { min: DETAIL_NODE_MIN_ZOOM, max: NODE_DETAIL_ZOOM },
+  'overview-poles-lv': { min: DETAIL_NODE_MIN_ZOOM, max: NODE_DETAIL_ZOOM },
   'lines-overhead-mv': { min: DETAIL_LINE_MIN_ZOOM },
   'lines-underground-mv': { min: DETAIL_LINE_MIN_ZOOM },
   'lines-overhead-lv': { min: DETAIL_LV_MIN_ZOOM },
   'lines-underground-lv': { min: DETAIL_LV_MIN_ZOOM },
-  [UNPROMOTED_GIS_GAP_LAYER_ID]: { min: UNPROMOTED_GIS_GAP_MIN_ZOOM },
+  [UNPROMOTED_GIS_GAP_LAYER_ID]: { min: UNPROMOTED_GIS_GAP_MIN_ZOOM, max: GIS_COMPARE_LAYER_MAX_ZOOM },
   nodes: { min: DETAIL_NODE_MIN_ZOOM },
   'nodes-transformers-dt': { min: TRANSFORMER_ICON_MIN_ZOOM },
   'nodes-transformers-pt': { min: TRANSFORMER_ICON_MIN_ZOOM },
@@ -2005,7 +2126,7 @@ export function buildGiopLegendGroups(
       label: 'Pole / node (red = in conflict)',
       color: isLightMode ? '#64748b' : '#94a3b8',
       dot: true,
-      layerIds: ['nodes'],
+      layerIds: ['nodes', ...GIS_POLE_LAYER_IDS],
     },
     {
       id: 'staging-pending',
@@ -2054,7 +2175,7 @@ function giopLegendGroupOn(state: GiopLegendVisibilityState, groupId: string): b
   return state[groupId] !== false;
 }
 
-function setGiopLayerVisibility(map: MaplibreMap, layerId: string, visible: boolean): void {
+export function setGiopLayerVisibility(map: MaplibreMap, layerId: string, visible: boolean): void {
   if (!map.getLayer(layerId)) return;
   map.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none');
 }
@@ -2103,11 +2224,18 @@ export function applyGiopLegendVisibility(
   options?: {
     geometryMode?: NetworkGeometryMode;
     gisOverviewAvailable?: boolean;
+    /** Endpoint-fix row preview — hide district-wide gap tiles. */
+    suppressUnpromotedGapLayer?: boolean;
   },
 ): void {
   const geometryMode = options?.geometryMode ?? 'master';
+  const gisOk = options?.gisOverviewAvailable !== false;
   const mvVoltages = enabledMvVoltages(state);
   const undergroundOn = giopLegendGroupOn(state, 'underground');
+  const mv33On = giopLegendGroupOn(state, 'mv-33-overhead');
+  const mv11On = giopLegendGroupOn(state, 'mv-11-overhead');
+  const transformersOn = giopLegendGroupOn(state, 'transformers');
+  const polesOn = giopLegendGroupOn(state, 'poles');
 
   applySharedMvLineLayer(
     map,
@@ -2124,21 +2252,13 @@ export function applyGiopLegendVisibility(
     undergroundOn,
   );
 
-  setGiopLayerVisibility(map, 'overview-oh-33kv', giopLegendGroupOn(state, 'mv-33-overhead'));
-  setGiopLayerVisibility(map, 'overview-oh-11kv', giopLegendGroupOn(state, 'mv-11-overhead'));
+  setGiopLayerVisibility(map, 'overview-oh-33kv', mv33On);
+  setGiopLayerVisibility(map, 'overview-oh-11kv', mv11On);
   const lvOn = giopLegendGroupOn(state, 'lv-overhead');
   setGiopLayerVisibility(map, 'lines-overhead-lv', lvOn);
   setGiopLayerVisibility(map, 'lines-underground-lv', undergroundOn);
-  setGiopLayerVisibility(
-    map,
-    'overview-ug-33kv',
-    undergroundOn && giopLegendGroupOn(state, 'mv-33-overhead'),
-  );
-  setGiopLayerVisibility(
-    map,
-    'overview-ug-11kv',
-    undergroundOn && giopLegendGroupOn(state, 'mv-11-overhead'),
-  );
+  setGiopLayerVisibility(map, 'overview-ug-33kv', undergroundOn && mv33On);
+  setGiopLayerVisibility(map, 'overview-ug-11kv', undergroundOn && mv11On);
 
   const exclusiveByGroup: [string, string[]][] = [
     [
@@ -2151,7 +2271,7 @@ export function applyGiopLegendVisibility(
         'master-transformers-pt',
       ],
     ],
-    ['poles', ['nodes']],
+    ['poles', ['nodes', ...GIS_POLE_LAYER_IDS]],
     ['staging-pending', ['staging-points']],
     ['field-tech', ['field-technician-halo', 'field-technician-points']],
   ];
@@ -2162,15 +2282,37 @@ export function applyGiopLegendVisibility(
     }
   }
 
+  // Legend groups share overview + master layer IDs. Geometry mode must run last
+  // so GIS import does not leave master lines/nodes drawn on top (same red look).
   applyNetworkGeometryModeOverride(map, geometryMode, {
     gisOverviewAvailable: options?.gisOverviewAvailable,
   });
 
+  if (geometryMode === 'gis' && gisOk) {
+    // Override forces all GIS layers on; re-honor voltage / transformer / pole legend.
+    setGiopLayerVisibility(map, 'overview-oh-33kv', mv33On);
+    setGiopLayerVisibility(map, 'overview-oh-11kv', mv11On);
+    setGiopLayerVisibility(map, 'overview-ug-33kv', undergroundOn && mv33On);
+    setGiopLayerVisibility(map, 'overview-ug-11kv', undergroundOn && mv11On);
+    setGiopLayerVisibility(map, 'overview-transformers', transformersOn);
+    setGiopLayerVisibility(map, 'nodes-transformers-dt', transformersOn);
+    setGiopLayerVisibility(map, 'nodes-transformers-pt', transformersOn);
+    for (const layerId of GIS_POLE_LAYER_IDS) {
+      setGiopLayerVisibility(map, layerId, polesOn);
+    }
+  }
+
   if (geometryMode === 'both' && map.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID)) {
-    setGiopLayerVisibility(
-      map,
-      UNPROMOTED_GIS_GAP_LAYER_ID,
-      giopLegendGroupOn(state, 'gis-unpromoted-gap'),
-    );
+    if (options?.suppressUnpromotedGapLayer) {
+      setGiopLayerVisibility(map, UNPROMOTED_GIS_GAP_LAYER_ID, false);
+    } else {
+      setGiopLayerVisibility(
+        map,
+        UNPROMOTED_GIS_GAP_LAYER_ID,
+        giopLegendGroupOn(state, 'gis-unpromoted-gap'),
+      );
+    }
+  } else if (options?.suppressUnpromotedGapLayer && map.getLayer(UNPROMOTED_GIS_GAP_LAYER_ID)) {
+    setGiopLayerVisibility(map, UNPROMOTED_GIS_GAP_LAYER_ID, false);
   }
 }

@@ -543,8 +543,8 @@ export function useGiopRealtimeSession({
             transcription: { model: 'gpt-4o-mini-transcribe' },
             turnDetection: {
               type: 'semantic_vad',
-              // "low" waits longer between phrases — better for hands-free pauses.
-              eagerness: 'low',
+              // "medium" commits sooner after you finish; still tolerates short pauses.
+              eagerness: 'medium',
               createResponse: true,
               interruptResponse: true,
             },

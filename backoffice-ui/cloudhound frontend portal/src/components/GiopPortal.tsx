@@ -267,6 +267,7 @@ function GiopPortalInner() {
   const [opsTopologyFocus, setOpsTopologyFocus] = useState<string | null>(null);
   const [opsTableStaging, setOpsTableStaging] = useState<GiopStagingAsset[]>([]);
   const [opsFlyRequest, setOpsFlyRequest] = useState<GiopMapFlyRequest | null>(null);
+  const [combinedFlyRequest, setCombinedFlyRequest] = useState<GiopMapFlyRequest | null>(null);
 
   const routeStartMrid = route.startMrid || DEFAULT_START_MRID;
   const startMrid = routeStartMrid;
@@ -849,6 +850,14 @@ function GiopPortalInner() {
     [bumpOpsFly, setSelection],
   );
 
+  const bumpCombinedFly = useCallback((coordinates: [number, number] | null) => {
+    if (!coordinates) return;
+    setCombinedFlyRequest((prev) => ({
+      id: (prev?.id ?? 0) + 1,
+      coordinates,
+    }));
+  }, []);
+
   const handleGraphNodeSelect = useCallback(
     (mrid: string, label?: string) => {
       setSelection(mrid, { name: label, source: 'graph' });
@@ -862,6 +871,7 @@ function GiopPortalInner() {
           resolvePortalGraphNodeCoordinates(graph, mrid) ??
           extractStagingGeomCoordinates(staging.find((a) => a.mrid === mrid)?.geom) ??
           null;
+        bumpCombinedFly(coordinates);
         void focusOnMap(mrid, {
           name: label,
           source: 'graph',
@@ -872,6 +882,7 @@ function GiopPortalInner() {
       }
     },
     [
+      bumpCombinedFly,
       clearMapIdentifyFocus,
       focusOnMap,
       graph,
@@ -1127,6 +1138,7 @@ function GiopPortalInner() {
           focusLabel={mapPulseFocus ? (selection.name ?? null) : null}
           pulseFocus={mapPulseFocus}
           pulseFocusTentative={mapPulseTentative}
+          flyRequest={combinedFlyRequest}
         />
       )}
 

@@ -10,7 +10,9 @@ from graph_sync import memgraph_totals
 TRACE_MAX_HOPS = int(os.getenv("TRACE_MAX_HOPS", "10"))
 TRACE_MAX_NODES = int(os.getenv("TRACE_MAX_NODES", "5000"))
 TRACE_MAX_EDGES = int(os.getenv("TRACE_MAX_EDGES", "15000"))
-TRACE_FULL_HOPS = int(os.getenv("TRACE_FULL_HOPS", "12"))
+# Map impact / full-neighborhood walks — keep aligned with Postgres BFS (64).
+TRACE_FULL_HOPS = int(os.getenv("TRACE_FULL_HOPS", "64"))
+TRACE_HOP_CEILING = int(os.getenv("TRACE_HOP_CEILING", "64"))
 MEMGRAPH_TRACE_MIN_EDGES = int(os.getenv("MEMGRAPH_TRACE_MIN_EDGES", "100"))
 
 _trace_driver = None
@@ -39,7 +41,8 @@ def memgraph_trace_ready(driver) -> bool:
 
 def _clamp_hops(max_hops: int | None, *, full: bool = False) -> int:
     default = TRACE_FULL_HOPS if full else TRACE_MAX_HOPS
-    return max(1, min(max_hops or default, 20))
+    ceiling = max(1, TRACE_HOP_CEILING)
+    return max(1, min(max_hops or default, ceiling))
 
 
 def _clamp_nodes(max_nodes: int | None) -> int:
@@ -48,6 +51,20 @@ def _clamp_nodes(max_nodes: int | None) -> int:
 
 def _clamp_edges(max_edges: int | None) -> int:
     return max(100, min(max_edges or TRACE_MAX_EDGES, 50000))
+
+
+def _has_outbound_beyond(driver, mrids: set[str]) -> bool:
+    """True when any included node has a directed edge leaving the set."""
+    if len(mrids) < 2:
+        return False
+    query = """
+        MATCH (a:ConnectivityNode)-[:AC_LINE_SEGMENT]->(b:ConnectivityNode)
+        WHERE a.mrid IN $mrids AND NOT (b.mrid IN $mrids)
+        RETURN 1 AS x
+        LIMIT 1
+    """
+    with driver.session() as session:
+        return session.run(query, mrids=list(mrids)).single() is not None
 
 
 def collect_downstream_mrids(
@@ -74,6 +91,9 @@ def collect_downstream_mrids(
         if mrid:
             mrids.add(str(mrid))
     if len(rows) >= cap or len(mrids) >= cap:
+        truncated = True
+    elif _has_outbound_beyond(driver, mrids):
+        # Hop ceiling (or sparse LIMIT) left reachable downstream uncollected.
         truncated = True
     return mrids, truncated
 
@@ -188,22 +208,29 @@ def enrich_nodes_from_postgres(conn, nodes: list[dict[str, Any]], traced_mrids: 
     if not nodes:
         return []
     mrids = [n["mrid"] for n in nodes]
+
+    # Batch large MRID lists to avoid Postgres temp-file spill (disk full).
+    _ENRICH_BATCH = 500
+    rows: dict[str, Any] = {}
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-              cn.mrid::text,
-              io.name,
-              io.validation::text,
-              ST_Y(cn.geom) AS lat,
-              ST_X(cn.geom) AS lon
-            FROM public.connectivity_nodes cn
-            JOIN public.identified_objects io ON io.mrid = cn.mrid
-            WHERE cn.mrid = ANY(%s::uuid[])
-            """,
-            (mrids,),
-        )
-        rows = {row[0]: row for row in cur.fetchall()}
+        for i in range(0, len(mrids), _ENRICH_BATCH):
+            batch = mrids[i : i + _ENRICH_BATCH]
+            cur.execute(
+                """
+                SELECT
+                  cn.mrid::text,
+                  io.name,
+                  io.validation::text,
+                  ST_Y(cn.geom) AS lat,
+                  ST_X(cn.geom) AS lon
+                FROM public.connectivity_nodes cn
+                JOIN public.identified_objects io ON io.mrid = cn.mrid
+                WHERE cn.mrid = ANY(%s::uuid[])
+                """,
+                (batch,),
+            )
+            for row in cur.fetchall():
+                rows[row[0]] = row
 
     enriched: list[dict[str, Any]] = []
     for node in nodes:

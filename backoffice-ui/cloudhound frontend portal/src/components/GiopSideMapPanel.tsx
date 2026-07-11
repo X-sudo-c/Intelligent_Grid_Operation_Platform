@@ -118,6 +118,7 @@ export function GiopSideMapPanel({
           onNodeClick={onNodeClick}
           impactOverlay={impactOverlay}
           flyRequest={flyRequest}
+          enableImportSegmentHighlight={persistent}
         />
       </div>
     </div>

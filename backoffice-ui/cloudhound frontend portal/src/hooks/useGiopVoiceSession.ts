@@ -1,12 +1,17 @@
 /**
  * Voice capture — record in browser, auto-send on silence, one API hop to copilot.
+ *
+ * Mic opens immediately for the wave UI; MediaRecorder only starts after VAD
+ * detects speech so silence is not uploaded. Trailing silence ends the turn.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { DEFAULT_VOICE_VAD, VoiceVadMonitor } from '../lib/giopVoiceVad';
 
 const MAX_RECORD_MS = 12_000;
-const VAD_POLL_MS = 60;
+/** Max wait for the user to start speaking after arming the mic. */
+const MAX_ARM_MS = 8_000;
+const VAD_POLL_MS = 50;
 
 function pickRecorderMime(): string {
   const candidates = [
@@ -23,6 +28,12 @@ function pickRecorderMime(): string {
 
 function streamIsLive(stream: MediaStream | null): boolean {
   return Boolean(stream?.getTracks().some((t) => t.readyState === 'live'));
+}
+
+function blobWouldHaveSpeech(chunks: Blob[]): boolean {
+  let size = 0;
+  for (const part of chunks) size += part.size;
+  return size >= 800;
 }
 
 export interface PendingVoiceTranscript {
@@ -56,6 +67,7 @@ export function useGiopVoiceSession({
   const chunksRef = useRef<Blob[]>([]);
   const mimeRef = useRef('audio/webm');
   const maxTimerRef = useRef<number | undefined>(undefined);
+  const armTimerRef = useRef<number | undefined>(undefined);
   const vadTimerRef = useRef<number | undefined>(undefined);
   const vadRef = useRef(new VoiceVadMonitor());
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -64,6 +76,10 @@ export function useGiopVoiceSession({
   const keepStreamRef = useRef(keepStreamBetweenTurns);
   const autoSendRef = useRef(autoSendOnSilence);
   const startRecordingRef = useRef<() => void>(() => undefined);
+  /** True once MediaRecorder has started for this armed turn. */
+  const captureStartedRef = useRef(false);
+  /** User/manual stop — allow empty blob without "no speech" error when keepStream. */
+  const discardTurnRef = useRef(false);
 
   onAudioTurnRef.current = onAudioTurn;
   keepStreamRef.current = keepStreamBetweenTurns;
@@ -97,12 +113,15 @@ export function useGiopVoiceSession({
   const stopVad = useCallback(() => {
     window.clearInterval(vadTimerRef.current);
     vadTimerRef.current = undefined;
+    window.clearTimeout(armTimerRef.current);
+    armTimerRef.current = undefined;
     vadRef.current.reset();
   }, []);
 
   const cleanupAfterTurn = useCallback(() => {
     stopVad();
     recorderRef.current = null;
+    captureStartedRef.current = false;
     window.clearTimeout(maxTimerRef.current);
     if (!keepStreamRef.current || !streamIsLive(streamRef.current)) {
       releaseStream();
@@ -135,6 +154,72 @@ export function useGiopVoiceSession({
     }
   }, [cleanupAnalyser]);
 
+  const beginCapture = useCallback(() => {
+    if (captureStartedRef.current) return;
+    const stream = streamRef.current;
+    const mime = mimeRef.current;
+    if (!stream || !mime) return;
+
+    chunksRef.current = [];
+    discardTurnRef.current = false;
+    const recorder = new MediaRecorder(stream, { mimeType: mime });
+    recorderRef.current = recorder;
+
+    recorder.ondataavailable = (ev) => {
+      if (ev.data.size > 0) chunksRef.current.push(ev.data);
+    };
+
+    recorder.onstop = () => {
+      setRecording(false);
+      // stopVad() may have already reset the monitor; captureStarted is still true here.
+      const hadSpeech = captureStartedRef.current || blobWouldHaveSpeech(chunksRef.current);
+      const blob = new Blob(chunksRef.current, { type: mimeRef.current });
+      cleanupAfterTurn();
+      chunksRef.current = [];
+
+      if (discardTurnRef.current) {
+        discardTurnRef.current = false;
+        return;
+      }
+
+      if (!hadSpeech || blob.size < 800) {
+        if (keepStreamRef.current) {
+          scheduleRestartRef.current();
+        } else {
+          setError('No speech detected — try again.');
+        }
+        return;
+      }
+
+      setProcessing(true);
+      void (async () => {
+        try {
+          await onAudioTurnRef.current(blob);
+          setError(null);
+        } catch (err) {
+          setError(err instanceof Error ? err.message : 'Voice request failed');
+        } finally {
+          setProcessing(false);
+        }
+      })();
+    };
+
+    recorder.onerror = () => {
+      setError('Recording failed — try again.');
+      stopRecordingRef.current();
+    };
+
+    recorder.start(200);
+    captureStartedRef.current = true;
+    window.clearTimeout(armTimerRef.current);
+    armTimerRef.current = undefined;
+    maxTimerRef.current = window.setTimeout(() => {
+      stopRecordingRef.current();
+    }, MAX_RECORD_MS);
+  }, [cleanupAfterTurn]);
+
+  const scheduleRestartRef = useRef<() => void>(() => undefined);
+
   const stopRecording = useCallback(() => {
     stopVad();
     window.clearTimeout(maxTimerRef.current);
@@ -148,6 +233,7 @@ export function useGiopVoiceSession({
       }
       return;
     }
+    // Armed but never spoke — drop the turn without uploading silence.
     cleanupAfterTurn();
     setRecording(false);
   }, [cleanupAfterTurn, stopVad]);
@@ -158,23 +244,49 @@ export function useGiopVoiceSession({
   const scheduleRestart = useCallback(() => {
     if (!keepStreamRef.current) return;
     window.setTimeout(() => {
-      if (!recorderRef.current) startRecordingRef.current();
+      if (!recorderRef.current && !captureStartedRef.current) startRecordingRef.current();
     }, 120);
   }, []);
+  scheduleRestartRef.current = scheduleRestart;
 
   const startVad = useCallback(() => {
-    if (!autoSendRef.current) return;
     stopVad();
     vadRef.current.reset();
+    captureStartedRef.current = false;
+
     vadTimerRef.current = window.setInterval(() => {
       const analyser = analyserRef.current;
+      if (!analyser) return;
+      const now = performance.now();
+      vadRef.current.tick(analyser, now, DEFAULT_VOICE_VAD);
+
+      // Gate: only start MediaRecorder after real speech.
+      if (!captureStartedRef.current && vadRef.current.hasHeardSpeech()) {
+        beginCapture();
+      }
+
+      if (!autoSendRef.current) return;
+      if (!captureStartedRef.current) return;
       const recorder = recorderRef.current;
-      if (!analyser || !recorder || recorder.state === 'inactive') return;
-      if (vadRef.current.shouldSend(analyser, performance.now(), DEFAULT_VOICE_VAD)) {
+      if (!recorder || recorder.state === 'inactive') return;
+      if (vadRef.current.shouldSend(now, DEFAULT_VOICE_VAD)) {
         stopRecordingRef.current();
       }
     }, VAD_POLL_MS);
-  }, [stopVad]);
+
+    armTimerRef.current = window.setTimeout(() => {
+      if (captureStartedRef.current) return;
+      // Never spoke while armed — re-arm handsfree or stop.
+      stopVad();
+      setRecording(false);
+      if (keepStreamRef.current) {
+        scheduleRestartRef.current();
+      } else {
+        cleanupAfterTurn();
+        setError('No speech detected — try again.');
+      }
+    }, MAX_ARM_MS);
+  }, [beginCapture, cleanupAfterTurn, stopVad]);
 
   const startRecording = useCallback(async () => {
     if (!enabled) {
@@ -208,53 +320,10 @@ export function useGiopVoiceSession({
       await attachAnalyser(stream);
       mimeRef.current = mime;
       chunksRef.current = [];
-
-      const recorder = new MediaRecorder(stream, { mimeType: mime });
-      recorderRef.current = recorder;
-
-      recorder.ondataavailable = (ev) => {
-        if (ev.data.size > 0) chunksRef.current.push(ev.data);
-      };
-
-      recorder.onstop = () => {
-        setRecording(false);
-        const blob = new Blob(chunksRef.current, { type: mimeRef.current });
-        cleanupAfterTurn();
-        chunksRef.current = [];
-
-        if (blob.size < 800) {
-          if (keepStreamRef.current) {
-            scheduleRestart();
-          } else {
-            setError('No speech detected — try again.');
-          }
-          return;
-        }
-
-        setProcessing(true);
-        void (async () => {
-          try {
-            await onAudioTurnRef.current(blob);
-            setError(null);
-          } catch (err) {
-            setError(err instanceof Error ? err.message : 'Voice request failed');
-          } finally {
-            setProcessing(false);
-          }
-        })();
-      };
-
-      recorder.onerror = () => {
-        setError('Recording failed — try again.');
-        stopRecording();
-      };
-
-      recorder.start(200);
+      captureStartedRef.current = false;
+      discardTurnRef.current = false;
       setRecording(true);
       startVad();
-      maxTimerRef.current = window.setTimeout(() => {
-        stopRecording();
-      }, MAX_RECORD_MS);
     } catch (err) {
       releaseStream();
       setRecording(false);
@@ -266,15 +335,7 @@ export function useGiopVoiceSession({
         setError(err instanceof Error ? err.message : 'Could not start recording');
       }
     }
-  }, [
-    attachAnalyser,
-    cleanupAfterTurn,
-    enabled,
-    releaseStream,
-    scheduleRestart,
-    startVad,
-    stopRecording,
-  ]);
+  }, [attachAnalyser, enabled, releaseStream, startVad]);
 
   startRecordingRef.current = () => {
     void startRecording();
@@ -286,6 +347,7 @@ export function useGiopVoiceSession({
   }, [processing, recording, startRecording, stopRecording]);
 
   const forceRelease = useCallback(() => {
+    discardTurnRef.current = true;
     stopVad();
     window.clearTimeout(maxTimerRef.current);
     const recorder = recorderRef.current;
@@ -297,6 +359,7 @@ export function useGiopVoiceSession({
       }
     }
     releaseStream();
+    captureStartedRef.current = false;
     setRecording(false);
     setProcessing(false);
   }, [releaseStream, stopVad]);

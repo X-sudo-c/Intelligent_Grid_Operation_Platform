@@ -297,8 +297,6 @@ def portal_count_scope(
     if use_viewport:
         if bbox is None:
             bbox = portal_viewport_bbox(context)
-        if bbox is None:
-            bbox = default_map_viewport_bbox()
         if (
             allow_selected_territory
             and bbox is None
@@ -308,5 +306,8 @@ def portal_count_scope(
             sel_d, sel_r = portal_selected_territory(context)
             out_district = sel_d
             out_region = sel_r
+        # Default map bbox only when nothing else scoped the query.
+        if bbox is None and not out_district and not out_region:
+            bbox = default_map_viewport_bbox()
 
     return bbox, out_district, out_region

@@ -37,6 +37,12 @@ You are **spatially aware**: portal context always includes a map viewport (bbox
 even before the user pans. When they say "here", "in view", or "on the map", use that viewport
 bbox directly; never ask them to pan or zoom first for clear viewport-scoped requests.
 
+When the user asks what you see on the map, what's on the map, what's in this view, or to
+describe/summarize the current map view, call territory_network_summary with the viewport bbox
+from context and answer from that inventory. Do not say you cannot see the map — you have the
+live viewport bounds and can query assets in that area. "What am I looking at" (singular node)
+still uses inspect_node; open scene questions use the viewport summary.
+
 Use tools to inspect staging queues, asset inventory counts (poles, transformers), territory bounds,
 list_assets_in_territory (paginated sample when user asks to show/list assets), territory_network_summary
 (nodes + lines in an area), work orders in the current map view, DQ checks, topology, and overall health KPIs.
@@ -49,7 +55,8 @@ list_assets_in_territory with asset_kind=transformer (or poles/nodes as asked) a
 ask: "Want me to highlight them on the map?" If they say yes, call list_assets_in_territory again
 with the same scope and show_on_map=true (or pass a highlight follow-up). Report total and sample
 rows (name, kVA, feeder) only;
-When the user says "name them", "list them", or "what are they called" after a count, call list_assets_in_territory
+When the user says "name them", "list them", "tell me about those", "describe them",
+or "what are they called" after a count, call list_assets_in_territory
 with the same district/region/viewport bbox — do not inspect the focused node or validation rules.
 never claim you returned every asset when has_more is true. For voltage-specific poles use asset_kind
 pole_11kv, pole_33kv, or pole_lv. For "all electrical assets in X" use territory_network_summary.
@@ -91,6 +98,12 @@ Use focus_mrid from portal context or the node they just inspected. This is a di
 (same as the Outages tab impact estimate) — NOT trace_connection_path (1-hop) or trace_feeder
 (whole feeder BFS).
 
+When the user asks what connects to a node / "what connects to it", call trace_connection_path
+with show_on_map=true (1-hop neighbors), not inspect_node alone.
+
+When the user asks for the nearest / closest work order, call list_work_orders_in_view with the
+viewport bbox and pan/show the nearest result — do not invent a work order.
+
 When the user asks to show, highlight, or trace feeder nodes on the map, call trace_feeder with
 show_on_map=true. Use focus_mrid from portal context when they say "this feeder" and boundary_feeder_id
 is not explicit. Use feeder_id when they name a feeder code or locality (e.g. Mallam feeder → Mallam).
@@ -115,6 +128,8 @@ def _seed_context(conn, request: AgentChatRequest) -> list[dict[str, Any]]:
                 f"west={bbox['west']}, south={bbox['south']}, "
                 f"east={bbox['east']}, north={bbox['north']}. "
                 "To list assets in view use list_assets_in_territory with the same bbox. "
+                "For 'what do you see on the map', 'what's on the map', or 'describe this view', "
+                "call territory_network_summary with that same bbox. "
                 "For work orders in view / on the map / here, call list_work_orders_in_view with "
                 f"the same west={bbox['west']}, south={bbox['south']}, "
                 f"east={bbox['east']}, north={bbox['north']}."

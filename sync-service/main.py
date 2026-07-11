@@ -121,6 +121,7 @@ from topology_analysis import (
     topology_gaps_payload,
     topology_health_report,
 )
+from topology_rewire import rewire_line_endpoints_by_geometry
 from lineage import (
     fetch_asset_updated_at,
     fetch_lineage,
@@ -399,27 +400,32 @@ def _collect_traced_mrids_pg(
     max_hops: int,
     max_nodes: int,
 ) -> tuple[set[str], bool]:
-    """Downstream walk in PostGIS — bounded by hops and node cap."""
+    """Downstream walk in PostGIS — BFS, no recursive CTE (avoids temp-file spill)."""
+    bfs_cap = max_nodes * 2
+    visited: set[str] = {start_mrid}
+    frontier: list[str] = [start_mrid]
+
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            WITH RECURSIVE walk AS (
-              SELECT %s::uuid AS mrid, 0 AS depth
-              UNION ALL
-              SELECT als.target_node_id, w.depth + 1
-              FROM walk w
-              JOIN public.ac_line_segments als ON als.source_node_id = w.mrid
-              WHERE w.depth < %s
-            ),
-            reached AS (
-              SELECT DISTINCT mrid FROM walk
+        for _depth in range(1, max_hops + 1):
+            if not frontier or len(visited) >= bfs_cap:
+                break
+            cur.execute(
+                """
+                SELECT DISTINCT als.target_node_id
+                FROM pg_catalog.unnest(%s::uuid[]) AS src(mrid)
+                JOIN public.ac_line_segments als ON als.source_node_id = src.mrid
+                WHERE NOT (als.target_node_id = ANY(%s::uuid[]))
+                LIMIT %s
+                """,
+                (frontier, list(visited), bfs_cap),
             )
-            SELECT mrid::text FROM reached
-            LIMIT %s
-            """,
-            (start_mrid, max_hops, max_nodes),
-        )
-        mrids = {row[0] for row in cur.fetchall()}
+            new_nodes = [r[0] for r in cur.fetchall() if r[0] not in visited]
+            if not new_nodes:
+                break
+            visited.update(new_nodes)
+            frontier = new_nodes
+
+    mrids = set(list(visited)[:max_nodes])
     return mrids, len(mrids) >= max_nodes
 
 
@@ -1060,6 +1066,19 @@ class TopologyRepairPayload(BaseModel):
     target_mrid: str
     radius_meters: float = Field(default=50, gt=0, le=5000)
     dry_run: bool = False
+    operator_id: str | None = Field(default=None, max_length=100)
+
+
+class TopologyRewireEndpointsPayload(BaseModel):
+    """Bbox geom-preserving FK rewire for miswired master line tips."""
+
+    west: float = Field(ge=-180, le=180)
+    south: float = Field(ge=-90, le=90)
+    east: float = Field(ge=-180, le=180)
+    north: float = Field(ge=-90, le=90)
+    tip_tol_m: float = Field(default=1.0, gt=0, le=25)
+    far_fk_m: float = Field(default=50.0, gt=0, le=5000)
+    dry_run: bool = True
     operator_id: str | None = Field(default=None, max_length=100)
 
 
@@ -2543,6 +2562,82 @@ async def repair_topology(payload: TopologyRepairPayload, background_tasks: Back
         background_tasks.add_task(reconcile_memgraph, graph_driver)
     return {
         "status": "preview" if payload.dry_run else "repaired",
+        "dry_run": payload.dry_run,
+        "result": result,
+    }
+
+
+@app.post("/api/v1/topology/rewire-endpoints")
+async def rewire_topology_endpoints(
+    payload: TopologyRewireEndpointsPayload,
+    background_tasks: BackgroundTasks,
+):
+    """Rewire miswired master line FKs by tip geometry (preserves as-built path)."""
+    if not SUPABASE_DB_URI:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_URI not configured")
+    if payload.west >= payload.east or payload.south >= payload.north:
+        raise HTTPException(
+            status_code=400,
+            detail="invalid bbox: require west < east and south < north",
+        )
+    if payload.far_fk_m < payload.tip_tol_m:
+        raise HTTPException(
+            status_code=400,
+            detail="far_fk_m must be >= tip_tol_m",
+        )
+
+    try:
+        conn = pooled_connect(SUPABASE_DB_URI)
+        try:
+            result = rewire_line_endpoints_by_geometry(
+                conn,
+                west=payload.west,
+                south=payload.south,
+                east=payload.east,
+                north=payload.north,
+                tip_tol_m=payload.tip_tol_m,
+                far_fk_m=payload.far_fk_m,
+                dry_run=payload.dry_run,
+            )
+            applied = result.get("applied") or []
+            if not payload.dry_run and applied:
+                # Lineage requires a target UUID — attribute the batch to the first rewired segment.
+                first_mrid = applied[0].get("segment_mrid")
+                if first_mrid:
+                    log_lineage(
+                        conn,
+                        target_mrid=str(first_mrid),
+                        source_type="REPAIR",
+                        action_type="TOPOLOGY_ENDPOINT_REWIRE",
+                        operator_id=payload.operator_id,
+                        provenance_ref="POST /api/v1/topology/rewire-endpoints",
+                        after_state={
+                            "stats": result.get("stats"),
+                            "bbox": result.get("bbox"),
+                            "applied_count": len(applied),
+                            "operator_id": payload.operator_id,
+                        },
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        msg = str(exc)
+        if "rewire_line_endpoints_by_geometry" in msg and "does not exist" in msg:
+            raise HTTPException(
+                status_code=503,
+                detail="Migration 00109 not applied. Run: npx supabase migration up --local",
+            ) from exc
+        raise HTTPException(status_code=500, detail=msg) from exc
+
+    if not payload.dry_run and (result.get("applied") or result.get("stats", {}).get("rewired")):
+        invalidate_topology_cache()
+        background_tasks.add_task(reconcile_memgraph, graph_driver)
+
+    return {
+        "status": "preview" if payload.dry_run else "rewired",
         "dry_run": payload.dry_run,
         "result": result,
     }
@@ -4578,7 +4673,8 @@ async def get_gis_endpoint_fix_active_ai_run(
     try:
         run = find_active_endpoint_fix_ai_run(conn, district, data_tier=data_tier)
         if not run:
-            raise HTTPException(status_code=404, detail="no_active_run")
+            # Idle poll — return 200 so the browser console is not flooded with 404s.
+            return None
         return get_endpoint_fix_ai_run(conn, run["id"])
     finally:
         conn.close()
@@ -4628,7 +4724,8 @@ async def get_gis_endpoint_fix_proposals_ai_scan_latest(
     try:
         scan = get_latest_endpoint_fix_ai_scan(conn, district, data_tier=data_tier)
         if not scan:
-            raise HTTPException(status_code=404, detail="no_ai_scan")
+            # Empty optional state is normal; avoid a console 404 on panel load.
+            return None
         return scan
     finally:
         conn.close()

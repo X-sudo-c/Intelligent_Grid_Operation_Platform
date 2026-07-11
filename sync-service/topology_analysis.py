@@ -224,61 +224,63 @@ def downstream_impact_payload(
                     "Memgraph impact failed, falling back to Postgres: %s", exc
                 )
 
+        # Postgres fallback: BFS walk (no recursive CTE — avoids temp-file spill).
+        bfs_hops = 64
+        bfs_cap = cap * 2
+        visited: set[str] = {start_mrid}
+        frontier: list[str] = [start_mrid]
+
         with conn.cursor() as cur:
+            for _depth in range(1, bfs_hops + 1):
+                if not frontier or len(visited) >= bfs_cap:
+                    break
+                cur.execute(
+                    """
+                    SELECT DISTINCT als.target_node_id
+                    FROM pg_catalog.unnest(%s::uuid[]) AS src(mrid)
+                    JOIN public.ac_line_segments als ON als.source_node_id = src.mrid
+                    WHERE NOT (als.target_node_id = ANY(%s::uuid[]))
+                    LIMIT %s
+                    """,
+                    (frontier, list(visited), bfs_cap),
+                )
+                new_nodes = [r[0] for r in cur.fetchall() if r[0] not in visited]
+                if not new_nodes:
+                    break
+                visited.update(new_nodes)
+                frontier = new_nodes
+
+            reached_ids = list(visited)[:cap]
+
             cur.execute(
                 """
-                WITH RECURSIVE walk AS (
-                  SELECT %s::uuid AS mrid, 0 AS depth
-                  UNION ALL
-                  SELECT als.target_node_id, w.depth + 1
-                  FROM walk w
-                  JOIN public.ac_line_segments als ON als.source_node_id = w.mrid
-                  WHERE w.depth < 64
-                ),
-                reached AS (
-                  SELECT DISTINCT mrid FROM walk
-                )
-                SELECT
-                  cn.mrid::text,
-                  io.name,
-                  io.validation::text,
-                  ST_Y(cn.geom) AS lat,
-                  ST_X(cn.geom) AS lon
-                FROM reached r
-                JOIN public.connectivity_nodes cn ON cn.mrid = r.mrid
+                SELECT cn.mrid::text,
+                       io.name,
+                       io.validation::text,
+                       ST_Y(cn.geom) AS lat,
+                       ST_X(cn.geom) AS lon
+                FROM public.connectivity_nodes cn
                 JOIN public.identified_objects io ON io.mrid = cn.mrid
-                LIMIT %s
+                WHERE cn.mrid = ANY(%s::uuid[])
                 """,
-                (start_mrid, cap),
+                (reached_ids,),
             )
             node_rows = cur.fetchall()
 
             cur.execute(
                 """
-                WITH RECURSIVE walk AS (
-                  SELECT %s::uuid AS mrid, 0 AS depth
-                  UNION ALL
-                  SELECT als.target_node_id, w.depth + 1
-                  FROM walk w
-                  JOIN public.ac_line_segments als ON als.source_node_id = w.mrid
-                  WHERE w.depth < 64
-                ),
-                reached AS (
-                  SELECT DISTINCT mrid FROM walk
-                )
-                SELECT
-                  als.mrid::text,
-                  als.source_node_id::text,
-                  als.target_node_id::text,
-                  coalesce(ce.phases, 'ABC'),
-                  coalesce(ce.nominal_voltage::text, 'MV_11KV')
+                SELECT als.mrid::text,
+                       als.source_node_id::text,
+                       als.target_node_id::text,
+                       coalesce(ce.phases, 'ABC'),
+                       coalesce(ce.nominal_voltage::text, 'MV_11KV')
                 FROM public.ac_line_segments als
                 JOIN public.conducting_equipment ce ON ce.mrid = als.mrid
-                WHERE als.source_node_id IN (SELECT mrid FROM reached)
-                  AND als.target_node_id IN (SELECT mrid FROM reached)
+                WHERE als.source_node_id = ANY(%s::uuid[])
+                  AND als.target_node_id = ANY(%s::uuid[])
                 LIMIT %s
                 """,
-                (start_mrid, cap * 2),
+                (reached_ids, reached_ids, cap * 2),
             )
             edge_rows = cur.fetchall()
 

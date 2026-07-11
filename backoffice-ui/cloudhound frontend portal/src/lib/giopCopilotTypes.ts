@@ -132,12 +132,12 @@ export interface GiopCopilotPortalContext {
 }
 
 export const COPILOT_SUGGESTIONS = [
+  "What's on the map in this view?",
   'How many poles are in the current map view?',
   'What work orders are in view?',
   'Tell me about the node in view',
   'Show connections on the Mallam feeder',
   'How many staging captures in this district?',
   'Highlight Accra on the map',
-  'Show nodes on this feeder',
   "What's downstream from this node?",
 ] as const;

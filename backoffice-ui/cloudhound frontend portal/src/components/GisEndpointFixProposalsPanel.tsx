@@ -48,6 +48,38 @@ const AI_SCAN_BATCH_OPTIONS = [10, 50, 100] as const;
 export type EndpointFixAiReasoningDepth = 'quick' | 'deep';
 export type EndpointFixAiBatchSize = (typeof AI_SCAN_BATCH_OPTIONS)[number];
 
+function topologyAlignBadge(
+  proposal: GiopEndpointFixProposal,
+  isLightMode: boolean,
+): { label: string; className: string; title: string } {
+  const maxGap = proposal.max_gap_m;
+  if (proposal.topology_aligned || proposal.topology_noop) {
+    return {
+      label: proposal.topology_noop ? 'noop' : 'aligned',
+      className: isLightMode
+        ? 'text-emerald-800 bg-emerald-50'
+        : 'text-emerald-200 bg-emerald-950/40',
+      title: proposal.topology_noop
+        ? 'IDs already match geometry at both ends — no ID change needed; promote when ready.'
+        : 'Line ends already within 1 m of proposed nodes — safe for Memgraph after promote.',
+    };
+  }
+  if (proposal.topology_ready) {
+    return {
+      label: 'snap OK',
+      className: isLightMode
+        ? 'text-sky-800 bg-sky-50'
+        : 'text-sky-200 bg-sky-950/40',
+      title: `Apply will snap geometry to nodes (max gap ${maxGap?.toFixed(1) ?? '?'} m) so MRIDs match the line.`,
+    };
+  }
+  return {
+    label: 'reject',
+    className: isLightMode ? 'text-red-800 bg-red-50' : 'text-red-200 bg-red-950/40',
+    title: `Gap too large for snap (${maxGap?.toFixed(1) ?? '?'} m) — geometry and logical link would disagree after apply.`,
+  };
+}
+
 function confidenceBadge(
   confidence: string | null | undefined,
   agrees: boolean | null | undefined,
@@ -146,7 +178,8 @@ export function GisEndpointFixProposalsPanel({
   dataTier = 'gis',
   defaultDistrict = '',
 }: GisEndpointFixProposalsPanelProps) {
-  const { queueMapViewportCommand, setImportSegmentHighlight } = useGiopMapOverlay();
+  const { queueMapViewportCommand, setImportSegmentHighlight, setNetworkGeometryMode } =
+    useGiopMapOverlay();
   const [district, setDistrict] = useState(defaultDistrict);
   const [districtOptions, setDistrictOptions] = useState<string[]>([]);
   const [districtsLoading, setDistrictsLoading] = useState(false);
@@ -163,12 +196,15 @@ export function GisEndpointFixProposalsPanel({
   const [offset, setOffset] = useState(0);
   const [tierFilter, setTierFilter] = useState<GiopEndpointFixTier | ''>('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [activePreviewId, setActivePreviewId] = useState<string | null>(null);
   const [mapBusyId, setMapBusyId] = useState<number | null>(null);
   const [aiScan, setAiScan] = useState<GiopEndpointFixAiScanRecord | null>(null);
   const [showThoughts, setShowThoughts] = useState(false);
   const [aiReasoningDepth, setAiReasoningDepth] = useState<EndpointFixAiReasoningDepth>('quick');
   const [aiBatchSize, setAiBatchSize] = useState<EndpointFixAiBatchSize>(50);
   const [districtRun, setDistrictRun] = useState<GiopEndpointFixAiDistrictRun | null>(null);
+  const panelRef = useRef<HTMLDetailsElement | null>(null);
+  const showOnMapRef = useRef<(proposal: GiopEndpointFixProposal) => Promise<void>>(async () => {});
 
   const card = isLightMode
     ? 'border-slate-200 bg-white/90'
@@ -287,8 +323,9 @@ export function GisEndpointFixProposalsPanel({
     const openedOrSwitchedDistrict = workspaceKeyRef.current !== workspaceKey;
     workspaceKeyRef.current = workspaceKey;
     if (!expanded) return;
+    if (!isStaging) setNetworkGeometryMode('both');
     void loadDistrictWorkspace({ autoGenerateIfEmpty: openedOrSwitchedDistrict });
-  }, [dataTier, districtTrim, enabled, expanded, loadDistrictWorkspace, offset, tierFilter]);
+  }, [dataTier, districtTrim, enabled, expanded, isStaging, loadDistrictWorkspace, offset, setNetworkGeometryMode, tierFilter]);
 
   const handleTierFilter = (tier: GiopEndpointFixTier | '') => {
     setTierFilter(tier);
@@ -327,6 +364,11 @@ export function GisEndpointFixProposalsPanel({
   }, [district, districtOptions]);
 
   useEffect(() => {
+    if (!expanded || isStaging || proposals.length === 0 || activePreviewId) return;
+    void showOnMapRef.current(proposals[0]);
+  }, [activePreviewId, expanded, isStaging, proposals]);
+
+  useEffect(() => {
     if (!districtTrim || !expanded) return;
     let cancelled = false;
     const poll = async () => {
@@ -359,15 +401,6 @@ export function GisEndpointFixProposalsPanel({
   const toggleAll = () => {
     if (allSelected) setSelected(new Set());
     else setSelected(new Set(proposals.map((p) => p.id)));
-  };
-
-  const toggleOne = (id: string) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
   };
 
   const handleGenerate = async () => {
@@ -472,7 +505,7 @@ export function GisEndpointFixProposalsPanel({
     }
   };
 
-  const handleReview = async (approve: boolean) => {
+  const handleReview = useCallback(async (approve: boolean) => {
     const ids = [...selected];
     if (ids.length === 0) {
       setStatus('Select at least one row');
@@ -492,7 +525,7 @@ export function GisEndpointFixProposalsPanel({
     } finally {
       setBusy(false);
     }
-  };
+  }, [dataTier, refresh, selected]);
 
   const handleApplyApproved = async () => {
     if (!districtTrim) return;
@@ -502,7 +535,7 @@ export function GisEndpointFixProposalsPanel({
       setStatus(
         isStaging
           ? `Applied ${result.applied.toLocaleString()} approved fix(es) to staging line segments`
-          : `Applied ${result.applied.toLocaleString()} approved fix(es) to GIS conductor rows`,
+          : `Applied IDs + snapped geometry (${result.applied.toLocaleString()} row(s)) — promote for Memgraph trace`,
       );
       await refresh();
     } catch (err) {
@@ -512,9 +545,13 @@ export function GisEndpointFixProposalsPanel({
     }
   };
 
-  const showOnMap = async (proposal: GiopEndpointFixProposal) => {
+  const showOnMap = useCallback(async (proposal: GiopEndpointFixProposal) => {
+    if (isStaging) return;
     setMapBusyId(proposal.segment_id);
+    setActivePreviewId(proposal.id);
     try {
+      // Endpoint-fix overlays are GeoJSON; Both mode also shows GIS gap context under them.
+      setNetworkGeometryMode('both');
       const preview = await getGisEndpointFixProposalMapPreview(proposal.id);
       const focusBbox = bboxFromEndpointFixGeojson(preview.geojson) ?? preview.bbox ?? undefined;
       const state: ImportSegmentHighlightState = {
@@ -528,9 +565,9 @@ export function GisEndpointFixProposalsPanel({
         queueMapViewportCommand({
           type: 'fit_bounds',
           bbox: focusBbox,
-          max_zoom: 20,
+          max_zoom: 22,
           padding: 28,
-          min_span: 0.00045,
+          min_span: 0.00008,
         });
       }
     } catch (err) {
@@ -538,10 +575,146 @@ export function GisEndpointFixProposalsPanel({
     } finally {
       setMapBusyId(null);
     }
-  };
+  }, [isStaging, queueMapViewportCommand, setImportSegmentHighlight, setNetworkGeometryMode]);
+
+  showOnMapRef.current = showOnMap;
+
+  const selectAndPreview = useCallback(
+    (proposal: GiopEndpointFixProposal, opts?: { exclusive?: boolean }) => {
+      setSelected((prev) => {
+        if (opts?.exclusive) return new Set([proposal.id]);
+        const next = new Set(prev);
+        next.add(proposal.id);
+        return next;
+      });
+      void showOnMap(proposal);
+    },
+    [showOnMap],
+  );
+
+  const toggleOne = useCallback(
+    (id: string) => {
+      const proposal = proposals.find((p) => p.id === id);
+      setSelected((prev) => {
+        const next = new Set(prev);
+        if (next.has(id)) {
+          next.delete(id);
+          return next;
+        }
+        next.add(id);
+        return next;
+      });
+      if (proposal && !selected.has(id)) {
+        void showOnMap(proposal);
+      }
+    },
+    [proposals, selected, showOnMap],
+  );
+
+  const focusProposalIndex = useCallback(
+    (index: number) => {
+      if (index < 0 || index >= proposals.length) return;
+      selectAndPreview(proposals[index], { exclusive: true });
+    },
+    [proposals, selectAndPreview],
+  );
+
+  const handleApproveAndNext = useCallback(async () => {
+    const ids = [...selected];
+    if (ids.length === 0) {
+      setStatus('Select at least one proposal');
+      return;
+    }
+    const lastId = ids[ids.length - 1];
+    const lastIdx = proposals.findIndex((p) => p.id === lastId);
+    setBusy(true);
+    try {
+      await reviewGisEndpointFixProposals({
+        proposal_ids: ids,
+        data_tier: dataTier,
+        status: 'approved',
+      });
+      setStatus(`Approved ${ids.length} row(s)`);
+      const approved = new Set(ids);
+      const next =
+        lastIdx >= 0
+          ? proposals.slice(lastIdx + 1).find((p) => !approved.has(p.id))
+          : undefined;
+      await refresh();
+      if (next) {
+        selectAndPreview(next, { exclusive: true });
+      } else {
+        setSelected(new Set());
+        setActivePreviewId(null);
+      }
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : 'Review failed');
+    } finally {
+      setBusy(false);
+    }
+  }, [dataTier, proposals, refresh, selectAndPreview, selected]);
+
+  useEffect(() => {
+    if (!expanded || isStaging) return;
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        target
+        && (target.tagName === 'INPUT'
+          || target.tagName === 'TEXTAREA'
+          || target.tagName === 'SELECT'
+          || target.isContentEditable)
+      ) {
+        return;
+      }
+      const panel = panelRef.current;
+      if (!panel?.open) return;
+      const key = event.key.toLowerCase();
+      if (key === 'a' && !event.metaKey && !event.ctrlKey) {
+        event.preventDefault();
+        void handleReview(true);
+        return;
+      }
+      if (key === 'r' && !event.metaKey && !event.ctrlKey) {
+        event.preventDefault();
+        void handleReview(false);
+        return;
+      }
+      if (key === 'm' && !event.metaKey && !event.ctrlKey) {
+        const id = activePreviewId ?? [...selected][0];
+        const proposal = proposals.find((p) => p.id === id) ?? proposals[0];
+        if (proposal) {
+          event.preventDefault();
+          void showOnMapRef.current(proposal);
+        }
+        return;
+      }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        const currentId = activePreviewId ?? [...selected][0] ?? null;
+        const idx = currentId ? proposals.findIndex((p) => p.id === currentId) : -1;
+        const nextIdx =
+          event.key === 'ArrowDown'
+            ? Math.min(proposals.length - 1, Math.max(0, idx + 1))
+            : Math.max(0, idx <= 0 ? 0 : idx - 1);
+        focusProposalIndex(nextIdx);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [
+    activePreviewId,
+    expanded,
+    focusProposalIndex,
+    handleReview,
+    isStaging,
+    proposals,
+    selected,
+  ]);
 
   return (
     <details
+      ref={panelRef}
       className={`rounded-xl border text-sm group ${card}`}
       onToggle={(event) => setExpanded((event.currentTarget as HTMLDetailsElement).open)}
     >
@@ -571,13 +744,35 @@ export function GisEndpointFixProposalsPanel({
             </>
           ) : (
             <>
-              Compare map geometry with missing or wrong endpoint IDs (poles, DT, PT). Pick a district
-              to auto-scan unpromoted lines, run AI scan for steward reasoning, review each row (map
-              shows dashed links to proposed targets), then apply approved fixes to{' '}
-              <span className="font-mono">gis.conductor_segments</span> (from/to only — promote is separate).
+              Geometry-first repair: scan finds the pole/transformer at each line end, you approve the
+              IDs, apply writes IDs and snaps geometry so logical links match the wire. Map preview
+              shows <span className="font-medium">magenta = after snap</span> (what Memgraph will trace),{' '}
+              <span className="font-medium">gray = as-built</span>, dashed = gap before repair. Then
+              promote to master.
             </>
           )}
         </p>
+
+        {!isStaging && (
+          <div
+            className={`flex flex-wrap items-center gap-1.5 rounded-lg border px-2 py-1.5 text-[11px] ${shell}`}
+            aria-label="Endpoint fix workflow"
+          >
+            <span className={summaryPending > 0 ? (isLightMode ? 'text-fuchsia-800 font-semibold' : 'text-fuchsia-200 font-semibold') : muted}>
+              Pending
+            </span>
+            <span className={muted}>→</span>
+            <span className={summaryApproved > 0 ? (isLightMode ? 'text-emerald-800 font-semibold' : 'text-emerald-200 font-semibold') : muted}>
+              Approved
+            </span>
+            <span className={muted}>→</span>
+            <span className={muted}>Applied + snapped</span>
+            <span className={muted}>→</span>
+            <span className={isLightMode ? 'text-amber-800' : 'text-amber-200'}>
+              Promote → Memgraph trace
+            </span>
+          </div>
+        )}
 
         <div className="flex flex-wrap gap-2 items-end">
           <label className={`text-xs flex flex-col gap-1 ${muted}`}>
@@ -877,6 +1072,20 @@ export function GisEndpointFixProposalsPanel({
               >
                 Approve selected
               </button>
+              {!isStaging && (
+                <button
+                  type="button"
+                  disabled={busy || selected.size === 0}
+                  onClick={() => void handleApproveAndNext()}
+                  className={`rounded border px-2 py-0.5 text-xs disabled:opacity-50 ${
+                    isLightMode
+                      ? 'border-emerald-700 text-emerald-800 hover:bg-emerald-50'
+                      : 'border-emerald-600 text-emerald-300 hover:bg-emerald-950/40'
+                  }`}
+                >
+                  Approve + next
+                </button>
+              )}
               <button
                 type="button"
                 disabled={busy}
@@ -887,6 +1096,7 @@ export function GisEndpointFixProposalsPanel({
               </button>
               <span className={`text-xs self-center ${muted}`}>
                 {selected.size} selected · {total.toLocaleString()} pending
+                {!isStaging ? ' · A/R/M · ↑↓' : ''}
               </span>
             </div>
 
@@ -898,18 +1108,35 @@ export function GisEndpointFixProposalsPanel({
                       <input type="checkbox" checked={allSelected} onChange={toggleAll} aria-label="Select all" />
                     </th>
                     <th className="p-2 text-left">{isStaging ? 'Line' : 'Seg'}</th>
-                    <th className="p-2 text-left">From → proposed</th>
-                    <th className="p-2 text-left">To → proposed</th>
+                    <th className="p-2 text-left">Line start (FROM)</th>
+                    <th className="p-2 text-left">Line end (TO)</th>
+                    <th className="p-2 text-left">Align</th>
                     <th className="p-2 text-left">Tier</th>
                     <th className="p-2 text-left">AI</th>
                     <th className="p-2 text-left">Map</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {proposals.map((p) => (
+                  {proposals.map((p) => {
+                    const rowActive = activePreviewId === p.id || selected.has(p.id);
+                    return (
                     <tr
                       key={p.id}
-                      className={isLightMode ? 'border-t border-slate-100' : 'border-t border-premium-border/30'}
+                      className={`${
+                        isLightMode ? 'border-t border-slate-100' : 'border-t border-premium-border/30'
+                      } ${
+                        rowActive
+                          ? isLightMode
+                            ? 'bg-fuchsia-50/70'
+                            : 'bg-fuchsia-950/25'
+                          : ''
+                      } ${!isStaging ? 'cursor-pointer' : ''}`}
+                      onClick={(e) => {
+                        if (isStaging) return;
+                        const tag = (e.target as HTMLElement).tagName;
+                        if (tag === 'INPUT' || tag === 'BUTTON' || tag === 'A') return;
+                        selectAndPreview(p, { exclusive: true });
+                      }}
                     >
                       <td className="p-2">
                         <input
@@ -962,6 +1189,19 @@ export function GisEndpointFixProposalsPanel({
                           <span className={`block ${muted}`}>{p.end_dist_m.toFixed(1)} m</span>
                         )}
                       </td>
+                      <td className="p-2">
+                        {(() => {
+                          const badge = topologyAlignBadge(p, isLightMode);
+                          return (
+                            <span
+                              className={`inline-block rounded px-1.5 py-0.5 text-[10px] font-medium ${badge.className}`}
+                              title={badge.title}
+                            >
+                              {badge.label}
+                            </span>
+                          );
+                        })()}
+                      </td>
                       <td className="p-2">{p.tier}</td>
                       <td className="p-2 max-w-[180px]">
                         {p.ai_rationale ? (
@@ -990,15 +1230,19 @@ export function GisEndpointFixProposalsPanel({
                           <button
                             type="button"
                             disabled={mapBusyId === p.segment_id}
-                            onClick={() => void showOnMap(p)}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void showOnMap(p);
+                            }}
                             className="underline disabled:opacity-50"
                           >
-                            {mapBusyId === p.segment_id ? '…' : 'Show'}
+                            {mapBusyId === p.segment_id ? '…' : activePreviewId === p.id ? 'Showing' : 'Show'}
                           </button>
                         )}
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

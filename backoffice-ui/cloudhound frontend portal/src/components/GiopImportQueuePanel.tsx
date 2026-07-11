@@ -53,7 +53,7 @@ export function GiopImportQueuePanel({
   dataTier = 'gis',
   showImportQueue = true,
 }: GiopImportQueuePanelProps) {
-  const { queueMapViewportCommand, setImportSegmentHighlight, networkGeometryMode } = useGiopMapOverlay();
+  const { queueMapViewportCommand, setImportSegmentHighlight } = useGiopMapOverlay();
   const [expanded, setExpanded] = useState(false);
   const [summary, setSummary] = useState<GiopUnpromotedSegmentSummary | null>(null);
   const [endpointDiagnostics, setEndpointDiagnostics] = useState<GiopEndpointDiagnostics | null>(null);
@@ -197,12 +197,7 @@ export function GiopImportQueuePanel({
         bbox: payload.bbox ?? undefined,
       };
       setImportSegmentHighlight(highlight);
-
-      if (networkGeometryMode === 'master') {
-        setStatus('Map highlight hidden in Master mode — switch to Both or GIS import to preview.');
-      } else {
-        setStatus('');
-      }
+      setStatus('');
 
       if (payload.bbox) {
         queueMapViewportCommand({
@@ -392,7 +387,9 @@ export function GiopImportQueuePanel({
             </button>
             {snapBusy && (
               <span className={`text-xs ${muted}`}>
-                Typical {Math.ceil(estimateSec / 60)}m on full national dataset…
+                {estimateSec >= 60
+                  ? `Typical ~${Math.ceil(estimateSec / 60)}m on full national dataset…`
+                  : `Typical ~${estimateSec}s on full national dataset…`}
               </span>
             )}
           </div>

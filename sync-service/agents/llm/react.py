@@ -525,8 +525,9 @@ def _tool_schemas() -> list[dict[str, Any]]:
                 "name": "territory_network_summary",
                 "description": (
                     "Summary of all electrical assets in a territory: connectivity nodes by kind "
-                    "plus ac_line_segments by nominal voltage. Use for 'all electrical assets in X' "
-                    "or combined node+line counts."
+                    "plus ac_line_segments by nominal voltage. Use for 'all electrical assets in X', "
+                    "combined node+line counts, or open map-scene questions like 'what do you see "
+                    "on the map' / 'what's in this view' with the portal viewport bbox."
                 ),
                 "parameters": {
                     "type": "object",
@@ -715,7 +716,8 @@ def _tool_schemas() -> list[dict[str, Any]]:
             "function": {
                 "name": "apply_endpoint_fix_proposals",
                 "description": (
-                    "Apply approved endpoint fix proposals — writes from/to IDs on gis.conductor_segments. "
+                    "Apply approved endpoint fix proposals — writes from/to IDs on gis.conductor_segments "
+                    "and snaps line endpoints onto resolved node geometry so logical links match the wire. "
                     "Does not promote to master."
                 ),
                 "parameters": {

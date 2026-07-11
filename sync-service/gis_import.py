@@ -6,6 +6,8 @@ import json
 import os
 from typing import Any
 
+from endpoint_proposals import _as_linestring_geom
+
 TOPO_ENDPOINT_TOLERANCE_M = float(os.getenv("TOPO_ENDPOINT_TOLERANCE_M", "1.0"))
 GIS_IMPORT_SUMMARY_CACHE_TTL_SEC = int(os.getenv("GIS_IMPORT_SUMMARY_CACHE_TTL_SEC", "300"))
 
@@ -26,8 +28,17 @@ CUSTOMER_EQUIPMENT_REASONS = (
 )
 
 
-def snap_conductor_endpoints(conn, *, tolerance_m: float | None = None) -> dict[str, Any]:
-    """Run conservative endpoint snap on gis.conductor_segments."""
+def snap_conductor_endpoints(
+    conn,
+    *,
+    tolerance_m: float | None = None,
+    refresh_status: bool = False,
+) -> dict[str, Any]:
+    """Run conservative endpoint snap on gis.conductor_segments.
+
+    Geometry-only: import-status reasons do not change, so the heavy
+    ``refresh_conductor_import_status`` MV rebuild is skipped by default.
+    """
     tol = tolerance_m if tolerance_m is not None else TOPO_ENDPOINT_TOLERANCE_M
     with conn.cursor() as cur:
         cur.execute(
@@ -35,8 +46,10 @@ def snap_conductor_endpoints(conn, *, tolerance_m: float | None = None) -> dict[
             (tol,),
         )
         row = cur.fetchone()
-        cur.execute("SELECT gis.refresh_conductor_import_status()")
-        refresh = cur.fetchone()
+        refresh = None
+        if refresh_status:
+            cur.execute("SELECT gis.refresh_conductor_import_status()")
+            refresh = cur.fetchone()
     conn.commit()
     result = row[0] if row else {}
     if refresh and refresh[0]:
@@ -274,10 +287,6 @@ def unpromoted_segment_geojson(conn, segment_id: int) -> dict[str, Any]:
               cs.end_node_id,
               s.reason,
               ST_AsGeoJSON(ST_Force2D(cs.geom))::json AS line_geom,
-              ST_X(COALESCE(src.geom, ST_StartPoint(ST_Force2D(cs.geom)))) AS start_lon,
-              ST_Y(COALESCE(src.geom, ST_StartPoint(ST_Force2D(cs.geom)))) AS start_lat,
-              ST_X(COALESCE(tgt.geom, ST_EndPoint(ST_Force2D(cs.geom)))) AS end_lon,
-              ST_Y(COALESCE(tgt.geom, ST_EndPoint(ST_Force2D(cs.geom)))) AS end_lat,
               (src.mrid IS NOT NULL) AS start_resolved,
               (tgt.mrid IS NOT NULL) AS end_resolved,
               ST_XMin(ST_Envelope(cs.geom)) AS west,
@@ -306,10 +315,6 @@ def unpromoted_segment_geojson(conn, segment_id: int) -> dict[str, Any]:
         end_id,
         reason,
         line_geom,
-        start_lon,
-        start_lat,
-        end_lon,
-        end_lat,
         start_resolved,
         end_resolved,
         west,
@@ -317,6 +322,15 @@ def unpromoted_segment_geojson(conn, segment_id: int) -> dict[str, Any]:
         east,
         north,
     ) = row
+
+    # Pin markers to conductor tips. resolve_endpoint can land kilometers away
+    # (wrong/homonym node), which pans the map to the wire but leaves TO off-screen.
+    line_geom = _as_linestring_geom(line_geom) or (
+        line_geom if isinstance(line_geom, dict) else None
+    )
+    tip_coords: list[Any] | None = None
+    if isinstance(line_geom, dict) and line_geom.get("type") == "LineString":
+        tip_coords = line_geom.get("coordinates")
 
     line_features: list[dict[str, Any]] = []
     if line_geom and isinstance(line_geom, dict):
@@ -333,30 +347,49 @@ def unpromoted_segment_geojson(conn, segment_id: int) -> dict[str, Any]:
         )
 
     endpoint_features: list[dict[str, Any]] = []
-    if start_lon is not None and start_lat is not None:
-        endpoint_features.append(
-            {
-                "type": "Feature",
-                "properties": {
-                    "role": "start",
-                    "node_id": orig_id or "start",
-                    "resolved": bool(start_resolved),
-                },
-                "geometry": {"type": "Point", "coordinates": [start_lon, start_lat]},
-            }
-        )
-    if end_lon is not None and end_lat is not None:
-        endpoint_features.append(
-            {
-                "type": "Feature",
-                "properties": {
-                    "role": "end",
-                    "node_id": end_id or "end",
-                    "resolved": bool(end_resolved),
-                },
-                "geometry": {"type": "Point", "coordinates": [end_lon, end_lat]},
-            }
-        )
+    if tip_coords and len(tip_coords) >= 2:
+        start_pt = tip_coords[0]
+        end_pt = tip_coords[-1]
+        if (
+            isinstance(start_pt, (list, tuple))
+            and len(start_pt) >= 2
+            and start_pt[0] is not None
+            and start_pt[1] is not None
+        ):
+            endpoint_features.append(
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "role": "start",
+                        "node_id": orig_id or "start",
+                        "resolved": bool(start_resolved),
+                    },
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [float(start_pt[0]), float(start_pt[1])],
+                    },
+                }
+            )
+        if (
+            isinstance(end_pt, (list, tuple))
+            and len(end_pt) >= 2
+            and end_pt[0] is not None
+            and end_pt[1] is not None
+        ):
+            endpoint_features.append(
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "role": "end",
+                        "node_id": end_id or "end",
+                        "resolved": bool(end_resolved),
+                    },
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [float(end_pt[0]), float(end_pt[1])],
+                    },
+                }
+            )
 
     bbox = None
     if None not in (west, south, east, north):

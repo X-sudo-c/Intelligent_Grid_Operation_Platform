@@ -10,15 +10,12 @@
  */
 
 import type { Map as MaplibreMap, MapGeoJSONFeature } from 'maplibre-gl';
-import { GIOP_MAP_LABEL_FONT_REGULAR } from './giopMapLayers';
 
 export const MAP_MEASURE_LINE_SOURCE = 'map-measure-line';
 export const MAP_MEASURE_LINE_LAYER = 'map-measure-line-layer';
 export const MAP_MEASURE_POINT_SOURCE = 'map-measure-points';
 export const MAP_MEASURE_POINT_LAYER = 'map-measure-points-layer';
 export const MAP_MEASURE_POINT_HALO_LAYER = 'map-measure-points-halo-layer';
-export const MAP_MEASURE_LABEL_SOURCE = 'map-measure-labels';
-export const MAP_MEASURE_LABEL_LAYER = 'map-measure-labels-layer';
 
 /** Layers engineers typically measure between — snap targets. */
 export const MEASURE_SNAP_LAYER_IDS = [
@@ -141,6 +138,16 @@ function segmentLabelPosition(start: MapMeasurePoint, end: MapMeasurePoint): Map
   return [(start[0] + end[0]) / 2, (start[1] + end[1]) / 2];
 }
 
+/** Screen-stable bearing (degrees) so the dimension sits along the segment. */
+function segmentLabelBearing(start: MapMeasurePoint, end: MapMeasurePoint): number {
+  const dLon = end[0] - start[0];
+  const dLat = end[1] - start[1];
+  let deg = (Math.atan2(dLon, dLat) * 180) / Math.PI;
+  // Keep text upright (avoid upside-down labels on westbound spans).
+  if (deg > 90 || deg < -90) deg += 180;
+  return deg;
+}
+
 function featurePointCoords(feature: MapGeoJSONFeature): MapMeasurePoint | null {
   const geom = feature.geometry;
   if (!geom) return null;
@@ -196,10 +203,30 @@ export function snapMeasurePoint(
   return { coord: [ll.lng, ll.lat], snapped: false };
 }
 
+export type MeasureSegmentDimension = {
+  coord: MapMeasurePoint;
+  label: string;
+  bearing: number;
+};
+
+/** Per-segment midpoints + formatted lengths for on-map dimension chips. */
+export function buildMeasureSegmentDimensions(points: MapMeasurePoint[]): MeasureSegmentDimension[] {
+  const dims: MeasureSegmentDimension[] = [];
+  for (let i = 1; i < points.length; i += 1) {
+    const start = points[i - 1];
+    const end = points[i];
+    dims.push({
+      coord: segmentLabelPosition(start, end),
+      label: formatMeasureMeters(geodesicMeters(start, end)),
+      bearing: segmentLabelBearing(start, end),
+    });
+  }
+  return dims;
+}
+
 export function buildMeasureGeoJson(points: MapMeasurePoint[]): {
   line: GeoJSON.FeatureCollection;
   points: GeoJSON.FeatureCollection;
-  labels: GeoJSON.FeatureCollection;
 } {
   const pointFeatures: GeoJSON.Feature[] = points.map((coord, index) => ({
     type: 'Feature',
@@ -218,25 +245,9 @@ export function buildMeasureGeoJson(points: MapMeasurePoint[]): {
         ]
       : [];
 
-  const labelFeatures: GeoJSON.Feature[] = [];
-  for (let i = 1; i < points.length; i += 1) {
-    const start = points[i - 1];
-    const end = points[i];
-    const distM = geodesicMeters(start, end);
-    labelFeatures.push({
-      type: 'Feature',
-      properties: { label: formatMeasureMeters(distM) },
-      geometry: {
-        type: 'Point',
-        coordinates: segmentLabelPosition(start, end),
-      },
-    });
-  }
-
   return {
     line: { type: 'FeatureCollection', features: lineFeatures },
     points: { type: 'FeatureCollection', features: pointFeatures },
-    labels: { type: 'FeatureCollection', features: labelFeatures },
   };
 }
 
@@ -269,22 +280,3 @@ export function measurePointPaint(isLightMode: boolean) {
   };
 }
 
-export function measureLabelLayout() {
-  return {
-    'text-field': ['get', 'label'],
-    'text-size': 11,
-    'text-font': GIOP_MAP_LABEL_FONT_REGULAR,
-    'text-offset': [0, -1.15],
-    'text-anchor': 'bottom' as const,
-    'text-allow-overlap': true,
-    'text-ignore-placement': true,
-  };
-}
-
-export function measureLabelPaint(isLightMode: boolean) {
-  return {
-    'text-color': isLightMode ? '#9f1239' : '#ffe4e6',
-    'text-halo-color': isLightMode ? '#ffffff' : '#1e293b',
-    'text-halo-width': 1.5,
-  };
-}

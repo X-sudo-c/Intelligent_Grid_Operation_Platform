@@ -25,14 +25,34 @@ class MemgraphTopologyTests(unittest.TestCase):
         session = MagicMock()
         driver.session.return_value.__enter__ = MagicMock(return_value=session)
         driver.session.return_value.__exit__ = MagicMock(return_value=False)
-        session.run.return_value = iter(
-            [{"mrid": "b"}, {"mrid": "c"}],
+        downstream = MagicMock()
+        downstream.__iter__ = MagicMock(
+            return_value=iter([{"mrid": "b"}, {"mrid": "c"}])
         )
+        beyond = MagicMock()
+        beyond.single.return_value = None
+        session.run.side_effect = [downstream, beyond]
         mrids, truncated = collect_downstream_mrids(
             driver, "a", max_hops=5, max_nodes=100
         )
         self.assertEqual(mrids, {"a", "b", "c"})
         self.assertFalse(truncated)
+
+    def test_collect_downstream_marks_hop_truncation(self):
+        driver = MagicMock()
+        session = MagicMock()
+        driver.session.return_value.__enter__ = MagicMock(return_value=session)
+        driver.session.return_value.__exit__ = MagicMock(return_value=False)
+        downstream = MagicMock()
+        downstream.__iter__ = MagicMock(return_value=iter([{"mrid": "b"}]))
+        beyond = MagicMock()
+        beyond.single.return_value = {"x": 1}
+        session.run.side_effect = [downstream, beyond]
+        mrids, truncated = collect_downstream_mrids(
+            driver, "a", max_hops=5, max_nodes=100
+        )
+        self.assertEqual(mrids, {"a", "b"})
+        self.assertTrue(truncated)
 
     def test_fetch_subgraph_returns_edges(self):
         driver = MagicMock()

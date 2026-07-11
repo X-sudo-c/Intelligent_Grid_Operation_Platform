@@ -35,14 +35,31 @@ class GisImportTests(unittest.TestCase):
                     "segments_already_aligned": 400,
                     "segments_unresolved": 8,
                     "tolerance_m": 1.0,
+                    "duration_ms": 1200,
                 },
             ),
-            ({"total_unpromoted": 8},),
         ]
 
         result = snap_conductor_endpoints(conn)
         self.assertEqual(result["segments_snapped"], 12)
         conn.commit.assert_called_once()
+        # Geometry-only snap skips the heavy import-status MV refresh by default.
+        self.assertEqual(cur.execute.call_count, 1)
+        self.assertNotIn("import_status", result)
+
+    def test_snap_conductor_endpoints_optional_refresh(self):
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        cur.fetchone.side_effect = [
+            ({"segments_snapped": 1, "segments_unresolved": 0, "tolerance_m": 1.0},),
+            ({"total_unpromoted": 8},),
+        ]
+
+        result = snap_conductor_endpoints(conn, refresh_status=True)
+        self.assertEqual(result["segments_snapped"], 1)
+        self.assertEqual(result["import_status"]["total_unpromoted"], 8)
         self.assertEqual(cur.execute.call_count, 2)
 
     def test_infer_conductor_endpoint_ids_tier_a_commits(self):
@@ -178,10 +195,6 @@ class GisImportTests(unittest.TestCase):
             "P107/b23/6",
             "unresolved_end",
             {"type": "LineString", "coordinates": [[-0.2, 5.6], [-0.19, 5.61]]},
-            -0.2,
-            5.6,
-            -0.19,
-            5.61,
             True,
             False,
             -0.2,
@@ -194,8 +207,48 @@ class GisImportTests(unittest.TestCase):
         self.assertEqual(payload["segment_id"], 42)
         self.assertEqual(payload["geojson"]["line"]["features"][0]["geometry"]["type"], "LineString")
         self.assertEqual(len(payload["geojson"]["endpoints"]["features"]), 2)
+        self.assertEqual(
+            payload["geojson"]["endpoints"]["features"][0]["geometry"]["coordinates"],
+            [-0.2, 5.6],
+        )
+        self.assertEqual(
+            payload["geojson"]["endpoints"]["features"][1]["geometry"]["coordinates"],
+            [-0.19, 5.61],
+        )
         self.assertEqual(payload["geojson"]["endpoints"]["features"][1]["properties"]["resolved"], False)
         self.assertIsNotNone(payload["bbox"])
+
+    def test_unpromoted_segment_geojson_pins_tips_from_multilinestring(self):
+        conn = MagicMock()
+        cur = MagicMock()
+        conn.cursor.return_value.__enter__ = MagicMock(return_value=cur)
+        conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        cur.fetchone.return_value = (
+            99,
+            "oh_conductor_11kv",
+            "Ablekuma",
+            "P5/34(After CMP)",
+            "P5/35",
+            "eligible_unpromoted",
+            {
+                "type": "MultiLineString",
+                "coordinates": [[[-0.31, 5.61], [-0.30, 5.62]]],
+            },
+            True,
+            True,
+            -0.31,
+            5.61,
+            -0.30,
+            5.62,
+        )
+
+        payload = unpromoted_segment_geojson(conn, 99)
+        line = payload["geojson"]["line"]["features"][0]["geometry"]
+        self.assertEqual(line["type"], "LineString")
+        ends = payload["geojson"]["endpoints"]["features"]
+        self.assertEqual(ends[0]["geometry"]["coordinates"], [-0.31, 5.61])
+        self.assertEqual(ends[1]["geometry"]["coordinates"], [-0.30, 5.62])
+        self.assertEqual(ends[1]["properties"]["node_id"], "P5/35")
 
     def test_unpromoted_segment_geojson_not_found(self):
         conn = MagicMock()

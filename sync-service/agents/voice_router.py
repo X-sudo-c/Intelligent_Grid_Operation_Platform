@@ -106,6 +106,9 @@ def _clean_place(raw: str | None) -> str | None:
     place = place.strip()
     if not place:
         return None
+    # Keep "this district" / "my region" intact for selected-territory counts.
+    if re.match(r"^(?:this|the|my)\s+(?:district|region|territory)$", place, flags=re.I):
+        return place
     if place.endswith(" region"):
         return place[: -len(" region")].strip()
     if place.endswith(" district"):
@@ -296,12 +299,30 @@ def _parse_zoom_relative_intent(lower: str) -> VoiceIntent | None:
     )
 
 
-def _count_intent_from_text(lower: str) -> VoiceIntent | None:
+def _is_selected_territory_place(place: str | None) -> bool:
+    if not place:
+        return False
+    # "this area" / "my area" stay viewport-scoped; district/region mean the map selection.
+    return bool(
+        re.match(
+            r"^(?:this|the|my)\s+(?:district|region|territory)$",
+            place.strip(),
+            flags=re.I,
+        )
+    )
+
+
+def _count_intent_from_text(
+    lower: str,
+    *,
+    context: dict[str, Any] | None = None,
+) -> VoiceIntent | None:
     """Parse 'how many … in/at …' including 'staging elements are in X'."""
     count = re.match(
         r"(?:how many|count|number of)\s+"
         r"(?:"
-        r"(?P<asset>poles?|transformers?|nodes?|captures?|staging(?:\s+(?:elements?|assets?))?)"
+        r"(?P<asset>poles?|transformers?|nodes?|captures?|"
+        r"staging(?:\s+(?:elements?|assets?|captures?))?)"
         r"(?:\s+(?:are|is))?\s+"
         r")?"
         r"(?:(?:in|at|for|on|along|ar\s+ealong|ealong)\s+)?"
@@ -339,6 +360,28 @@ def _count_intent_from_text(lower: str) -> VoiceIntent | None:
         use_viewport = True
         viewport_explicit = True
         place_raw = None
+    if place_raw and _is_selected_territory_place(place_raw):
+        sel_d, sel_r = portal_selected_territory(context or {})
+        if sel_d or sel_r:
+            return VoiceIntent(
+                kind="count",
+                asset_kind=asset_kind,
+                tier=tier,
+                district=sel_d,
+                region=sel_r,
+                also_list_assets=_wants_asset_list(lower),
+                highlight_on_map=_wants_map_highlight(lower),
+            )
+        # Nothing selected on the map — fall back to the live viewport.
+        return VoiceIntent(
+            kind="count",
+            asset_kind=asset_kind,
+            tier=tier,
+            use_viewport=True,
+            viewport_explicit=True,
+            also_list_assets=_wants_asset_list(lower),
+            highlight_on_map=_wants_map_highlight(lower),
+        )
     if use_viewport or not place_raw:
         return VoiceIntent(
             kind="count",
@@ -368,8 +411,9 @@ def _parse_asset_correction_intent(
     """Re-run the last spatial count with corrected asset kind (e.g. 'I asked about transformers')."""
     if not session.get("last_kind") == "count":
         return None
+    # Require a correction cue — bare "tell me about those transformers" is a list follow-up.
     if not re.search(
-        r"\b(?:asked|meant|wanted|said|about)\b.*\b(?:transformers?|poles?|nodes?)\b",
+        r"\b(?:i\s+)?(?:asked|meant|wanted|said)\b.*\b(?:transformers?|poles?|nodes?)\b",
         lower,
     ) and not re.search(
         r"\b(?:transformers?|poles?|nodes?)\b.*\b(?:not\s+poles?|not\s+transformers?)\b",
@@ -403,6 +447,19 @@ def _parse_list_assets_intent(
     session: dict[str, Any],
 ) -> VoiceIntent | None:
     """List/name assets — direct query, highlight confirmation, or pronoun follow-up."""
+    # Singular node inspect phrases belong to inspect_node, not list.
+    if re.search(
+        r"\b(?:tell me about|describe|what is|what's|details? on|info on)\s+"
+        r"(?:this|the|selected)\s+(?:node|asset|pole|transformer|substation|bsp)\b",
+        lower,
+    ) and not re.search(r"\b(?:those|them|these|ones)\b", lower):
+        return None
+    if re.search(
+        r"\b(?:the|this|selected)\s+(?:node|asset)\s+(?:in view|on screen|here|in the view)\b",
+        lower,
+    ):
+        return None
+
     highlight_confirm = re.match(
         r"^(?:yes|yeah|yep|sure|please|ok|okay)(?:[,.]?\s+(?:please|sure|thanks)?)?"
         r"(?:\s*[,.]?\s*(?:highlight|pin|plot|show)(?:\s+them)?(?:\s+on\s+(?:the\s+)?map)?)?"
@@ -416,16 +473,32 @@ def _parse_list_assets_intent(
     )
     follow = re.match(
         r"^(?:can you |could you |please )?(?:name|list|show)(?:\s+me)?\s+"
-        r"(?:them|those|the ones|the poles|the assets)[\?.!]*$",
+        r"(?:them|those|the ones|the poles|the assets|the transformers|the nodes)"
+        r"[\?.!]*$",
         lower,
         flags=re.I,
     ) or re.match(
         r"^(?:what are they called|what are their names)[\?.!]*$",
         lower,
         flags=re.I,
+    ) or re.match(
+        # "tell me about those transformers" / "describe them" after a count
+        r"^(?:can you |could you |please )?"
+        r"(?:tell me about|describe|details? on|info on|information about|what about)\s+"
+        r"(?:them|those|these|the ones)"
+        r"(?:\s+(?:poles?|assets?|transformers?|nodes?))?"
+        r"[\?.!]*$",
+        lower,
+        flags=re.I,
     )
     direct = re.search(
-        r"\b(?:name|list|show|identify|display)(?:\s+me)?\s+(?:the\s+)?"
+        r"\b(?:name|list|show|identify|display)(?:\s+me)?\s+"
+        r"(?:(?:them|those|these|the ones|the)\s+)?"
+        r"(?:poles?|assets?|transformers?|nodes?)\b",
+        lower,
+    ) or re.search(
+        r"\b(?:tell me about|describe|details? on|info on|information about)\s+"
+        r"(?:(?:them|those|these|the ones|the)\s+)?"
         r"(?:poles?|assets?|transformers?|nodes?)\b",
         lower,
     )
@@ -537,6 +610,42 @@ def _network_summary_intent_from_text(lower: str) -> VoiceIntent | None:
     )
 
 
+def _parse_describe_viewport_intent(lower: str) -> VoiceIntent | None:
+    """Open 'what's on the map / what do you see' → viewport network summary."""
+    if "how many" in lower or re.search(r"\bcount\b", lower):
+        return None
+    # Specific asset / WO questions belong to count/list/work-order parsers.
+    if re.search(
+        r"\b(?:poles?|transformers?|nodes?|feeders?|work\s*orders?|tickets?)\b",
+        lower,
+    ):
+        return None
+    # Keep "what am I looking at" as inspect_node (selected / nearest asset).
+    if re.search(r"what am i looking at", lower):
+        return None
+
+    patterns = (
+        r"what do you see(?:\s+on\s+the\s+map)?",
+        r"what can you see(?:\s+on\s+the\s+map)?",
+        r"what(?:'s| is|s) on the map",
+        r"what(?:'s| is|s) in (?:this |the |my )?(?:map )?view",
+        r"what(?:'s| is|s) visible(?:\s+(?:here|on (?:the |this )?map|in (?:the |this )?view))?",
+        r"what(?:'s| is|s) in (?:the |this )?visible area",
+        r"describe (?:the |this |my )?(?:map(?:\s+view)?|view|current view|visible area)",
+        r"describe what you see",
+        r"summarize (?:the |this |my )?(?:map(?:\s+view)?|view|current view)",
+        r"what(?:'s| is) in (?:the |this )?current map view",
+    )
+    if not any(re.search(p, lower, flags=re.I) for p in patterns):
+        return None
+    return VoiceIntent(
+        kind="network_summary",
+        tier="master",
+        use_viewport=True,
+        viewport_explicit=True,
+    )
+
+
 def _clean_feeder_query(raw: str | None) -> str | None:
     if not raw:
         return None
@@ -568,12 +677,21 @@ def _parse_trace_downstream_path_intent(lower: str) -> VoiceIntent | None:
         lower,
     ):
         return VoiceIntent(kind="trace_downstream_path")
+    # "what would be affected if this node went out"
+    if re.search(
+        r"\b(?:would be affected|affected if|outage at|went out|goes out|if .+ (?:fails|trips|opens))\b",
+        lower,
+    ):
+        return VoiceIntent(kind="trace_downstream_path")
     return None
 
 
 def _parse_trace_connection_path_intent(lower: str) -> VoiceIntent | None:
     if re.search(r"\b(?:downstream|impact|affected)\b", lower):
         return None
+    # "what connects to it / this node"
+    if re.search(r"\bwhat connects to\b", lower):
+        return VoiceIntent(kind="trace_connection_path")
     if not re.search(r"\b(?:trace|show|highlight|display|draw)\b", lower):
         return None
     if re.search(r"\bfeeder\b", lower):
@@ -701,7 +819,7 @@ def _parse_work_orders_in_view_intent(lower: str) -> VoiceIntent | None:
 def _parse_pan_work_order_intent(lower: str) -> VoiceIntent | None:
     if not re.search(r"\bwork\s*orders?\b", lower):
         return None
-    if not re.search(r"\b(?:pan|go|fly|zoom|show|take me|open|navigate)\b", lower):
+    if not re.search(r"\b(?:pan|go|fly|zoom|show|take me|open|navigate|nearest|closest)\b", lower):
         return None
     if _extract_work_orders_place(lower):
         return None
@@ -720,11 +838,19 @@ def _parse_pan_work_order_intent(lower: str) -> VoiceIntent | None:
             r"\b(?:pan|show|go|fly|zoom)\b.*\bwork\s*order\s+(?:node|nodes|pin|pins)\b",
             lower,
         )
+        or re.search(
+            r"\b(?:nearest|closest|nearby)\s+work\s*orders?\b",
+            lower,
+        )
+        or re.search(
+            r"\b(?:show|open|pan|go|fly)\s+(?:me\s+)?(?:the\s+)?(?:nearest|closest|nearby)\s+work\s*orders?\b",
+            lower,
+        )
     )
     if not targets_work_order:
         return None
     viewport_explicit = _is_viewport_scope(lower) or bool(
-        re.search(r"\b(?:on the map|in view|here|on screen|the map)\b", lower)
+        re.search(r"\b(?:on the map|in view|here|on screen|the map|nearest|closest)\b", lower)
     )
     return VoiceIntent(
         kind="pan_work_order",
@@ -735,7 +861,12 @@ def _parse_pan_work_order_intent(lower: str) -> VoiceIntent | None:
 
 def _parse_inspect_node_intent(lower: str) -> VoiceIntent | None:
     node_words = r"\b(?:node|asset|pole|transformer|substation|bsp)\b"
-    if not re.search(node_words, lower) and "looking at" not in lower:
+    connects_to = bool(re.search(r"\bwhat connects to\b", lower))
+    if not re.search(node_words, lower) and "looking at" not in lower and not connects_to:
+        return None
+
+    # Connection-path questions are handled by trace_connection_path.
+    if connects_to:
         return None
 
     viewport_explicit = _is_viewport_scope(lower)
@@ -744,12 +875,12 @@ def _parse_inspect_node_intent(lower: str) -> VoiceIntent | None:
     asks_about = bool(
         re.search(
             r"(?:tell me about|what is|what's|describe|info on|information about|"
-            r"what am i looking at|what do i see|details on|about the)",
+            r"what am i looking at|what do i see|details on|about the|"
+            r"what kva|what(?:'s| is) the (?:kva|rating))",
             lower,
         )
         or re.search(rf"(?:this|the|selected)\s+{node_words}", lower)
         or re.search(rf"{node_words}\s+(?:in view|on screen|here|selected|in the view)", lower)
-        or re.search(r"what connects to (?:it|this|the node)", lower)
     )
     if not asks_about:
         return None
@@ -805,9 +936,27 @@ def parse_intent(
             region=region or session.get("last_region"),
         )
 
-    count_intent = _count_intent_from_text(lower)
+    count_intent = _count_intent_from_text(lower, context=context)
     if count_intent:
         return count_intent
+
+    # Topology before inspect — "downstream from this node" must not become inspect_node.
+    trace_downstream_intent = _parse_trace_downstream_path_intent(lower)
+    if trace_downstream_intent:
+        return trace_downstream_intent
+
+    trace_connection_intent = _parse_trace_connection_path_intent(lower)
+    if trace_connection_intent:
+        return trace_connection_intent
+
+    trace_feeder_intent = _parse_trace_feeder_intent(raw, lower)
+    if trace_feeder_intent:
+        return trace_feeder_intent
+
+    # Inspect singular node before list_assets so "node in view" is not stolen.
+    inspect_node_intent = _parse_inspect_node_intent(lower)
+    if inspect_node_intent:
+        return inspect_node_intent
 
     list_intent = _parse_list_assets_intent(lower, session)
     if list_intent:
@@ -821,6 +970,10 @@ def parse_intent(
     if network_intent:
         return network_intent
 
+    describe_viewport_intent = _parse_describe_viewport_intent(lower)
+    if describe_viewport_intent:
+        return describe_viewport_intent
+
     work_orders_intent = _parse_work_orders_in_view_intent(lower)
     if work_orders_intent:
         return work_orders_intent
@@ -828,22 +981,6 @@ def parse_intent(
     pan_work_order_intent = _parse_pan_work_order_intent(lower)
     if pan_work_order_intent:
         return pan_work_order_intent
-
-    trace_downstream_intent = _parse_trace_downstream_path_intent(lower)
-    if trace_downstream_intent:
-        return trace_downstream_intent
-
-    trace_connection_intent = _parse_trace_connection_path_intent(lower)
-    if trace_connection_intent:
-        return trace_connection_intent
-
-    inspect_node_intent = _parse_inspect_node_intent(lower)
-    if inspect_node_intent:
-        return inspect_node_intent
-
-    trace_feeder_intent = _parse_trace_feeder_intent(raw, lower)
-    if trace_feeder_intent:
-        return trace_feeder_intent
 
     zoom_in_to = re.search(r"zoom\s+in\s+to\s+(?P<place>.+?)[\?.!]*$", lower, flags=re.I)
     if zoom_in_to:
@@ -1114,6 +1251,7 @@ def _count_place_label(
         or region
         or sel_d
         or sel_r
+        or ("this map view" if intent.use_viewport and intent.viewport_explicit else None)
         or ("this area" if bbox else None)
         or "this map view"
     )

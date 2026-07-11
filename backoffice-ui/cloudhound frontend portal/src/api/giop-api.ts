@@ -1221,6 +1221,10 @@ export interface GiopEndpointFixProposal {
   proposed_to_kind?: string | null;
   start_dist_m?: number | null;
   end_dist_m?: number | null;
+  max_gap_m?: number | null;
+  topology_ready?: boolean;
+  topology_aligned?: boolean;
+  topology_noop?: boolean;
   start_nearest_pole?: string | null;
   end_nearest_pole?: string | null;
   start_nearest_kind?: string | null;
@@ -1295,9 +1299,24 @@ export async function listGisEndpointFixProposals(options?: {
 
 export interface GiopEndpointFixMapPreviewGeoJson {
   line: GeoJSON.FeatureCollection;
+  line_before?: GeoJSON.FeatureCollection;
   endpoints: GeoJSON.FeatureCollection;
   proposed_assets?: GeoJSON.FeatureCollection;
   suggested_links?: GeoJSON.FeatureCollection;
+}
+
+export interface GiopEndpointFixTopologyAlignment {
+  district_from_resolved?: boolean;
+  district_to_resolved?: boolean;
+  start_gap_m?: number | null;
+  end_gap_m?: number | null;
+  max_gap_m?: number | null;
+  span_m?: number | null;
+  snap_ready?: boolean;
+  topology_ready?: boolean;
+  snap_action?: string;
+  topology_tolerance_m?: number;
+  max_snap_move_m?: number;
 }
 
 export interface GiopEndpointFixMapPreview {
@@ -1308,6 +1327,7 @@ export interface GiopEndpointFixMapPreview {
   proposed_to: string;
   proposed_from_kind?: string | null;
   proposed_to_kind?: string | null;
+  topology?: GiopEndpointFixTopologyAlignment;
   geojson: GiopEndpointFixMapPreviewGeoJson;
   bbox?: {
     west: number;
@@ -1468,7 +1488,7 @@ export async function getGisEndpointFixAiDistrictRun(
 export async function getActiveGisEndpointFixAiDistrictRun(
   district: string,
   dataTier: GiopEndpointFixDataTier = 'gis',
-): Promise<GiopEndpointFixAiDistrictRun> {
+): Promise<GiopEndpointFixAiDistrictRun | null> {
   const q = new URLSearchParams({ district, data_tier: dataTier });
   return fetchJson(`${SYNC_BASE}/gis/endpoint-fix-proposals/ai-scan/runs/active?${q}`);
 }
@@ -1489,7 +1509,7 @@ export async function bulkReviewGisEndpointFixProposals(payload: {
 export async function getLatestGisEndpointFixAiScan(
   district: string,
   dataTier: GiopEndpointFixDataTier = 'gis',
-): Promise<GiopEndpointFixAiScanRecord> {
+): Promise<GiopEndpointFixAiScanRecord | null> {
   const q = new URLSearchParams({ district, data_tier: dataTier });
   return fetchJson(`${SYNC_BASE}/gis/endpoint-fix-proposals/ai-scans/latest?${q}`);
 }
